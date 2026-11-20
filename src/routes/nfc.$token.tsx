@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { Logo } from "@/components/Logo";
+import { ReadingActions } from "@/components/ReadingActions";
 import { TripleTapExit } from "@/components/TripleTapExit";
 import { loginAccount, logout, resolveNfcToken, useChat } from "@/lib/chat-store";
 
@@ -92,7 +93,7 @@ function NfcTapPage() {
   }
 
   return (
-    <div className="relative grid min-h-[100dvh] place-items-center overflow-hidden bg-gradient-to-b from-[#060913] via-[#0c1427] to-[#07090f] px-4 py-10 text-white">
+    <div className="relative grid min-h-[100dvh] place-items-center overflow-hidden bg-gradient-to-b from-[#060913] via-[#0c1427] to-[#07090f] px-4 pt-10 pb-[calc(5rem+env(safe-area-inset-bottom))] text-white">
       {/* Drifting 3D Glass Ambient Orbs */}
       <div className="pointer-events-none fixed inset-0 overflow-hidden">
         <motion.div
@@ -108,6 +109,7 @@ function NfcTapPage() {
       </div>
 
       <TripleTapExit />
+      <ReadingActions />
 
       <motion.div
         initial={{ opacity: 0, y: 18, scale: 0.97 }}

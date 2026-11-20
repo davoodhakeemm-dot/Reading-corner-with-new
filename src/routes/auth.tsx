@@ -26,6 +26,7 @@ import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Logo } from "@/components/Logo";
+import { ReadingActions } from "@/components/ReadingActions";
 import { TripleTapExit } from "@/components/TripleTapExit";
 import { WaterGlowButton } from "@/components/WaterGlowButton";
 import {
@@ -291,7 +292,7 @@ function AuthPage() {
   return (
     <div
       className={cn(
-        "relative min-h-[100dvh] overflow-x-hidden px-4 py-6 transition-colors duration-500 sm:px-6 sm:py-10",
+        "relative min-h-[100dvh] overflow-x-hidden px-4 pt-6 pb-[calc(5rem+env(safe-area-inset-bottom))] transition-colors duration-500 sm:px-6 sm:pt-10",
         isDark
           ? "bg-gradient-to-b from-[#070b14] via-[#0d1527] to-[#060a12] text-white"
           : isLiquid
@@ -349,6 +350,7 @@ function AuthPage() {
       </div>
 
       <TripleTapExit />
+      <ReadingActions />
 
       <div className="relative mx-auto flex min-h-[calc(100dvh-3.5rem)] w-full max-w-5xl flex-col justify-center lg:grid lg:grid-cols-[1fr_460px] lg:items-center lg:gap-12">
         {/* Left Info & Quick Header */}

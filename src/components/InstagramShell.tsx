@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { DiscoverUsersView } from "@/components/DiscoverUsersView";
 import { InstagramChatView } from "@/components/InstagramChatView";
 import { InstagramProfileView, type ProfileSection } from "@/components/InstagramProfileView";
+import { ReadingActions } from "@/components/ReadingActions";
 import { Logo } from "@/components/Logo";
 import { TripleTapExit } from "@/components/TripleTapExit";
 import { initialsOf, openThread, respondToCall, useChat } from "@/lib/chat-store";
@@ -23,7 +24,7 @@ export function InstagramShell({
   initialProfileSection?: ProfileSection;
 }) {
   const navigate = useNavigate();
-  const { ready, me, conversations, incomingCall, outgoingCall, soundEnabled } = useChat();
+  const { ready, me, nfc, conversations, incomingCall, outgoingCall, soundEnabled } = useChat();
   const [tab, setTab] = useState<ShellTab>(initialTab);
   const [threadOpenOnMobile, setThreadOpenOnMobile] = useState(false);
 
@@ -284,6 +285,15 @@ export function InstagramShell({
             </motion.div>
           )}
         </AnimatePresence>
+        <div
+          className={cn(
+            "shrink-0",
+            !(tab === "chat" && threadOpenOnMobile) &&
+              "mb-[calc(4rem+max(0.5rem,env(safe-area-inset-bottom)))] md:mb-0",
+          )}
+        >
+          <ReadingActions inShell personalPath={nfc?.revoked ? null : nfc?.path} />
+        </div>
       </main>
 
       {/* Floating Glass Mobile Bottom Pill */}
