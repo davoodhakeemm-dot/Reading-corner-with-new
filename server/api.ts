@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
+import { getApp, getApps, initializeApp } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
 import multer from "multer";
 
 import {
@@ -17,15 +19,64 @@ import {
   normalizeHandle,
   normalizePhoneE164,
   sha256,
+  signCookieToken,
   threadKeyFor,
   toPublicUser,
+  verifyCookieToken,
   verifyPassword,
   type DbUser,
   type SecretTheme,
 } from "./db";
 import { isUserConnected, sendToUser } from "./ws";
 
-type AuthedRequest = Request & { authUser?: DbUser; authToken?: string };
+type AuthedRequest = Request & { authUser?: DbUser; authToken?: string; firebaseUid?: string };
+
+let cachedProjectId: string | null = null;
+function getFirebaseAdminAuth() {
+  if (!cachedProjectId) {
+    const cfgPath = path.resolve(process.cwd(), "firebase-applet-config.json");
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")) as { projectId?: string };
+    cachedProjectId = cfg.projectId || process.env["GOOGLE_CLOUD_PROJECT"] || "";
+  }
+  const app = getApps().length
+    ? getApp()
+    : initializeApp(cachedProjectId ? { projectId: cachedProjectId } : undefined);
+  return getAuth(app);
+}
+
+function extractCookieValue(req: Request, name: string): string | null {
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(";")) {
+    const [k, ...rest] = part.trim().split("=");
+    if (k === name) {
+      const val = decodeURIComponent(rest.join("=")).trim();
+      if (val) return val;
+    }
+  }
+  return null;
+}
+
+async function resolveFirebaseUid(req: Request): Promise<string | null> {
+  const auth = req.headers.authorization;
+  if (auth?.startsWith("Bearer ")) {
+    const token = auth.slice(7).trim();
+    if (token && !token.startsWith("rc_sess_")) {
+      try {
+        const decoded = await getFirebaseAdminAuth().verifyIdToken(token);
+        if (decoded?.uid) return decoded.uid;
+      } catch {
+        /* invalid Firebase ID token */
+      }
+    }
+  }
+  const fbCookie = extractCookieValue(req, "rc_fb_session");
+  if (fbCookie) {
+    const verified = verifyCookieToken(fbCookie);
+    if (verified?.uid) return verified.uid;
+  }
+  return null;
+}
 
 type DbMessageRow = {
   id: string;
@@ -580,12 +631,42 @@ export function createApiRouter() {
     });
   });
 
+  router.post("/auth/firebase-cookie", async (req, res) => {
+    const authHeader = req.headers.authorization;
+    const bodyToken = (req.body as { idToken?: string } | undefined)?.idToken;
+    const rawToken =
+      (authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : "") ||
+      String(bodyToken ?? "").trim();
+
+    if (!rawToken) {
+      res.status(400).json({ error: "Firebase ID token is required." });
+      return;
+    }
+
+    try {
+      const decoded = await getFirebaseAdminAuth().verifyIdToken(rawToken);
+      const signed = signCookieToken(decoded.uid);
+      const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
+      res.cookie("rc_fb_session", signed, {
+        httpOnly: true,
+        sameSite: isHttps ? "none" : "lax",
+        path: "/",
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+        secure: isHttps,
+      });
+      res.json({ ok: true, uid: decoded.uid });
+    } catch {
+      res.status(401).json({ error: "Invalid Firebase ID token." });
+    }
+  });
+
   router.post("/auth/logout", (req: AuthedRequest, res) => {
     const token = extractToken(req);
     if (token) {
       db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(sha256(token));
     }
     res.clearCookie("rc_session", { path: "/" });
+    res.clearCookie("rc_fb_session", { path: "/" });
     res.json({ ok: true });
   });
 
@@ -1593,10 +1674,18 @@ export function createApiRouter() {
     res.json({ ok: true, updated: result.changes, seenAt });
   });
 
-  // Upload private photo / video / audio media
-  router.post("/media", requireAuth, upload.single("file"), (req: AuthedRequest, res) => {
-    const me = req.authUser!;
+  // Upload private photo / video / audio media (supports both Firebase ID tokens and SQLite sessions)
+  router.post("/media", upload.single("file"), async (req: AuthedRequest, res) => {
     const file = req.file;
+    const fbUid = await resolveFirebaseUid(req);
+    const resolved = fbUid ? null : lookupSessionUser(req);
+
+    if (!fbUid && !resolved) {
+      if (file && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
     if (!file) {
       res.status(400).json({ error: "No file uploaded." });
       return;
@@ -1605,7 +1694,7 @@ export function createApiRouter() {
     const recipientId =
       typeof req.body?.["recipientId"] === "string" ? req.body["recipientId"].trim() : null;
 
-    if (recipientId && isBlockedBetween(me.id, recipientId)) {
+    if (resolved && recipientId && isBlockedBetween(resolved.user.id, recipientId)) {
       fs.unlinkSync(file.path);
       res.status(403).json({ error: "Cannot share media with a blocked user." });
       return;
@@ -1625,35 +1714,221 @@ export function createApiRouter() {
       return;
     }
 
-    const mediaId = `med_${crypto.randomUUID()}`;
+    const mediaId = `${fbUid ? "fbm" : "med"}_${crypto.randomUUID()}`;
     const now = new Date().toISOString();
-    db.prepare(
-      "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-    ).run(
-      mediaId,
-      me.id,
-      recipientId,
-      kind,
-      file.mimetype,
-      file.originalname || `${kind}.${kind === "video" ? "mp4" : "jpg"}`,
-      file.filename,
-      file.size,
-      now,
-    );
+
+    if (fbUid) {
+      db.prepare(
+        "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        mediaId,
+        fbUid,
+        recipientId || null,
+        kind,
+        file.mimetype,
+        file.originalname || `${kind}.${kind === "video" ? "mp4" : "jpg"}`,
+        file.filename,
+        file.size,
+        now,
+      );
+    } else if (resolved) {
+      db.prepare(
+        "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+      ).run(
+        mediaId,
+        resolved.user.id,
+        recipientId,
+        kind,
+        file.mimetype,
+        file.originalname || `${kind}.${kind === "video" ? "mp4" : "jpg"}`,
+        file.filename,
+        file.size,
+        now,
+      );
+    }
 
     res.status(201).json({
       id: mediaId,
       kind,
       mimeType: file.mimetype,
-      originalName: file.originalname,
+      originalName: file.originalname || `${kind}.${kind === "video" ? "mp4" : "jpg"}`,
+      sizeBytes: file.size,
+      createdAt: now,
       url: `/api/media/${mediaId}`,
+      mine: true,
     });
   });
 
-  // Protected private media endpoint with ACL & block check
-  router.get("/media/:id", requireAuth, (req: AuthedRequest, res) => {
-    const me = req.authUser!;
+  // Grant recipient access when sharing an existing gallery item into a Firebase chat
+  router.post("/media/:id/share", async (req: AuthedRequest, res) => {
+    const fbUid = await resolveFirebaseUid(req);
+    if (!fbUid) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
     const mediaId = String(req.params["id"] ?? "");
+    const recipientId = String(
+      (req.body as { recipientId?: string } | undefined)?.recipientId ?? "",
+    ).trim();
+    if (!recipientId) {
+      res.status(400).json({ error: "recipientId is required." });
+      return;
+    }
+    const fbItem = db
+      .prepare("SELECT id, owner_uid, recipient_uid FROM firebase_media WHERE id = ? LIMIT 1")
+      .get(mediaId) as { id: string; owner_uid: string; recipient_uid: string | null } | undefined;
+    if (!fbItem || fbItem.owner_uid !== fbUid) {
+      res.status(404).json({ error: "Media not found." });
+      return;
+    }
+    const existing = new Set(
+      (fbItem.recipient_uid ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    );
+    existing.add(recipientId);
+    db.prepare("UPDATE firebase_media SET recipient_uid = ? WHERE id = ?").run(
+      Array.from(existing).join(","),
+      mediaId,
+    );
+    res.json({ ok: true });
+  });
+
+  // Delete an owned media file from the gallery & disk storage
+  router.delete("/media/:id", async (req: AuthedRequest, res) => {
+    const fbUid = await resolveFirebaseUid(req);
+    const resolved = fbUid ? null : lookupSessionUser(req);
+    if (!fbUid && !resolved) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    const mediaId = String(req.params["id"] ?? "").trim();
+    if (!mediaId) {
+      res.status(400).json({ error: "Media ID is required." });
+      return;
+    }
+
+    const baseMediaDir = path.resolve(mediaDir);
+
+    if (fbUid) {
+      const fbItem = db
+        .prepare("SELECT id, owner_uid, file_path FROM firebase_media WHERE id = ? LIMIT 1")
+        .get(mediaId) as { id: string; owner_uid: string; file_path: string } | undefined;
+      if (!fbItem) {
+        res.status(404).json({ error: "Media not found." });
+        return;
+      }
+      if (fbItem.owner_uid !== fbUid) {
+        res.status(403).json({ error: "You can only delete media that you uploaded." });
+        return;
+      }
+
+      db.prepare("DELETE FROM firebase_media WHERE id = ? AND owner_uid = ?").run(mediaId, fbUid);
+      const fullPath = path.resolve(baseMediaDir, path.basename(fbItem.file_path));
+      if (fullPath.startsWith(baseMediaDir + path.sep) && fs.existsSync(fullPath)) {
+        try {
+          fs.unlinkSync(fullPath);
+        } catch {
+          /* ignore file unlink race */
+        }
+      }
+      res.json({ ok: true, id: mediaId });
+      return;
+    }
+
+    const me = resolved!.user;
+    const item = db
+      .prepare(
+        "SELECT id, owner_id, file_path, is_public_avatar FROM media_objects WHERE id = ? LIMIT 1",
+      )
+      .get(mediaId) as
+      { id: string; owner_id: string; file_path: string; is_public_avatar: number } | undefined;
+    if (!item) {
+      res.status(404).json({ error: "Media not found." });
+      return;
+    }
+    if (item.owner_id !== me.id) {
+      res.status(403).json({ error: "You can only delete media that you uploaded." });
+      return;
+    }
+    if (item.is_public_avatar === 1) {
+      res.status(400).json({ error: "Profile avatars cannot be deleted from the gallery." });
+      return;
+    }
+
+    db.prepare("UPDATE messages SET media_kind = NULL, media_name = NULL WHERE media_id = ?").run(
+      mediaId,
+    );
+    db.prepare("DELETE FROM media_objects WHERE id = ? AND owner_id = ?").run(mediaId, me.id);
+
+    const fullPath = path.resolve(baseMediaDir, path.basename(item.file_path));
+    if (fullPath.startsWith(baseMediaDir + path.sep) && fs.existsSync(fullPath)) {
+      try {
+        fs.unlinkSync(fullPath);
+      } catch {
+        /* ignore file unlink race */
+      }
+    }
+
+    res.json({ ok: true, id: mediaId });
+  });
+
+  // Protected private media endpoint with ACL & block check
+  router.get("/media/:id", async (req: AuthedRequest, res) => {
+    const fbUid = await resolveFirebaseUid(req);
+    const resolved = fbUid ? null : lookupSessionUser(req);
+    if (!fbUid && !resolved) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    const mediaId = String(req.params["id"] ?? "");
+    const baseMediaDir = path.resolve(mediaDir);
+
+    if (fbUid) {
+      const fbItem = db
+        .prepare("SELECT * FROM firebase_media WHERE id = ? LIMIT 1")
+        .get(mediaId) as
+        | {
+            id: string;
+            owner_uid: string;
+            recipient_uid: string | null;
+            kind: string;
+            mime_type: string;
+            original_name: string;
+            file_path: string;
+          }
+        | undefined;
+      if (!fbItem) {
+        res.status(404).json({ error: "Media not found." });
+        return;
+      }
+      const recipients = (fbItem.recipient_uid ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (fbItem.owner_uid !== fbUid && !recipients.includes(fbUid)) {
+        res.status(403).json({ error: "You do not have permission to access this private media." });
+        return;
+      }
+      const fullPath = path.resolve(baseMediaDir, path.basename(fbItem.file_path));
+      if (!fullPath.startsWith(baseMediaDir + path.sep) || !fs.existsSync(fullPath)) {
+        res.status(404).json({ error: "Media file missing." });
+        return;
+      }
+      res.setHeader("Content-Type", fbItem.mime_type);
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      if (req.query["download"] === "1") {
+        const safeName = fbItem.original_name.replace(/["\r\n]/g, "_");
+        res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+      }
+      res.sendFile(fullPath, { dotfiles: "allow" });
+      return;
+    }
+
+    const me = resolved!.user;
     const item = db.prepare("SELECT * FROM media_objects WHERE id = ? LIMIT 1").get(mediaId) as
       | {
           id: string;
@@ -1698,8 +1973,8 @@ export function createApiRouter() {
       }
     }
 
-    const fullPath = path.join(mediaDir, path.basename(item.file_path));
-    if (!fs.existsSync(fullPath)) {
+    const fullPath = path.resolve(baseMediaDir, path.basename(item.file_path));
+    if (!fullPath.startsWith(baseMediaDir + path.sep) || !fs.existsSync(fullPath)) {
       res.status(404).json({ error: "Media file missing." });
       return;
     }
@@ -1714,8 +1989,58 @@ export function createApiRouter() {
   });
 
   // Gallery for Profile & Chat picker: photos & videos owned by or shared with the signed-in user
-  router.get("/gallery", requireAuth, (req: AuthedRequest, res) => {
-    const me = req.authUser!;
+  router.get("/gallery", async (req: AuthedRequest, res) => {
+    const fbUid = await resolveFirebaseUid(req);
+    const resolved = fbUid ? null : lookupSessionUser(req);
+    if (!fbUid && !resolved) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    if (fbUid) {
+      const rows = db
+        .prepare(
+          `SELECT id, owner_uid, recipient_uid, kind, mime_type, original_name, size_bytes, created_at
+           FROM firebase_media
+           WHERE kind IN ('image', 'video')
+           ORDER BY created_at DESC
+           LIMIT 200`,
+        )
+        .all() as {
+        id: string;
+        owner_uid: string;
+        recipient_uid: string | null;
+        kind: string;
+        mime_type: string;
+        original_name: string;
+        size_bytes: number;
+        created_at: string;
+      }[];
+
+      const visible = rows.filter((r) => {
+        if (r.owner_uid === fbUid) return true;
+        return (r.recipient_uid ?? "")
+          .split(",")
+          .map((s) => s.trim())
+          .includes(fbUid);
+      });
+
+      res.json({
+        items: visible.slice(0, 120).map((r) => ({
+          id: r.id,
+          kind: r.kind as "image" | "video",
+          mimeType: r.mime_type,
+          originalName: r.original_name,
+          sizeBytes: r.size_bytes,
+          createdAt: r.created_at,
+          url: `/api/media/${r.id}`,
+          mine: r.owner_uid === fbUid,
+        })),
+      });
+      return;
+    }
+
+    const me = resolved!.user;
     const rows = db
       .prepare(
         `SELECT id, owner_id, recipient_id, kind, mime_type, original_name, size_bytes, created_at

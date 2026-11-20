@@ -24,8 +24,10 @@ import {
   Settings,
   Share2,
   ShieldAlert,
+  Trash2,
   Volume2,
   VolumeX,
+  X,
 } from "lucide-react";
 import { motion } from "motion/react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -33,9 +35,11 @@ import { toast } from "sonner";
 
 import { BookCover } from "@/components/BookCover";
 import { MediaLightbox } from "@/components/InstagramChatView";
+import { ProtectedImage, ProtectedVideo } from "@/components/ProtectedMedia";
 import { bookById } from "@/lib/books";
 import {
   changePassword,
+  deleteGalleryMedia,
   fetchGallery,
   fetchNfcLink,
   initialsOf,
@@ -56,6 +60,7 @@ import {
 import { progressPercent, useLibrary } from "@/lib/library-store";
 import { SECRET_THEMES, type SecretThemeId, type SecretThemeTokens } from "@/lib/secret-themes";
 import { cn } from "@/lib/utils";
+import { playWaterSound } from "@/lib/water-sound";
 
 export type ProfileSection = "gallery" | "nfc" | "theme" | "settings";
 
@@ -86,10 +91,15 @@ export function InstagramProfileView({
   const [writingNfc, setWritingNfc] = useState(false);
 
   const [lightbox, setLightbox] = useState<{
+    id: string;
     url: string;
     kind: "image" | "video";
     name: string;
+    mine: boolean;
   } | null>(null);
+  const [uploadingGallery, setUploadingGallery] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingMediaId, setDeletingMediaId] = useState<string | null>(null);
 
   const [currentPwd, setCurrentPwd] = useState("");
   const [newPwd, setNewPwd] = useState("");
@@ -146,15 +156,49 @@ export function InstagramProfileView({
   }
 
   async function handleGalleryUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
+    const files = Array.from(e.target.files ?? []);
     e.target.value = "";
-    if (!file) return;
+    if (files.length === 0) return;
+
+    const validFiles = files.filter(
+      (f) => f.type.startsWith("image/") || f.type.startsWith("video/"),
+    );
+    if (validFiles.length === 0) {
+      toast.error("Please choose a real image or video file from your device.");
+      return;
+    }
+
+    setUploadingGallery(true);
+    let uploadedCount = 0;
     try {
-      await uploadChatMedia(file);
+      for (const file of validFiles) {
+        await uploadChatMedia(file);
+        uploadedCount += 1;
+      }
       await fetchGallery();
-      toast.success("Added to your private gallery");
+      toast.success(
+        uploadedCount === 1
+          ? "Added to your private gallery"
+          : `Added ${uploadedCount} items to your private gallery`,
+      );
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Upload failed.");
+    } finally {
+      setUploadingGallery(false);
+    }
+  }
+
+  async function handleDeleteGalleryItem(mediaId: string) {
+    setDeletingMediaId(mediaId);
+    try {
+      await deleteGalleryMedia(mediaId);
+      setConfirmDeleteId((prev) => (prev === mediaId ? null : prev));
+      setLightbox((prev) => (prev?.id === mediaId ? null : prev));
+      toast.success("Removed from your gallery");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not delete media.");
+    } finally {
+      setDeletingMediaId(null);
     }
   }
 
@@ -692,23 +736,26 @@ export function InstagramProfileView({
               <div>
                 <h2 className="font-display text-lg font-bold">Gallery</h2>
                 <p className={cn("text-xs", theme.mutedText)}>
-                  Private photos and videos from your conversations and uploads.
+                  Real photos and videos uploaded from your device or shared in chat.
                 </p>
               </div>
               <button
                 type="button"
+                disabled={uploadingGallery}
                 onClick={() => galleryInputRef.current?.click()}
                 className={cn(
-                  "inline-flex min-h-[40px] shrink-0 items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold",
+                  "inline-flex min-h-[40px] shrink-0 items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold transition disabled:opacity-60",
                   theme.accentBg,
                 )}
               >
-                <Plus className="size-4" /> Add Media
+                <Plus className="size-4" />
+                {uploadingGallery ? "Uploading…" : "Add Photo / Video"}
               </button>
               <input
                 ref={galleryInputRef}
                 type="file"
                 accept="image/*,video/*"
+                multiple
                 onChange={(e) => void handleGalleryUpload(e)}
                 className="hidden"
               />
@@ -716,38 +763,94 @@ export function InstagramProfileView({
 
             {gallery.length > 0 ? (
               <div className="mt-4 grid grid-cols-3 gap-1.5 sm:gap-2.5">
-                {gallery.map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() =>
-                      setLightbox({ url: item.url, kind: item.kind, name: item.originalName })
-                    }
-                    className="group relative aspect-square overflow-hidden rounded-xl bg-black/10"
-                  >
-                    {item.kind === "image" ? (
-                      <img
-                        src={item.url}
-                        alt={item.originalName}
-                        className="size-full object-cover transition duration-200 group-hover:scale-105"
-                      />
-                    ) : (
-                      <>
-                        <video src={item.url} className="size-full object-cover" />
-                        <span className="absolute right-2 top-2 grid size-7 place-items-center rounded-full bg-black/65 text-white">
-                          <Film className="size-3.5" />
-                        </span>
-                      </>
-                    )}
-                  </button>
-                ))}
+                {gallery.map((item) => {
+                  const confirming = confirmDeleteId === item.id;
+                  const deleting = deletingMediaId === item.id;
+                  return (
+                    <div
+                      key={item.id}
+                      data-testid={`gallery-item-${item.id}`}
+                      className="group relative aspect-square overflow-hidden rounded-xl bg-black/10"
+                    >
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setLightbox({
+                            id: item.id,
+                            url: item.url,
+                            kind: item.kind,
+                            name: item.originalName,
+                            mine: item.mine,
+                          })
+                        }
+                        aria-label={`View ${item.originalName}`}
+                        className="block size-full"
+                      >
+                        {item.kind === "image" ? (
+                          <ProtectedImage
+                            src={item.url}
+                            alt={item.originalName}
+                            className="size-full object-cover transition duration-200 group-hover:scale-105"
+                          />
+                        ) : (
+                          <>
+                            <ProtectedVideo src={item.url} className="size-full object-cover" />
+                            <span className="absolute left-2 top-2 grid size-7 place-items-center rounded-full bg-black/65 text-white">
+                              <Film className="size-3.5" />
+                            </span>
+                          </>
+                        )}
+                      </button>
+
+                      {item.mine && !confirming && (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteId(item.id)}
+                          aria-label={`Delete ${item.originalName}`}
+                          title="Delete from gallery"
+                          className="absolute right-1.5 top-1.5 z-10 grid size-8 place-items-center rounded-full bg-black/65 text-white shadow-sm backdrop-blur-sm transition hover:bg-rose-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      )}
+
+                      {item.mine && confirming && (
+                        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-1.5 bg-black/80 p-2 text-center text-white backdrop-blur-sm">
+                          <p className="text-[11px] font-bold leading-tight">
+                            Delete this {item.kind}?
+                          </p>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={deleting}
+                              onClick={() => void handleDeleteGalleryItem(item.id)}
+                              className="min-h-[30px] rounded-lg bg-rose-600 px-2.5 text-[11px] font-bold text-white transition hover:bg-rose-500 disabled:opacity-50"
+                            >
+                              {deleting ? "…" : "Delete"}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={deleting}
+                              onClick={() => setConfirmDeleteId(null)}
+                              aria-label="Cancel delete"
+                              className="grid size-7 place-items-center rounded-lg bg-white/15 text-white transition hover:bg-white/25"
+                            >
+                              <X className="size-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <div className={cn("mt-5 rounded-2xl p-8 text-center", theme.surfaceMuted)}>
                 <Grid3X3 className={cn("mx-auto size-8 opacity-40", theme.mutedText)} />
                 <p className="mt-2 text-sm font-bold">Your gallery is empty</p>
                 <p className={cn("mt-1 text-xs", theme.mutedText)}>
-                  Photos and videos you share in chat or upload here stay protected to your account.
+                  Photos and videos you upload from your device or share in chat stay protected to
+                  your account.
                 </p>
               </div>
             )}
@@ -909,16 +1012,24 @@ export function InstagramProfileView({
               {(Object.keys(SECRET_THEMES) as SecretThemeId[]).map((id) => {
                 const t = SECRET_THEMES[id];
                 const selected = me.theme === id;
+                const isLiquidCard = id === "emerald";
                 return (
-                  <button
+                  <motion.button
                     key={id}
                     type="button"
-                    onClick={() => void handleThemeSelect(id)}
+                    whileHover={{ y: -3, scale: 1.015 }}
+                    whileTap={{ scale: 0.97 }}
+                    transition={{ type: "spring", stiffness: 400, damping: 20 }}
+                    onClick={() => {
+                      playWaterSound("pop", soundEnabled);
+                      void handleThemeSelect(id);
+                    }}
                     className={cn(
                       "flex flex-col rounded-2xl border p-4 text-left transition",
-                      selected ? "ring-2 ring-offset-1" : "opacity-85 hover:opacity-100",
-                      theme.border,
-                      theme.surfaceMuted,
+                      selected ? "ring-2 ring-offset-1" : "opacity-88 hover:opacity-100",
+                      isLiquidCard
+                        ? "liquid-glass-iridescent border-white/85 text-[#1f1b38]"
+                        : cn(theme.border, theme.surfaceMuted),
                     )}
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -931,19 +1042,24 @@ export function InstagramProfileView({
                         </span>
                       )}
                     </div>
-                    <p className={cn("mt-1 flex-1 text-xs leading-relaxed", theme.mutedText)}>
+                    <p
+                      className={cn(
+                        "mt-1 flex-1 text-xs leading-relaxed",
+                        isLiquidCard ? "text-[#484366]" : theme.mutedText,
+                      )}
+                    >
                       {t.description}
                     </p>
                     <div className="mt-3 flex gap-1.5">
                       {t.swatches.map((hex) => (
                         <span
                           key={hex}
-                          className="h-5 flex-1 rounded-md border border-black/10"
+                          className="h-5 flex-1 rounded-md border border-white/60 shadow-inner"
                           style={{ backgroundColor: hex }}
                         />
                       ))}
                     </div>
-                  </button>
+                  </motion.button>
                 );
               })}
             </div>
@@ -1179,7 +1295,12 @@ export function InstagramProfileView({
         )}
       </div>
 
-      <MediaLightbox media={lightbox} onClose={() => setLightbox(null)} />
+      <MediaLightbox
+        media={lightbox}
+        canDelete={Boolean(lightbox?.mine)}
+        onDelete={lightbox ? () => handleDeleteGalleryItem(lightbox.id) : undefined}
+        onClose={() => setLightbox(null)}
+      />
     </div>
   );
 }

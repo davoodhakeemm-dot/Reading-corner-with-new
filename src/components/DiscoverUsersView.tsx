@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { UserProfileModal } from "@/components/UserProfileModal";
+import { WaterGlowButton } from "@/components/WaterGlowButton";
 import {
   discoverUsers,
   followUser,
@@ -14,8 +15,9 @@ import {
   useChat,
   type PublicAccount,
 } from "@/lib/chat-store";
-import type { SecretThemeTokens } from "@/lib/secret-themes";
+import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
 import { cn } from "@/lib/utils";
+import { playWaterSound } from "@/lib/water-sound";
 
 type FilterMode = "all" | "following" | "followers";
 
@@ -26,7 +28,7 @@ export function DiscoverUsersView({
   theme: SecretThemeTokens;
   onStartMessage: (userId: string) => void;
 }) {
-  const { me, discoveredUsers } = useChat();
+  const { me, discoveredUsers, soundEnabled } = useChat();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterMode>("all");
   const [users, setUsers] = useState<PublicAccount[]>(discoveredUsers);
@@ -97,18 +99,18 @@ export function DiscoverUsersView({
           </div>
 
           {me && (
-            <button
+            <WaterGlowButton
               type="button"
+              variant={resolveWaterButtonVariant(theme.id, "surface")}
+              size="sm"
+              sound="pop"
+              soundEnabled={soundEnabled}
               onClick={() => void setSecretTheme(theme.isDark ? "instagram" : "dark")}
               aria-label={theme.isDark ? "Switch to light mode" : "Switch to dark mode"}
-              className={cn(
-                "glass-sheen inline-flex min-h-[40px] items-center gap-1.5 rounded-full border px-3.5 text-xs font-bold transition hover:scale-[1.02]",
-                theme.glassPill,
-              )}
             >
               {theme.isDark ? <Sun className="size-4" /> : <Moon className="size-4" />}
               <span>{theme.isDark ? "Light" : "Dark"}</span>
-            </button>
+            </WaterGlowButton>
           )}
         </div>
 
@@ -116,7 +118,7 @@ export function DiscoverUsersView({
         <div
           className={cn(
             "space-y-3 rounded-[28px] border p-4 backdrop-blur-2xl",
-            theme.surfaceGlass,
+            theme.id === "emerald" ? "liquid-glass-panel" : theme.surfaceGlass,
             theme.border,
           )}
         >
@@ -134,8 +136,12 @@ export function DiscoverUsersView({
               placeholder="Search users by name or @username…"
               aria-label="Search registered users"
               className={cn(
-                "w-full rounded-full border py-3 pl-11 pr-10 text-sm outline-none transition focus:ring-2 focus:ring-current/15",
-                theme.glassRow,
+                "w-full rounded-full py-3 pl-11 pr-10 text-sm outline-none transition focus:ring-2 focus:ring-sky-400/40",
+                theme.isDark
+                  ? "neu-inset-dark text-white"
+                  : theme.id === "emerald"
+                    ? "liquid-glass-inset text-[#1f1b38]"
+                    : "neu-inset-light text-[#1e293b]",
               )}
             />
             {query && (
@@ -164,9 +170,12 @@ export function DiscoverUsersView({
                   <button
                     key={tab.id}
                     type="button"
-                    onClick={() => setFilter(tab.id)}
+                    onClick={() => {
+                      playWaterSound("pop", soundEnabled);
+                      setFilter(tab.id);
+                    }}
                     className={cn(
-                      "rounded-full px-3.5 py-1.5 text-xs font-bold transition",
+                      "min-h-[36px] rounded-full px-3.5 py-1.5 text-xs font-bold transition",
                       active ? theme.navActiveBg : cn(theme.surfaceMuted, theme.mutedText),
                     )}
                   >
@@ -208,7 +217,7 @@ export function DiscoverUsersView({
                 transition={{ delay: Math.min(idx * 0.03, 0.25), duration: 0.22 }}
                 className={cn(
                   "flex flex-col justify-between gap-3 rounded-[26px] border p-4 backdrop-blur-xl transition",
-                  theme.surfaceGlass,
+                  theme.id === "emerald" ? "liquid-glass-panel" : theme.surfaceGlass,
                   theme.border,
                   theme.cardShadow,
                 )}
@@ -287,25 +296,30 @@ export function DiscoverUsersView({
                 </div>
 
                 <div className="grid grid-cols-3 gap-2 pt-1">
-                  <button
+                  <WaterGlowButton
                     type="button"
+                    variant={resolveWaterButtonVariant(theme.id, "surface")}
+                    size="sm"
+                    sound="pop"
+                    soundEnabled={soundEnabled}
                     onClick={() => setSelectedUser(u)}
-                    className={cn(
-                      "min-h-[38px] rounded-xl border px-2.5 text-xs font-bold transition hover:opacity-90",
-                      theme.surfaceMuted,
-                      theme.border,
-                    )}
+                    className="px-2"
                   >
                     Profile
-                  </button>
-                  <button
+                  </WaterGlowButton>
+                  <WaterGlowButton
                     type="button"
+                    variant={
+                      u.isFollowing
+                        ? resolveWaterButtonVariant(theme.id, "surface")
+                        : resolveWaterButtonVariant(theme.id, "secondary")
+                    }
+                    size="sm"
+                    sound="droplet"
+                    soundEnabled={soundEnabled}
                     disabled={busyId === u.id}
                     onClick={() => void handleFollowToggle(u)}
-                    className={cn(
-                      "inline-flex min-h-[38px] items-center justify-center gap-1 rounded-xl border px-2.5 text-xs font-bold transition disabled:opacity-50",
-                      u.isFollowing ? cn(theme.surfaceMuted, theme.border) : theme.accentBg,
-                    )}
+                    className="px-2"
                   >
                     {u.isFollowing ? (
                       <>
@@ -316,17 +330,18 @@ export function DiscoverUsersView({
                         <UserPlus className="size-3.5" /> Follow
                       </>
                     )}
-                  </button>
-                  <button
+                  </WaterGlowButton>
+                  <WaterGlowButton
                     type="button"
+                    variant={resolveWaterButtonVariant(theme.id, "primary")}
+                    size="sm"
+                    sound="droplet"
+                    soundEnabled={soundEnabled}
                     onClick={() => onStartMessage(u.id)}
-                    className={cn(
-                      "inline-flex min-h-[38px] items-center justify-center gap-1 rounded-xl px-2.5 text-xs font-bold transition hover:opacity-95",
-                      theme.accentBg,
-                    )}
+                    className="px-2"
                   >
                     <MessageCircle className="size-3.5" /> Message
-                  </button>
+                  </WaterGlowButton>
                 </div>
               </motion.div>
             ))}

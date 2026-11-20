@@ -11,6 +11,7 @@ import { TripleTapExit } from "@/components/TripleTapExit";
 import { initialsOf, openThread, respondToCall, useChat } from "@/lib/chat-store";
 import { getSecretTheme } from "@/lib/secret-themes";
 import { cn } from "@/lib/utils";
+import { playWaterSound } from "@/lib/water-sound";
 
 export type ShellTab = "chat" | "discover" | "profile";
 
@@ -22,9 +23,14 @@ export function InstagramShell({
   initialProfileSection?: ProfileSection;
 }) {
   const navigate = useNavigate();
-  const { ready, me, conversations, incomingCall, outgoingCall } = useChat();
+  const { ready, me, conversations, incomingCall, outgoingCall, soundEnabled } = useChat();
   const [tab, setTab] = useState<ShellTab>(initialTab);
   const [threadOpenOnMobile, setThreadOpenOnMobile] = useState(false);
+
+  function selectTab(nextTab: ShellTab) {
+    playWaterSound("pop", soundEnabled);
+    setTab(nextTab);
+  }
 
   useEffect(() => {
     setTab(initialTab);
@@ -138,7 +144,7 @@ export function InstagramShell({
           <nav className="space-y-2">
             <button
               type="button"
-              onClick={() => setTab("chat")}
+              onClick={() => selectTab("chat")}
               className={cn(
                 "relative flex min-h-[48px] w-full items-center justify-center gap-3 rounded-2xl px-3 text-sm font-bold transition lg:justify-start",
                 tab === "chat" ? theme.navActiveText : theme.mutedText,
@@ -169,7 +175,7 @@ export function InstagramShell({
 
             <button
               type="button"
-              onClick={() => setTab("discover")}
+              onClick={() => selectTab("discover")}
               className={cn(
                 "relative flex min-h-[48px] w-full items-center justify-center gap-3 rounded-2xl px-3 text-sm font-bold transition lg:justify-start",
                 tab === "discover" ? theme.navActiveText : theme.mutedText,
@@ -188,7 +194,7 @@ export function InstagramShell({
 
             <button
               type="button"
-              onClick={() => setTab("profile")}
+              onClick={() => selectTab("profile")}
               className={cn(
                 "relative flex min-h-[48px] w-full items-center justify-center gap-3 rounded-2xl px-3 text-sm font-bold transition lg:justify-start",
                 tab === "profile" ? theme.navActiveText : theme.mutedText,
@@ -294,7 +300,7 @@ export function InstagramShell({
           <div className="mx-auto grid max-w-md grid-cols-3 gap-1">
             <button
               type="button"
-              onClick={() => setTab("chat")}
+              onClick={() => selectTab("chat")}
               className={cn(
                 "relative flex min-h-[48px] items-center justify-center gap-1.5 rounded-[22px] px-2 text-xs font-bold transition",
                 tab === "chat" ? theme.navActiveText : theme.mutedText,
@@ -325,7 +331,7 @@ export function InstagramShell({
 
             <button
               type="button"
-              onClick={() => setTab("discover")}
+              onClick={() => selectTab("discover")}
               className={cn(
                 "relative flex min-h-[48px] items-center justify-center gap-1.5 rounded-[22px] px-2 text-xs font-bold transition",
                 tab === "discover" ? theme.navActiveText : theme.mutedText,
@@ -344,7 +350,7 @@ export function InstagramShell({
 
             <button
               type="button"
-              onClick={() => setTab("profile")}
+              onClick={() => selectTab("profile")}
               className={cn(
                 "relative flex min-h-[48px] items-center justify-center gap-1.5 rounded-[22px] px-2 text-xs font-bold transition",
                 tab === "profile" ? theme.navActiveText : theme.mutedText,

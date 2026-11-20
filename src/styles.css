@@ -119,21 +119,21 @@
 
 /* Secret-page theme synchronization for consistent accents across Reading pages */
 html[data-secret-theme="instagram"] {
-  --gradient-brand: linear-gradient(135deg, #f58529 0%, #dd2a7b 52%, #8134af 100%);
-  --primary: oklch(0.55 0.22 350);
-  --ring: oklch(0.55 0.22 350);
+  --gradient-brand: linear-gradient(135deg, #4ec4df 0%, #259df4 52%, #006eff 100%);
+  --primary: oklch(0.58 0.18 242);
+  --ring: oklch(0.58 0.18 242);
 }
 
 html[data-secret-theme="emerald"] {
-  --gradient-brand: linear-gradient(135deg, #059669 0%, #10b981 60%, #f97316 100%);
-  --primary: oklch(0.54 0.14 162);
-  --ring: oklch(0.54 0.14 162);
+  --gradient-brand: linear-gradient(135deg, #9d7cff 0%, #6d5dfc 48%, #2dd4bf 100%);
+  --primary: oklch(0.58 0.2 280);
+  --ring: oklch(0.58 0.2 280);
 }
 
 html[data-secret-theme="dark"] {
-  --gradient-brand: linear-gradient(135deg, #e11d48 0%, #be123c 55%, #2563eb 100%);
-  --primary: oklch(0.58 0.22 18);
-  --ring: oklch(0.58 0.22 18);
+  --gradient-brand: linear-gradient(135deg, #06b6d4 0%, #2563eb 55%, #4f46e5 100%);
+  --primary: oklch(0.62 0.2 250);
+  --ring: oklch(0.62 0.2 250);
 }
 
 @layer base {
@@ -239,6 +239,32 @@ html[data-secret-theme="dark"] {
   }
 }
 
+@keyframes waterRippleWave {
+  0% {
+    transform: translate(-50%, -50%) scale(0);
+    opacity: 0.72;
+  }
+  60% {
+    opacity: 0.36;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0;
+  }
+}
+
+@keyframes waterGlowPulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.98);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.03);
+  }
+}
+
 @utility glass-sheen {
   position: relative;
   overflow: hidden;
@@ -251,11 +277,103 @@ html[data-secret-theme="dark"] {
     background: linear-gradient(
       90deg,
       transparent 0%,
-      rgba(255, 255, 255, 0.22) 50%,
+      rgba(255, 255, 255, 0.24) 50%,
       transparent 100%
     );
     animation: glassSheen 6.5s cubic-bezier(0.22, 1, 0.36, 1) infinite;
   }
+}
+
+/* Soft 3D Neumorphic Elevation & Inset Surfaces (visual style from 3D slate reference) */
+@utility neu-card-light {
+  background: linear-gradient(145deg, #f2f6fb 0%, #e7eef6 100%);
+  box-shadow:
+    16px 18px 38px rgba(154, 174, 200, 0.42),
+    -14px -14px 32px rgba(255, 255, 255, 0.95),
+    inset 1.5px 1.5px 2px rgba(255, 255, 255, 0.92);
+}
+
+@utility neu-card-dark {
+  background: linear-gradient(145deg, #131b2e 0%, #0b1120 100%);
+  box-shadow:
+    18px 20px 42px rgba(2, 6, 16, 0.78),
+    -10px -10px 26px rgba(56, 189, 248, 0.08),
+    inset 1.5px 1.5px 2px rgba(148, 197, 255, 0.16);
+}
+
+@utility neu-inset-light {
+  background: linear-gradient(145deg, #e5ecf4 0%, #f5f8fc 100%);
+  box-shadow:
+    inset 5px 5px 11px rgba(164, 182, 206, 0.52),
+    inset -5px -5px 11px rgba(255, 255, 255, 0.95),
+    0 1px 0 rgba(255, 255, 255, 0.85);
+}
+
+@utility neu-inset-dark {
+  background: linear-gradient(145deg, #0b1220 0%, #131d32 100%);
+  box-shadow:
+    inset 4px 4px 10px rgba(2, 6, 18, 0.75),
+    inset -3px -3px 8px rgba(59, 130, 246, 0.12),
+    0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+@utility neu-raised-light {
+  background: linear-gradient(145deg, #f8fbff 0%, #eaf0f8 100%);
+  box-shadow:
+    6px 8px 18px rgba(160, 178, 204, 0.36),
+    -5px -5px 14px rgba(255, 255, 255, 0.96),
+    inset 1px 1px 1px rgba(255, 255, 255, 0.95);
+}
+
+@utility neu-raised-dark {
+  background: linear-gradient(145deg, #18233a 0%, #10182a 100%);
+  box-shadow:
+    6px 8px 18px rgba(2, 6, 18, 0.65),
+    -4px -4px 12px rgba(56, 189, 248, 0.07),
+    inset 1px 1px 1px rgba(186, 230, 253, 0.14);
+}
+
+/* Refractive Iridescent Liquid Glass Surfaces (visual style from Liquid Glass reference) */
+@utility liquid-glass-panel {
+  background: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.56) 0%,
+    rgba(241, 245, 255, 0.34) 52%,
+    rgba(232, 250, 252, 0.44) 100%
+  );
+  backdrop-filter: blur(26px) saturate(160%);
+  box-shadow:
+    0 24px 52px -14px rgba(124, 92, 255, 0.24),
+    0 12px 30px -10px rgba(45, 212, 191, 0.22),
+    inset 0 2px 2px rgba(255, 255, 255, 0.94),
+    inset 0 -1.5px 3px rgba(124, 92, 255, 0.16);
+}
+
+@utility liquid-glass-iridescent {
+  background: linear-gradient(
+    135deg,
+    rgba(255, 224, 206, 0.66) 0%,
+    rgba(229, 214, 255, 0.62) 50%,
+    rgba(196, 248, 245, 0.68) 100%
+  );
+  backdrop-filter: blur(22px) saturate(165%);
+  box-shadow:
+    0 18px 38px -12px rgba(124, 92, 255, 0.26),
+    0 10px 24px -10px rgba(45, 212, 191, 0.24),
+    inset 0 1.5px 2px rgba(255, 255, 255, 0.96);
+}
+
+@utility liquid-glass-inset {
+  background: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.68) 0%,
+    rgba(244, 246, 255, 0.46) 100%
+  );
+  backdrop-filter: blur(18px) saturate(150%);
+  box-shadow:
+    inset 0 2px 6px rgba(124, 92, 255, 0.14),
+    inset 0 1px 1px rgba(255, 255, 255, 0.92),
+    0 8px 20px -10px rgba(99, 102, 241, 0.22);
 }
 
 /* Reading surface themes */

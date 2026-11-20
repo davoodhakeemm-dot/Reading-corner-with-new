@@ -12,6 +12,7 @@ const IS_PROD = process.env["NODE_ENV"] === "production";
 
 async function startServer() {
   const app = express();
+  app.set("trust proxy", 1);
   const httpServer = http.createServer(app);
 
   // Real-time WebSocket server multiplexed on port 3000 (/ws)

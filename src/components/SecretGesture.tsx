@@ -1,6 +1,8 @@
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 
+import { useChat } from "@/lib/chat-store";
+
 const HOLD_MS = 7000;
 const HIDDEN_PREFIXES = ["/auth", "/chat", "/messages", "/chat-settings", "/nfc"];
 
@@ -11,10 +13,16 @@ const HIDDEN_PREFIXES = ["/auth", "/chat", "/messages", "/chat-settings", "/nfc"
 export function SecretGesture() {
   const navigate = useNavigate();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const { me } = useChat();
   const [progress, setProgress] = useState(0);
   const timer = useRef<number | null>(null);
   const tick = useRef<number | null>(null);
   const start = useRef<{ x: number; y: number } | null>(null);
+  const signedInRef = useRef(Boolean(me));
+
+  useEffect(() => {
+    signedInRef.current = Boolean(me);
+  }, [me]);
 
   const disabled = HIDDEN_PREFIXES.some((p) => pathname.startsWith(p));
 
@@ -41,7 +49,7 @@ export function SecretGesture() {
       }, 100);
       timer.current = window.setTimeout(() => {
         clear();
-        navigate({ to: "/auth" });
+        navigate({ to: signedInRef.current ? "/messages" : "/auth" });
       }, HOLD_MS);
     }
 

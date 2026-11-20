@@ -240,3 +240,103 @@ test("Account registration, duplicate prevention, session persistence, discovery
   });
   assert.equal(blockedSend.status, 403);
 });
+
+test("Gallery real image upload, binary retrieval, and owner-only delete", async () => {
+  const regOwner = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Gallery Owner",
+      username: "gallery_owner",
+      email: "gallery.owner@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(regOwner.status, 201);
+  const ownerToken = regOwner.data.token;
+
+  const regOther = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Gallery Other",
+      username: "gallery_other",
+      email: "gallery.other@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(regOther.status, 201);
+  const otherToken = regOther.data.token;
+
+  // Minimal valid 1x1 PNG binary
+  const pngBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const form = new FormData();
+  form.append("file", new Blob([pngBytes], { type: "image/png" }), "cover-photo.png");
+
+  const uploadResp = await fetch(`${baseUrl}/media`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ownerToken}` },
+    body: form,
+  });
+  assert.equal(uploadResp.status, 201);
+  const uploaded = (await uploadResp.json()) as {
+    id: string;
+    kind: string;
+    mimeType: string;
+    originalName: string;
+    sizeBytes: number;
+    url: string;
+    mine: boolean;
+  };
+  assert.equal(uploaded.kind, "image");
+  assert.equal(uploaded.mimeType, "image/png");
+  assert.equal(uploaded.originalName, "cover-photo.png");
+  assert.equal(uploaded.sizeBytes, pngBytes.length);
+  assert.equal(uploaded.mine, true);
+
+  // Listed in /api/gallery
+  const galleryRes = await api<{ items: { id: string; url: string; mine: boolean }[] }>(
+    "/gallery",
+    { token: ownerToken },
+  );
+  assert.equal(galleryRes.status, 200);
+  assert.equal(galleryRes.data.items.length, 1);
+  assert.equal(galleryRes.data.items[0]?.id, uploaded.id);
+  assert.equal(galleryRes.data.items[0]?.mine, true);
+
+  // Real binary image served with image/png content-type
+  const mediaResp = await fetch(`${baseUrl}/media/${uploaded.id}`, {
+    headers: { Authorization: `Bearer ${ownerToken}` },
+  });
+  assert.equal(mediaResp.status, 200);
+  assert.equal(mediaResp.headers.get("content-type"), "image/png");
+  const downloadedBytes = Buffer.from(await mediaResp.arrayBuffer());
+  assert.deepEqual(downloadedBytes, pngBytes);
+
+  // Another user cannot delete it
+  const forbiddenDel = await api(`/media/${uploaded.id}`, {
+    method: "DELETE",
+    token: otherToken,
+  });
+  assert.equal(forbiddenDel.status, 403);
+
+  // Owner can delete it
+  const ownerDel = await api<{ ok: boolean; id: string }>(`/media/${uploaded.id}`, {
+    method: "DELETE",
+    token: ownerToken,
+  });
+  assert.equal(ownerDel.status, 200);
+  assert.equal(ownerDel.data.ok, true);
+  assert.equal(ownerDel.data.id, uploaded.id);
+
+  // No longer in gallery or accessible on disk
+  const afterGallery = await api<{ items: unknown[] }>("/gallery", { token: ownerToken });
+  assert.equal(afterGallery.status, 200);
+  assert.equal(afterGallery.data.items.length, 0);
+
+  const afterMedia = await fetch(`${baseUrl}/media/${uploaded.id}`, {
+    headers: { Authorization: `Bearer ${ownerToken}` },
+  });
+  assert.equal(afterMedia.status, 404);
+});

@@ -34,6 +34,8 @@ import {
   User as UserIcon,
   Users,
   Video,
+  Volume2,
+  VolumeX,
   X,
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
@@ -41,10 +43,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Logo } from "@/components/Logo";
+import { ProtectedAudio, ProtectedImage, ProtectedVideo } from "@/components/ProtectedMedia";
 import { UserProfileModal } from "@/components/UserProfileModal";
+import { WaterGlowButton } from "@/components/WaterGlowButton";
 import {
   blockUser,
   deleteChatMessage,
+  downloadProtectedMedia,
   editChatMessage,
   fetchGallery,
   formatRelative,
@@ -58,6 +63,7 @@ import {
   sendChatMessage,
   sendTyping,
   setSecretTheme,
+  setSoundEnabled,
   unblockUser,
   updateConversationSettings,
   uploadChatMedia,
@@ -66,8 +72,10 @@ import {
   type MediaKind,
   type PublicAccount,
 } from "@/lib/chat-store";
-import type { SecretThemeTokens } from "@/lib/secret-themes";
+import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
+import { filterConversationsByTab, splitChatSidebarUsers } from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
+import { playWaterSound } from "@/lib/water-sound";
 
 const EMOJIS = [
   "😀",
@@ -132,13 +140,24 @@ function UserAvatar({
 
 export function MediaLightbox({
   media,
+  canDelete = false,
+  onDelete,
   onClose,
 }: {
-  media: { url: string; kind: "image" | "video"; name: string } | null;
+  media: { id?: string; url: string; kind: "image" | "video"; name: string } | null;
+  canDelete?: boolean;
+  onDelete?: () => Promise<void> | void;
   onClose: () => void;
 }) {
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  useEffect(() => {
+    setConfirmDelete(false);
+    setDeleting(false);
+  }, [media?.url]);
+
   if (!media) return null;
-  const downloadHref = `${media.url}${media.url.includes("?") ? "&" : "?"}download=1`;
 
   return (
     <AnimatePresence>
@@ -151,13 +170,56 @@ export function MediaLightbox({
         <div className="flex items-center justify-between gap-3 px-4 py-3">
           <p className="truncate text-sm font-semibold">{media.name}</p>
           <div className="flex items-center gap-2">
-            <a
-              href={downloadHref}
-              download={media.name}
+            {canDelete &&
+              onDelete &&
+              (confirmDelete ? (
+                <div className="flex items-center gap-1.5 rounded-full bg-rose-950/90 px-2 py-1 ring-1 ring-rose-500/60">
+                  <button
+                    type="button"
+                    disabled={deleting}
+                    onClick={async () => {
+                      setDeleting(true);
+                      try {
+                        await onDelete();
+                        onClose();
+                      } finally {
+                        setDeleting(false);
+                      }
+                    }}
+                    className="min-h-[32px] rounded-full bg-rose-600 px-3 text-xs font-bold text-white transition hover:bg-rose-500 disabled:opacity-50"
+                  >
+                    {deleting ? "Deleting…" : "Confirm Delete"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={deleting}
+                    onClick={() => setConfirmDelete(false)}
+                    className="min-h-[32px] rounded-full px-2.5 text-xs font-semibold text-white/80 hover:text-white"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmDelete(true)}
+                  aria-label="Delete media"
+                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-full bg-rose-600/85 px-3.5 py-2 text-xs font-bold text-white transition hover:bg-rose-600"
+                >
+                  <Trash2 className="size-4" /> Delete
+                </button>
+              ))}
+            <button
+              type="button"
+              onClick={() =>
+                void downloadProtectedMedia(media.url, media.name).catch(() =>
+                  toast.error("Could not download media."),
+                )
+              }
               className="inline-flex min-h-[40px] items-center gap-1.5 rounded-full bg-white/15 px-3.5 py-2 text-xs font-bold text-white transition hover:bg-white/25"
             >
               <Download className="size-4" /> Download
-            </a>
+            </button>
             <button
               type="button"
               onClick={onClose}
@@ -170,13 +232,13 @@ export function MediaLightbox({
         </div>
         <div className="flex flex-1 items-center justify-center overflow-hidden p-4">
           {media.kind === "image" ? (
-            <img
+            <ProtectedImage
               src={media.url}
               alt={media.name}
               className="max-h-full max-w-full rounded-2xl object-contain"
             />
           ) : (
-            <video
+            <ProtectedVideo
               src={media.url}
               controls
               autoPlay
@@ -201,9 +263,19 @@ export function InstagramChatView({
   onOpenDiscover?: () => void;
   onThreadOpenChange?: (open: boolean) => void;
 }) {
-  const { me, conversations, activePeerId, threads, typingByPeer, gallery } = useChat();
+  const {
+    me,
+    conversations,
+    discoveredUsers,
+    activePeerId,
+    threads,
+    typingByPeer,
+    gallery,
+    soundEnabled,
+  } = useChat();
 
   const [query, setQuery] = useState("");
+  const [chatFilterTab, setChatFilterTab] = useState<"all" | "unread">("all");
   const [searchResults, setSearchResults] = useState<PublicAccount[]>([]);
   const [searching, setSearching] = useState(false);
 
@@ -340,11 +412,30 @@ export function InstagramChatView({
     };
   }, [activePeerId, threadSearchOpen, threadSearchQuery]);
 
+  const convPeerIds = useMemo(() => new Set(conversations.map((c) => c.peer.id)), [conversations]);
+  const unreadTotal = useMemo(
+    () => conversations.reduce((acc, c) => acc + c.unreadCount, 0),
+    [conversations],
+  );
+  const filteredConversations = useMemo(
+    () => filterConversationsByTab(conversations, chatFilterTab),
+    [conversations, chatFilterTab],
+  );
+  const directoryPeers = useMemo(
+    () => splitChatSidebarUsers(discoveredUsers, convPeerIds),
+    [discoveredUsers, convPeerIds],
+  );
+
   const activeConv = useMemo(
     () => conversations.find((c) => c.peer.id === activePeerId) ?? null,
     [conversations, activePeerId],
   );
-  const activePeer = activeConv?.peer ?? null;
+  const activePeer = useMemo(
+    () =>
+      activeConv?.peer ??
+      (activePeerId ? (discoveredUsers.find((u) => u.id === activePeerId) ?? null) : null),
+    [activeConv, activePeerId, discoveredUsers],
+  );
   const activeMessages: ChatMessage[] = useMemo(
     () => (activePeerId ? (threads[activePeerId] ?? []) : []),
     [activePeerId, threads],
@@ -470,6 +561,7 @@ export function InstagramChatView({
     setSending(true);
     try {
       await sendChatMessage(activePeerId, text, pendingMedia?.id ?? null, replyingTo?.id ?? null);
+      playWaterSound("droplet", soundEnabled);
       setDraft("");
       setPendingMedia(null);
       setReplyingTo(null);
@@ -607,9 +699,28 @@ export function InstagramChatView({
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
             <motion.button
-              whileTap={{ scale: 0.94 }}
+              whileTap={{ scale: 0.9 }}
               type="button"
-              onClick={() => void setSecretTheme(theme.isDark ? "instagram" : "dark")}
+              onClick={() => {
+                playWaterSound("pop", !soundEnabled);
+                setSoundEnabled(!soundEnabled);
+              }}
+              aria-label={soundEnabled ? "Mute water sounds" : "Enable water sounds"}
+              title={soundEnabled ? "Sound on" : "Sound muted"}
+              className={cn(
+                "grid size-9 place-items-center rounded-full border transition",
+                theme.glassPill,
+              )}
+            >
+              {soundEnabled ? <Volume2 className="size-4" /> : <VolumeX className="size-4" />}
+            </motion.button>
+            <motion.button
+              whileTap={{ scale: 0.9 }}
+              type="button"
+              onClick={() => {
+                playWaterSound("pop", soundEnabled);
+                void setSecretTheme(theme.isDark ? "instagram" : "dark");
+              }}
               aria-label={theme.isDark ? "Switch to light mode" : "Switch to dark mode"}
               title={theme.isDark ? "Light mode" : "Dark mode"}
               className={cn(
@@ -678,11 +789,71 @@ export function InstagramChatView({
           transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
           className={cn(
             "relative mx-2.5 mb-20 mt-1 flex min-h-0 flex-1 flex-col overflow-hidden rounded-[30px] border md:mx-3 md:mb-3",
-            theme.glassSheet,
+            theme.id === "emerald" ? "liquid-glass-panel" : theme.glassSheet,
           )}
         >
-          {/* Inner Frosted Search Pill */}
-          <div className="p-3.5 pb-2.5">
+          {/* 3D Segmented All | Unread Tabs + Recessed Search */}
+          <div className="space-y-2.5 p-3.5 pb-2.5">
+            <div
+              className={cn(
+                "grid grid-cols-2 gap-1.5 rounded-full p-1",
+                theme.isDark
+                  ? "neu-inset-dark"
+                  : theme.id === "emerald"
+                    ? "liquid-glass-inset"
+                    : "neu-inset-light",
+              )}
+            >
+              {(
+                [
+                  { id: "all", label: "All" },
+                  { id: "unread", label: "Unread" },
+                ] as const
+              ).map(({ id, label }) => {
+                const active = chatFilterTab === id;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => {
+                      playWaterSound("pop", soundEnabled);
+                      setChatFilterTab(id);
+                    }}
+                    className={cn(
+                      "relative flex min-h-[36px] items-center justify-center gap-1.5 rounded-full text-xs font-bold transition",
+                      active ? theme.text : theme.mutedText,
+                    )}
+                  >
+                    {active && (
+                      <motion.span
+                        layoutId="chatSidebarFilterTab"
+                        transition={{ type: "spring", stiffness: 420, damping: 26 }}
+                        className={cn(
+                          "absolute inset-0 rounded-full",
+                          theme.isDark
+                            ? "neu-raised-dark"
+                            : theme.id === "emerald"
+                              ? "liquid-glass-iridescent border border-white/85"
+                              : "neu-raised-light",
+                        )}
+                      />
+                    )}
+                    <span className="relative z-10">{label}</span>
+                    {id === "unread" && unreadTotal > 0 && (
+                      <span
+                        className={cn(
+                          "relative z-10 grid min-w-[18px] place-items-center rounded-full px-1.5 py-0.5 text-[10px] font-bold tabular-nums",
+                          theme.badgeBg,
+                        )}
+                      >
+                        {unreadTotal > 99 ? "99+" : unreadTotal}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
             <div className="relative">
               <Search
                 className={cn(
@@ -696,8 +867,12 @@ export function InstagramChatView({
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search readers by name or @username…"
                 className={cn(
-                  "w-full rounded-full border py-2.5 pl-11 pr-9 text-sm outline-none transition focus:ring-2 focus:ring-current/15",
-                  theme.glassRow,
+                  "w-full rounded-full py-2.5 pl-11 pr-9 text-sm outline-none transition focus:ring-2 focus:ring-sky-400/40",
+                  theme.isDark
+                    ? "neu-inset-dark text-white"
+                    : theme.id === "emerald"
+                      ? "liquid-glass-inset text-[#1f1b38]"
+                      : "neu-inset-light text-[#1e293b]",
                 )}
               />
               {query && (
@@ -770,7 +945,7 @@ export function InstagramChatView({
                     </button>
                   )}
                 </div>
-                {conversations.map((c, idx) => {
+                {filteredConversations.map((c, idx) => {
                   const selected = c.peer.id === activePeerId;
                   const isTyping = typingByPeer[c.peer.id];
                   const preview = c.lastMessage?.deletedAt
@@ -784,18 +959,21 @@ export function InstagramChatView({
                     <motion.button
                       key={c.peer.id}
                       initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
+                      animate={{ opacity: 1, y: 0, scale: selected ? 1.01 : 1 }}
                       transition={{
                         delay: Math.min(idx * 0.04, 0.24),
                         duration: 0.24,
                         ease: [0.16, 1, 0.3, 1],
                       }}
                       whileHover={{ y: -2 }}
-                      whileTap={{ scale: 0.98 }}
+                      whileTap={{ scale: 0.97 }}
                       type="button"
-                      onClick={() => void openThread(c.peer.id)}
+                      onClick={() => {
+                        playWaterSound("pop", soundEnabled);
+                        void openThread(c.peer.id);
+                      }}
                       className={cn(
-                        "flex min-h-[66px] w-full items-center gap-3 rounded-[26px] border px-3 py-2.5 text-left transition",
+                        "flex min-h-[66px] w-full items-center gap-3 rounded-[24px] border px-3 py-2.5 text-left transition",
                         selected ? theme.glassRowSelected : theme.glassRow,
                       )}
                     >
@@ -856,24 +1034,92 @@ export function InstagramChatView({
                   );
                 })}
 
-                {conversations.length === 0 && (
-                  <div className="px-5 py-12 text-center">
-                    <MessageCircle className={cn("mx-auto size-10 opacity-40", theme.mutedText)} />
-                    <p className="mt-3 text-sm font-bold">No conversations yet</p>
-                    <p className={cn("mt-1 text-xs leading-relaxed", theme.mutedText)}>
-                      Search above or open Discover Readers to message anyone on Reading Corner.
-                    </p>
-                    {onOpenDiscover && (
-                      <button
-                        type="button"
-                        onClick={onOpenDiscover}
+                {directoryPeers.length > 0 && (
+                  <div className={cn(conversations.length > 0 ? "pt-3" : "pt-1", "space-y-2")}>
+                    <div className="flex items-center justify-between px-2 py-1">
+                      <span
                         className={cn(
-                          "mt-4 inline-flex items-center gap-1.5 rounded-full px-4 py-2 text-xs font-bold",
-                          theme.accentBg,
+                          "inline-flex items-center gap-1.5 text-xs font-bold",
+                          theme.text,
                         )}
                       >
+                        <Compass className={cn("size-3.5", theme.accentText)} /> Registered Readers
+                        <span className={cn("font-semibold tabular-nums", theme.mutedText)}>
+                          ({directoryPeers.length})
+                        </span>
+                      </span>
+                    </div>
+                    {directoryPeers.map((u, idx) => (
+                      <motion.button
+                        key={u.id}
+                        initial={{ opacity: 0, y: 8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{
+                          delay: Math.min(idx * 0.03, 0.2),
+                          duration: 0.22,
+                          ease: [0.16, 1, 0.3, 1],
+                        }}
+                        whileHover={{ y: -2 }}
+                        whileTap={{ scale: 0.98 }}
+                        type="button"
+                        onClick={() => void openThread(u.id)}
+                        className={cn(
+                          "flex min-h-[62px] w-full items-center gap-3 rounded-[26px] border px-3 py-2 text-left transition",
+                          u.id === activePeerId ? theme.glassRowSelected : theme.glassRow,
+                        )}
+                      >
+                        <UserAvatar user={u} theme={theme} />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex items-center justify-between gap-1.5">
+                            <span className="truncate text-sm font-bold">{u.fullName}</span>
+                            <span
+                              className={cn(
+                                "shrink-0 text-[10px] font-bold",
+                                u.online ? "text-emerald-500" : theme.mutedText,
+                              )}
+                            >
+                              {u.online ? "Online" : formatRelative(u.lastActiveAt)}
+                            </span>
+                          </span>
+                          <span className={cn("block truncate text-xs", theme.mutedText)}>
+                            {u.displayHandle} · Tap to chat
+                          </span>
+                        </span>
+                      </motion.button>
+                    ))}
+                  </div>
+                )}
+
+                {chatFilterTab === "unread" &&
+                  filteredConversations.length === 0 &&
+                  conversations.length > 0 && (
+                    <div className="px-4 py-8 text-center">
+                      <p className="text-xs font-bold">All caught up</p>
+                      <p className={cn("mt-1 text-xs", theme.mutedText)}>
+                        You have no unread messages right now.
+                      </p>
+                    </div>
+                  )}
+
+                {conversations.length === 0 && directoryPeers.length === 0 && (
+                  <div className="px-5 py-12 text-center">
+                    <MessageCircle className={cn("mx-auto size-10 opacity-40", theme.mutedText)} />
+                    <p className="mt-3 text-sm font-bold">No other registered readers yet</p>
+                    <p className={cn("mt-1 text-xs leading-relaxed", theme.mutedText)}>
+                      As soon as another reader creates an account, they will appear here
+                      automatically so you can start chatting.
+                    </p>
+                    {onOpenDiscover && (
+                      <WaterGlowButton
+                        type="button"
+                        variant={resolveWaterButtonVariant(theme.id, "primary")}
+                        size="sm"
+                        soundEnabled={soundEnabled}
+                        onClick={onOpenDiscover}
+                        className="mt-4"
+                      >
                         <Compass className="size-3.5" /> Discover Readers
-                      </button>
+                      </WaterGlowButton>
                     )}
                   </div>
                 )}
@@ -881,20 +1127,19 @@ export function InstagramChatView({
             )}
           </div>
 
-          {/* Floating Specular Glass Compose Pencil FAB */}
-          <motion.button
-            whileHover={{ scale: 1.07 }}
-            whileTap={{ scale: 0.94 }}
+          {/* Floating 3D Water-Glow Compose Pencil FAB */}
+          <WaterGlowButton
             type="button"
+            variant={resolveWaterButtonVariant(theme.id, "secondary")}
+            size="icon"
+            sound="droplet"
+            soundEnabled={soundEnabled}
             onClick={() => (onOpenDiscover ? onOpenDiscover() : searchInputRef.current?.focus())}
             aria-label="Start new chat"
-            className={cn(
-              "glass-sheen absolute bottom-3.5 right-3.5 grid size-12 place-items-center rounded-full border border-white/40",
-              theme.accentBg,
-            )}
+            className="absolute bottom-3.5 right-3.5 size-12"
           >
             <PenLine className="size-5" />
-          </motion.button>
+          </WaterGlowButton>
         </motion.div>
       </aside>
 
@@ -1288,26 +1533,31 @@ export function InstagramChatView({
                                   }
                                   className="block w-full"
                                 >
-                                  <img
+                                  <ProtectedImage
                                     src={m.mediaUrl}
                                     alt={m.mediaName || "Shared photo"}
                                     className="max-h-64 w-full rounded-2xl object-cover"
                                   />
                                 </button>
-                                <a
-                                  href={`${m.mediaUrl}?download=1`}
-                                  download={m.mediaName || "photo.jpg"}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void downloadProtectedMedia(
+                                      m.mediaUrl!,
+                                      m.mediaName || "photo.jpg",
+                                    ).catch(() => toast.error("Could not download photo."))
+                                  }
                                   aria-label="Download photo"
                                   className="absolute bottom-2 right-2 grid size-9 place-items-center rounded-full bg-black/65 text-white backdrop-blur-sm transition hover:bg-black/85"
                                 >
                                   <Download className="size-4" />
-                                </a>
+                                </button>
                               </div>
                             )}
 
                             {!isDeleted && m.mediaUrl && m.mediaKind === "video" && (
                               <div className="relative mb-2 overflow-hidden rounded-2xl bg-black">
-                                <video
+                                <ProtectedVideo
                                   src={m.mediaUrl}
                                   controls
                                   playsInline
@@ -1327,27 +1577,41 @@ export function InstagramChatView({
                                   >
                                     <Film className="size-3.5" /> Fullscreen
                                   </button>
-                                  <a
-                                    href={`${m.mediaUrl}?download=1`}
-                                    download={m.mediaName || "video.mp4"}
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      void downloadProtectedMedia(
+                                        m.mediaUrl!,
+                                        m.mediaName || "video.mp4",
+                                      ).catch(() => toast.error("Could not download video."))
+                                    }
                                     className="inline-flex items-center gap-1 font-semibold"
                                   >
                                     <Download className="size-3.5" /> Download
-                                  </a>
+                                  </button>
                                 </div>
                               </div>
                             )}
 
                             {!isDeleted && m.mediaUrl && m.mediaKind === "audio" && (
                               <div className="mb-2 space-y-1.5">
-                                <audio src={m.mediaUrl} controls className="w-52 max-w-full" />
-                                <a
-                                  href={`${m.mediaUrl}?download=1`}
-                                  download={m.mediaName || "voice.webm"}
+                                <ProtectedAudio
+                                  src={m.mediaUrl}
+                                  controls
+                                  className="w-52 max-w-full"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void downloadProtectedMedia(
+                                      m.mediaUrl!,
+                                      m.mediaName || "voice.webm",
+                                    ).catch(() => toast.error("Could not save audio."))
+                                  }
                                   className="inline-flex items-center gap-1 text-[11px] font-semibold underline opacity-90"
                                 >
                                   <Download className="size-3" /> Save audio
-                                </a>
+                                </button>
                               </div>
                             )}
 
@@ -1582,13 +1846,13 @@ export function InstagramChatView({
                         className={cn("flex items-center gap-3 border-b px-3.5 py-2", theme.border)}
                       >
                         {pendingMedia.kind === "image" ? (
-                          <img
+                          <ProtectedImage
                             src={pendingMedia.url}
                             alt="Ready to send"
                             className="size-12 rounded-xl object-cover"
                           />
                         ) : pendingMedia.kind === "video" ? (
-                          <video
+                          <ProtectedVideo
                             src={pendingMedia.url}
                             className="size-12 rounded-xl object-cover"
                           />
@@ -1741,21 +2005,20 @@ export function InstagramChatView({
                           theme.surfaceMuted,
                         )}
                       />
-                      <motion.button
-                        whileHover={{ scale: 1.06 }}
-                        whileTap={{ scale: 0.94 }}
+                      <WaterGlowButton
                         type="submit"
+                        variant={resolveWaterButtonVariant(theme.id, "primary")}
+                        size="icon"
+                        sound="droplet"
+                        soundEnabled={soundEnabled}
                         disabled={
                           sending || uploading || (!draft.trim() && !pendingMedia && !editingMsg)
                         }
                         aria-label={editingMsg ? "Save edited message" : "Send message"}
-                        className={cn(
-                          "glass-sheen grid size-10 shrink-0 place-items-center rounded-full transition disabled:opacity-45",
-                          theme.accentBg,
-                        )}
+                        className="size-10 shrink-0"
                       >
                         {editingMsg ? <Check className="size-4" /> : <Send className="size-4" />}
-                      </motion.button>
+                      </WaterGlowButton>
                     </form>
                   </div>
                 )}
@@ -1776,19 +2039,38 @@ export function InstagramChatView({
             </motion.div>
             <p className="mt-4 font-display text-xl font-bold">Your Messages</p>
             <p className={cn("mt-1.5 max-w-xs text-sm", theme.mutedText)}>
-              Select a conversation or browse Discover Readers to message anyone in real time.
+              Select a reader from the left sidebar or pick one below to message in real time.
             </p>
+            {discoveredUsers.length > 0 && (
+              <div className="mt-4 flex max-w-md flex-wrap justify-center gap-2">
+                {discoveredUsers.slice(0, 6).map((u) => (
+                  <WaterGlowButton
+                    key={u.id}
+                    type="button"
+                    variant={resolveWaterButtonVariant(theme.id, "surface")}
+                    size="sm"
+                    sound="pop"
+                    soundEnabled={soundEnabled}
+                    onClick={() => void openThread(u.id)}
+                  >
+                    <span className="max-w-[140px] truncate">{u.fullName}</span>
+                    {u.online && <span className="size-2 rounded-full bg-emerald-500" />}
+                  </WaterGlowButton>
+                ))}
+              </div>
+            )}
             {onOpenDiscover && (
-              <button
+              <WaterGlowButton
                 type="button"
+                variant={resolveWaterButtonVariant(theme.id, "primary")}
+                size="md"
+                sound="droplet"
+                soundEnabled={soundEnabled}
                 onClick={onOpenDiscover}
-                className={cn(
-                  "mt-4 inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-xs font-bold",
-                  theme.accentBg,
-                )}
+                className="mt-4"
               >
                 <Compass className="size-4" /> Discover Users
-              </button>
+              </WaterGlowButton>
             )}
           </div>
         )}
@@ -1849,14 +2131,14 @@ export function InstagramChatView({
                       className="group relative aspect-square overflow-hidden rounded-xl bg-black/10"
                     >
                       {item.kind === "image" ? (
-                        <img
+                        <ProtectedImage
                           src={item.url}
                           alt={item.originalName}
                           className="size-full object-cover transition group-hover:scale-105"
                         />
                       ) : (
                         <>
-                          <video src={item.url} className="size-full object-cover" />
+                          <ProtectedVideo src={item.url} className="size-full object-cover" />
                           <span className="absolute right-1.5 top-1.5 grid size-6 place-items-center rounded-full bg-black/70 text-white">
                             <Film className="size-3" />
                           </span>

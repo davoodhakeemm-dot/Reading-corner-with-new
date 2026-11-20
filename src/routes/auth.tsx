@@ -7,17 +7,19 @@ import {
   BookOpen,
   Camera,
   CheckCircle2,
+  ExternalLink,
   Eye,
   EyeOff,
   KeyRound,
   Lock,
   Mail,
   Moon,
-  Phone,
   ShieldCheck,
   Sparkles,
   Sun,
   User,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useRef, useState } from "react";
@@ -25,15 +27,19 @@ import { toast } from "sonner";
 
 import { Logo } from "@/components/Logo";
 import { TripleTapExit } from "@/components/TripleTapExit";
+import { WaterGlowButton } from "@/components/WaterGlowButton";
 import {
   initialsOf,
   loginAccount,
   registerAccount,
-  resetPasswordWithOtp,
-  sendOtp,
+  sendPasswordReset,
+  setSoundEnabled,
+  signInWithGoogle,
   useChat,
 } from "@/lib/chat-store";
+import { resolveWaterButtonVariant, type SecretThemeId } from "@/lib/secret-themes";
 import { cn } from "@/lib/utils";
+import { playWaterSound } from "@/lib/water-sound";
 
 export const Route = createFileRoute("/auth")({
   validateSearch: (search: Record<string, unknown>): { next?: string } =>
@@ -54,30 +60,38 @@ export const Route = createFileRoute("/auth")({
 
 type AuthMode = "login" | "register" | "forgot";
 
-const COUNTRY_CODES = [
-  { code: "+91", label: "IN +91" },
-  { code: "+1", label: "US +1" },
-  { code: "+44", label: "UK +44" },
-  { code: "+971", label: "AE +971" },
-  { code: "+966", label: "SA +966" },
-  { code: "+65", label: "SG +65" },
-  { code: "+61", label: "AU +61" },
-];
+function GoogleIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4 shrink-0" aria-hidden="true">
+      <path
+        fill="#4285F4"
+        d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.4h6.5c-.3 1.5-1.1 2.8-2.4 3.6v3h3.9c2.3-2.1 3.5-5.2 3.5-8.7z"
+      />
+      <path
+        fill="#34A853"
+        d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3c-1.1.7-2.5 1.2-4.1 1.2-3.2 0-5.9-2.1-6.9-5H1.1v3.1C3.1 21.4 7.2 24 12 24z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M5.1 14.3c-.2-.7-.4-1.5-.4-2.3s.1-1.6.4-2.3V6.6H1.1C.4 8.2 0 10.1 0 12s.4 3.8 1.1 5.4l4-3.1z"
+      />
+      <path
+        fill="#EA4335"
+        d="M12 4.8c1.8 0 3.3.6 4.6 1.8l3.4-3.4C18 1.2 15.2 0 12 0 7.2 0 3.1 2.6 1.1 6.6l4 3.1c1-2.9 3.7-4.9 6.9-4.9z"
+      />
+    </svg>
+  );
+}
 
 function AuthPage() {
   const navigate = useNavigate();
   const { next } = Route.useSearch();
-  const { ready, me, otpConfigured, legacyAccounts } = useChat();
+  const { ready, me, soundEnabled } = useChat();
 
   const [mode, setMode] = useState<AuthMode>("login");
-  const [darkBackdrop, setDarkBackdrop] = useState(false);
+  const [backdropTheme, setBackdropTheme] = useState<SecretThemeId>("instagram");
 
-  // Login & Forgot fields
-  const [identifier, setIdentifier] = useState("");
-  const [countryCode, setCountryCode] = useState("+91");
-  const [phone, setPhone] = useState("");
-
-  // Registration fields
+  // Fields (NO OTP for account creation)
   const [email, setEmail] = useState("");
   const [username, setUsername] = useState("");
   const [fullName, setFullName] = useState("");
@@ -86,11 +100,10 @@ function AuthPage() {
   const [confirm, setConfirm] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [dp, setDp] = useState<string | null>(null);
-  const [otpCode, setOtpCode] = useState("");
-  const [otpSentTo, setOtpSentTo] = useState<string | null>(null);
-  const [otpRequested, setOtpRequested] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [googleBusy, setGoogleBusy] = useState(false);
   const [error, setError] = useState("");
+  const [needsProviderHelp, setNeedsProviderHelp] = useState(false);
   const [info, setInfo] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -109,14 +122,13 @@ function AuthPage() {
   }, [ready, me, navigate, next]);
 
   function switchMode(target: AuthMode) {
+    playWaterSound("pop", soundEnabled);
     setMode(target);
     setError("");
+    setNeedsProviderHelp(false);
     setInfo("");
     setPassword("");
     setConfirm("");
-    setOtpCode("");
-    setOtpSentTo(null);
-    setOtpRequested(false);
   }
 
   function pickDp(e: React.ChangeEvent<HTMLInputElement>) {
@@ -128,35 +140,35 @@ function AuthPage() {
     e.target.value = "";
   }
 
-  async function handleSendOtp(purpose: "reset_password" | "register") {
+  async function handleGoogleLogin() {
     setError("");
+    setNeedsProviderHelp(false);
     setInfo("");
-    if (phone.replace(/\D/g, "").length < 7) {
-      setError("Enter your valid phone number first.");
-      return;
-    }
-    setBusy(true);
+    setGoogleBusy(true);
     try {
-      const res = await sendOtp({ phone, countryCode, purpose });
-      setOtpRequested(true);
-      setOtpSentTo(res.phoneMasked);
-      setInfo(`Verification code sent via SMS to ${res.phoneMasked}.`);
-      toast.success("OTP sent to your phone");
+      await signInWithGoogle();
+      toast.success("Signed in with Google");
+      if (next && next.startsWith("/nfc/")) {
+        window.location.assign(next);
+      } else {
+        navigate({ to: "/messages", replace: true });
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not send OTP.");
+      setError(err instanceof Error ? err.message : "Could not sign in with Google.");
     } finally {
-      setBusy(false);
+      setGoogleBusy(false);
     }
   }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+    setNeedsProviderHelp(false);
     setInfo("");
 
     if (mode === "login") {
-      if (!identifier.trim()) {
-        setError("Enter your email, username, or phone number.");
+      if (!email.trim()) {
+        setError("Enter your account email address.");
         return;
       }
       if (!password) {
@@ -165,7 +177,8 @@ function AuthPage() {
       }
       setBusy(true);
       try {
-        await loginAccount({ identifier: identifier.trim(), countryCode, password });
+        await loginAccount({ email: email.trim(), password });
+        playWaterSound("ripple", soundEnabled);
         toast.success("Welcome back");
         if (next && next.startsWith("/nfc/")) {
           window.location.assign(next);
@@ -173,7 +186,9 @@ function AuthPage() {
           navigate({ to: "/messages", replace: true });
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Invalid credentials.");
+        const eObj = err as Error & { needsProviderConfig?: boolean };
+        setError(eObj.message || "Invalid email or password.");
+        if (eObj.needsProviderConfig) setNeedsProviderHelp(true);
       } finally {
         setBusy(false);
       }
@@ -194,10 +209,6 @@ function AuthPage() {
         setError("Username must be at least 2 characters.");
         return;
       }
-      if (phone.trim() && phone.replace(/\D/g, "").length < 7) {
-        setError("Enter a valid phone number or leave it blank.");
-        return;
-      }
       if (password.length < 8) {
         setError("Password must be at least 8 characters.");
         return;
@@ -213,11 +224,11 @@ function AuthPage() {
           fullName: fullName.trim(),
           email: cleanEmail,
           ...(username.trim() ? { username: username.trim() } : {}),
-          ...(phone.trim() ? { phone: phone.trim(), countryCode } : {}),
           password,
           bio: bio.trim(),
           avatarDataUrl: dp,
         });
+        playWaterSound("ripple", soundEnabled);
         toast.success("Account created and saved permanently");
         if (next && next.startsWith("/nfc/")) {
           window.location.assign(next);
@@ -225,7 +236,9 @@ function AuthPage() {
           navigate({ to: "/messages", replace: true });
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Could not register account.");
+        const eObj = err as Error & { needsProviderConfig?: boolean };
+        setError(eObj.message || "Could not create account.");
+        if (eObj.needsProviderConfig) setNeedsProviderHelp(true);
       } finally {
         setBusy(false);
       }
@@ -233,65 +246,76 @@ function AuthPage() {
     }
 
     if (mode === "forgot") {
-      if (phone.replace(/\D/g, "").length < 7) {
-        setError("Enter your registered phone number.");
-        return;
-      }
-      if (!otpCode.trim()) {
-        setError("Enter the 6-digit SMS OTP sent to your phone.");
-        return;
-      }
-      if (password.length < 8) {
-        setError("New password must be at least 8 characters.");
-        return;
-      }
-      if (password !== confirm) {
-        setError("Passwords do not match.");
+      const cleanEmail = email.trim();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
+        setError("Enter your registered email address.");
         return;
       }
       setBusy(true);
       try {
-        await resetPasswordWithOtp({
-          phone,
-          countryCode,
-          code: otpCode.trim(),
-          newPassword: password,
-        });
-        toast.success("Password updated. Sign in with your account credentials.");
-        switchMode("login");
-        setInfo("Your password has been reset. You can now log in.");
+        await sendPasswordReset(cleanEmail);
+        playWaterSound("ripple", soundEnabled);
+        setInfo(`Password reset link sent to ${cleanEmail}. Check your inbox.`);
+        toast.success("Password reset email sent");
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Password reset failed.");
+        setError(err instanceof Error ? err.message : "Could not send password reset email.");
       } finally {
         setBusy(false);
       }
     }
   }
 
+  if (!ready || me) {
+    return (
+      <div className="grid min-h-[100dvh] place-items-center bg-gradient-to-b from-[#070b14] via-[#0d1527] to-[#060a12] px-4 text-white">
+        <div className="text-center">
+          <Logo className="mx-auto size-12 animate-pulse" />
+          <p className="mt-3 text-sm font-semibold">Restoring your session…</p>
+          <p className="mt-1 text-xs text-white/65">Checking your saved account</p>
+        </div>
+      </div>
+    );
+  }
+
+  const isDark = backdropTheme === "dark";
+  const isLiquid = backdropTheme === "emerald";
+  const insetClass = isDark
+    ? "neu-inset-dark text-white focus-within:ring-sky-400/50"
+    : isLiquid
+      ? "liquid-glass-inset border border-white/80 text-[#1f1b38] focus-within:ring-violet-400/55"
+      : "neu-inset-light text-[#1e293b] focus-within:ring-sky-400/50";
+  const mutedTextClass = isDark ? "text-slate-300" : isLiquid ? "text-[#4e4970]" : "text-[#5b6b82]";
+  const iconTintClass = isDark ? "text-sky-400" : isLiquid ? "text-[#6d5dfc]" : "text-[#5b6b82]";
+  const linkAccentClass = isLiquid ? "text-[#6d5dfc]" : "text-[#0284c7]";
+
   return (
     <div
       className={cn(
         "relative min-h-[100dvh] overflow-x-hidden px-4 py-6 transition-colors duration-500 sm:px-6 sm:py-10",
-        darkBackdrop
-          ? "bg-gradient-to-b from-[#060913] via-[#0d1426] to-[#07090f] text-white"
-          : "bg-gradient-to-br from-[#d8e6ff] via-[#eef3ff] to-[#fbeaff] text-[#111827]",
+        isDark
+          ? "bg-gradient-to-b from-[#070b14] via-[#0d1527] to-[#060a12] text-white"
+          : isLiquid
+            ? "bg-gradient-to-br from-[#ede5e1] via-[#eaeaf5] to-[#dbeff5] text-[#1f1b38]"
+            : "bg-gradient-to-br from-[#e7eef6] via-[#eef3fa] to-[#dce6f2] text-[#1e293b]",
       )}
     >
-      {/* Drifting Ambient Orbs */}
+      {/* Drifting 3D Ambient Water & Iridescent Liquid Light Orbs */}
       <div className="pointer-events-none fixed inset-0 overflow-hidden">
         <motion.div
           animate={{
-            x: [0, 26, -14, 0],
+            x: [0, 24, -14, 0],
             y: [0, 18, -12, 0],
-            scale: [1, 1.09, 0.96, 1],
-            opacity: [0.45, 0.68, 0.45],
+            scale: [1, 1.08, 0.96, 1],
+            opacity: [0.46, 0.72, 0.46],
           }}
           transition={{ duration: 12, repeat: Infinity, ease: "easeInOut" }}
           className={cn(
             "absolute -left-24 -top-24 size-[26rem] rounded-full blur-3xl",
-            darkBackdrop
-              ? "bg-gradient-to-tr from-[#2563eb]/40 via-[#e11d48]/28 to-[#4f46e5]/32"
-              : "bg-gradient-to-tr from-[#60a5fa]/45 via-[#f472b6]/28 to-[#818cf8]/38",
+            isDark
+              ? "bg-gradient-to-tr from-[#06b6d4]/35 via-[#2563eb]/30 to-[#38bdf8]/24"
+              : isLiquid
+                ? "bg-gradient-to-tr from-[#a78bfa]/48 via-[#c4b5fd]/34 to-[#fbcfe8]/42"
+                : "bg-gradient-to-tr from-[#7dd3fc]/45 via-[#38bdf8]/28 to-white/60",
           )}
         />
         <motion.div
@@ -299,51 +323,87 @@ function AuthPage() {
             x: [0, -24, 16, 0],
             y: [0, -18, 12, 0],
             scale: [1.05, 0.95, 1.08, 1.05],
-            opacity: [0.38, 0.58, 0.38],
+            opacity: [0.42, 0.68, 0.42],
           }}
           transition={{ duration: 14, repeat: Infinity, ease: "easeInOut" }}
           className={cn(
             "absolute -bottom-28 -right-24 size-[26rem] rounded-full blur-3xl",
-            darkBackdrop
-              ? "bg-gradient-to-tr from-[#e11d48]/30 via-[#2563eb]/28 to-[#6366f1]/34"
-              : "bg-gradient-to-tr from-[#f58529]/28 via-[#dd2a7b]/28 to-[#60a5fa]/40",
+            isDark
+              ? "bg-gradient-to-tr from-[#2563eb]/32 via-[#0ea5e9]/28 to-[#6366f1]/28"
+              : isLiquid
+                ? "bg-gradient-to-tr from-[#2dd4bf]/44 via-[#6ee7d8]/36 to-[#fdba74]/40"
+                : "bg-gradient-to-tr from-[#38bdf8]/30 via-[#93c5fd]/32 to-[#e0f2fe]/55",
           )}
         />
+        {isLiquid && (
+          <motion.div
+            animate={{
+              x: [0, 18, -18, 0],
+              y: [0, -16, 14, 0],
+              scale: [0.96, 1.08, 0.98, 0.96],
+            }}
+            transition={{ duration: 16, repeat: Infinity, ease: "easeInOut" }}
+            className="absolute left-1/2 top-1/3 size-[22rem] -translate-x-1/2 rounded-full bg-gradient-to-tr from-[#fed7aa]/38 via-[#c4b5fd]/32 to-[#5eead4]/36 blur-3xl"
+          />
+        )}
       </div>
 
       <TripleTapExit />
 
-      <div className="relative mx-auto flex min-h-[calc(100dvh-3.5rem)] w-full max-w-5xl flex-col justify-center lg:grid lg:grid-cols-[1fr_470px] lg:items-center lg:gap-12">
+      <div className="relative mx-auto flex min-h-[calc(100dvh-3.5rem)] w-full max-w-5xl flex-col justify-center lg:grid lg:grid-cols-[1fr_460px] lg:items-center lg:gap-12">
         {/* Left Info & Quick Header */}
         <div className="mb-6 lg:mb-0">
-          <div className="flex items-center justify-between gap-3">
-            <button
-              type="button"
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
+            <WaterGlowButton
+              variant={resolveWaterButtonVariant(backdropTheme, "surface")}
+              size="sm"
+              soundEnabled={soundEnabled}
               onClick={() => navigate({ to: "/home" })}
-              className={cn(
-                "glass-sheen inline-flex min-h-[42px] items-center gap-2 rounded-full border px-4 py-2 text-xs font-bold backdrop-blur-xl transition hover:scale-[1.02]",
-                darkBackdrop
-                  ? "border-white/20 bg-white/10 text-white shadow-[inset_0_1px_1px_rgba(255,255,255,0.18)] hover:bg-white/15"
-                  : "border-white/90 bg-white/75 text-[#1e293b] shadow-[inset_0_1px_1px_rgba(255,255,255,0.95),0_8px_20px_-8px_rgba(37,99,235,0.22)] hover:bg-white",
-              )}
             >
               <ArrowLeft className="size-4" /> Reading Corner
-            </button>
+            </WaterGlowButton>
 
-            <button
-              type="button"
-              onClick={() => setDarkBackdrop((d) => !d)}
-              aria-label={darkBackdrop ? "Switch to light mode" : "Switch to dark mode"}
-              className={cn(
-                "glass-sheen inline-flex min-h-[42px] items-center gap-1.5 rounded-full border px-3.5 py-2 text-xs font-bold backdrop-blur-xl transition hover:scale-[1.02]",
-                darkBackdrop
-                  ? "border-white/20 bg-white/10 text-white shadow-[inset_0_1px_1px_rgba(255,255,255,0.18)] hover:bg-white/15"
-                  : "border-white/90 bg-white/75 text-[#1e293b] shadow-[inset_0_1px_1px_rgba(255,255,255,0.95),0_8px_20px_-8px_rgba(37,99,235,0.22)] hover:bg-white",
-              )}
-            >
-              {darkBackdrop ? <Sun className="size-4" /> : <Moon className="size-4" />}
-              {darkBackdrop ? "Light" : "Dark"}
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <WaterGlowButton
+                variant={resolveWaterButtonVariant(backdropTheme, "surface")}
+                size="sm"
+                sound="pop"
+                soundEnabled={!soundEnabled}
+                onClick={() => setSoundEnabled(!soundEnabled)}
+                aria-label={soundEnabled ? "Mute water sounds" : "Enable water sounds"}
+              >
+                {soundEnabled ? <Volume2 className="size-4" /> : <VolumeX className="size-4" />}
+                <span>{soundEnabled ? "Sound" : "Muted"}</span>
+              </WaterGlowButton>
+
+              <WaterGlowButton
+                variant={
+                  isLiquid ? "liquidViolet" : resolveWaterButtonVariant(backdropTheme, "surface")
+                }
+                size="sm"
+                sound="pop"
+                soundEnabled={soundEnabled}
+                onClick={() => setBackdropTheme((t) => (t === "emerald" ? "instagram" : "emerald"))}
+                aria-pressed={isLiquid}
+                aria-label={isLiquid ? "Switch to Azure 3D theme" : "Switch to Liquid Glass theme"}
+              >
+                <Sparkles className="size-4" />
+                <span>Liquid Glass</span>
+              </WaterGlowButton>
+
+              <WaterGlowButton
+                variant={isDark ? "cobalt" : resolveWaterButtonVariant(backdropTheme, "surface")}
+                size="sm"
+                sound="pop"
+                soundEnabled={soundEnabled}
+                onClick={() => setBackdropTheme((t) => (t === "dark" ? "instagram" : "dark"))}
+                aria-pressed={isDark}
+                aria-label={isDark ? "Switch to light mode" : "Switch to dark mode"}
+              >
+                {isDark ? <Sun className="size-4" /> : <Moon className="size-4" />}
+                <span>{isDark ? "Azure" : "Dark"}</span>
+              </WaterGlowButton>
+            </div>
           </div>
 
           <motion.div
@@ -352,20 +412,24 @@ function AuthPage() {
             transition={{ duration: 0.35 }}
             className="mt-6"
           >
-            <div className="flex items-center gap-3.5">
-              <div className="glass-sheen grid size-14 place-items-center rounded-2xl bg-gradient-to-tr from-[#2563eb] via-[#dd2a7b] to-[#f58529] p-2.5 shadow-[0_12px_28px_-8px_rgba(37,99,235,0.55)]">
-                <Logo className="size-9" />
-              </div>
+            <div className="flex items-center gap-4">
+              <motion.div
+                whileHover={{ y: -3, rotate: -2 }}
+                transition={{ type: "spring", stiffness: 360, damping: 18 }}
+                className={cn(
+                  "glass-sheen grid size-14 place-items-center rounded-2xl border border-white/60 p-2.5 text-white",
+                  isLiquid
+                    ? "bg-gradient-to-tr from-[#9d7cff] via-[#7c5cff] to-[#2dd4bf] shadow-[0_14px_30px_-6px_rgba(124,92,255,0.55)]"
+                    : "bg-gradient-to-tr from-[#4bc4e2] via-[#249ff0] to-[#0284c7] shadow-[0_14px_28px_-8px_rgba(14,165,233,0.58)]",
+                )}
+              >
+                <Logo className="size-8 text-white" />
+              </motion.div>
               <div>
                 <h1 className="font-display text-2xl font-extrabold tracking-tight sm:text-4xl">
                   Reading Corner
                 </h1>
-                <p
-                  className={cn(
-                    "text-xs font-medium sm:text-sm",
-                    darkBackdrop ? "text-white/70" : "text-[#475569]",
-                  )}
-                >
+                <p className={cn("text-xs font-medium sm:text-sm", mutedTextClass)}>
                   Read · Discover Readers · Direct Messages
                 </p>
               </div>
@@ -374,117 +438,129 @@ function AuthPage() {
             <div
               className={cn(
                 "mt-6 hidden space-y-3 text-sm lg:block",
-                darkBackdrop ? "text-white/80" : "text-[#334155]",
+                isDark ? "text-slate-300" : isLiquid ? "text-[#353054]" : "text-[#334155]",
               )}
             >
               <p className="flex items-center gap-2.5">
-                <span className="grid size-7 place-items-center rounded-full bg-[#2563eb]/15 text-[#2563eb]">
-                  <Mail className="size-3.5" />
+                <span
+                  className={cn(
+                    "grid size-8 place-items-center rounded-full shadow-inner",
+                    isLiquid ? "bg-violet-500/18 text-[#6d5dfc]" : "bg-sky-500/15 text-[#0284c7]",
+                  )}
+                >
+                  <Mail className="size-4" />
                 </span>
-                Persistent accounts saved securely in the database across refreshes and restarts.
+                Cloud-synced accounts that stay logged in across refreshes, restarts, and devices.
               </p>
               <p className="flex items-center gap-2.5">
-                <span className="grid size-7 place-items-center rounded-full bg-[#dd2a7b]/15 text-[#dd2a7b]">
-                  <ShieldCheck className="size-3.5" />
+                <span
+                  className={cn(
+                    "grid size-8 place-items-center rounded-full shadow-inner",
+                    isLiquid ? "bg-teal-500/18 text-[#0d9488]" : "bg-cyan-500/15 text-[#0ea5e9]",
+                  )}
+                >
+                  <ShieldCheck className="size-4" />
                 </span>
-                Discover fellow readers, follow profiles, and send real-time Instagram-style DMs.
+                See every registered reader right on the Chat page and send real-time DMs.
               </p>
               <p className="flex items-center gap-2.5">
-                <span className="grid size-7 place-items-center rounded-full bg-[#f58529]/15 text-[#f58529]">
-                  <Lock className="size-3.5" />
+                <span
+                  className={cn(
+                    "grid size-8 place-items-center rounded-full shadow-inner",
+                    isLiquid ? "bg-indigo-500/18 text-[#4f46e5]" : "bg-blue-500/15 text-[#2563eb]",
+                  )}
+                >
+                  <Lock className="size-4" />
                 </span>
-                Your email, phone number, and password stay encrypted and private.
+                Your email and password remain private and are never shown to other users.
               </p>
             </div>
           </motion.div>
         </div>
 
-        {/* Right Layered Frosted Glass Card */}
+        {/* Right 3D / Liquid Glass Card */}
         <motion.div
-          initial={{ opacity: 0, y: 22, scale: 0.97 }}
+          initial={{ opacity: 0, y: 24, scale: 0.96 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
-          transition={{ type: "spring", stiffness: 260, damping: 24 }}
-          className="relative w-full"
+          transition={{ type: "spring", stiffness: 260, damping: 22 }}
+          className={cn(
+            "relative w-full rounded-[34px] border p-5 sm:p-7",
+            isDark
+              ? "neu-card-dark border-sky-400/20 text-white"
+              : isLiquid
+                ? "liquid-glass-panel border-white/85 text-[#1f1b38]"
+                : "neu-card-light border-white/95 text-[#1e293b]",
+          )}
         >
-          <div
-            className={cn(
-              "relative overflow-hidden rounded-t-[34px] border border-b-0 px-6 pb-10 pt-6 text-center backdrop-blur-2xl",
-              darkBackdrop
-                ? "border-[#3b82f6]/30 bg-gradient-to-b from-[#17213a]/82 to-[#0f1628]/74 text-white shadow-[inset_0_1.5px_1px_rgba(255,255,255,0.2)]"
-                : "border-white/95 bg-gradient-to-b from-white/86 to-[#eff5ff]/78 text-[#0f172a] shadow-[inset_0_1.5px_1px_rgba(255,255,255,0.95)]",
-            )}
-          >
-            <div className="pointer-events-none absolute -right-12 -top-12 size-40 rounded-full bg-gradient-to-tr from-[#2563eb]/20 via-[#dd2a7b]/15 to-transparent blur-2xl" />
-
-            <div className="relative flex flex-col items-center">
-              <motion.div
-                animate={{ y: [0, -4, 0] }}
-                transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
-                className="glass-sheen mb-3 inline-flex size-14 items-center justify-center rounded-2xl border border-white/50 bg-gradient-to-tr from-[#2563eb] via-[#dd2a7b] to-[#f58529] text-white shadow-[0_12px_26px_-6px_rgba(37,99,235,0.55)]"
+          {/* Raised 3D / Iridescent Liquid Glass Emblem Medallion */}
+          <div className="flex flex-col items-center text-center">
+            <motion.div
+              animate={{ y: [0, -5, 0] }}
+              transition={{ duration: 4.2, repeat: Infinity, ease: "easeInOut" }}
+              className={cn(
+                "mb-3 grid size-16 place-items-center rounded-full p-1.5 sm:size-[72px]",
+                isDark
+                  ? "bg-gradient-to-br from-[#1d2a45] to-[#0f172a] shadow-[10px_12px_24px_rgba(2,6,18,0.8),-6px_-6px_16px_rgba(56,189,248,0.12)]"
+                  : isLiquid
+                    ? "liquid-glass-iridescent border border-white/90"
+                    : "bg-gradient-to-br from-white to-[#dfe8f4] shadow-[10px_12px_24px_rgba(154,174,200,0.48),-8px_-8px_20px_rgba(255,255,255,0.98)]",
+              )}
+            >
+              <span
+                className={cn(
+                  "glass-sheen grid size-full place-items-center rounded-full text-white shadow-[inset_0_2px_4px_rgba(255,255,255,0.35)]",
+                  isLiquid
+                    ? "bg-gradient-to-br from-[#8b5cf6] via-[#6d5dfc] to-[#2dd4bf]"
+                    : "bg-gradient-to-br from-[#0f172a] via-[#13294b] to-[#0284c7]",
+                )}
               >
                 {mode === "forgot" ? (
-                  <KeyRound className="size-6" />
+                  <KeyRound className="size-7 text-white" />
                 ) : mode === "register" ? (
-                  <Sparkles className="size-6" />
+                  <Sparkles className="size-7 text-white" />
                 ) : (
-                  <BookOpen className="size-6" />
+                  <BookOpen className="size-7 text-white" />
                 )}
-              </motion.div>
+              </span>
+            </motion.div>
 
-              <AnimatePresence mode="wait">
-                <motion.div
-                  key={mode}
-                  initial={{ opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -6 }}
-                  transition={{ duration: 0.18 }}
-                >
-                  <h2
-                    className={cn(
-                      "font-display text-2xl font-extrabold tracking-tight sm:text-[26px]",
-                      darkBackdrop
-                        ? "bg-gradient-to-r from-white via-[#bfdbfe] to-[#fbcfe8] bg-clip-text text-transparent"
-                        : "bg-gradient-to-r from-[#1d4ed8] via-[#2563eb] to-[#dd2a7b] bg-clip-text text-transparent",
-                    )}
-                  >
-                    {mode === "login"
-                      ? "Welcome Back"
-                      : mode === "register"
-                        ? "Create Your Account"
-                        : "Reset Password"}
-                  </h2>
-                  <p
-                    className={cn(
-                      "mt-1 text-xs font-medium",
-                      darkBackdrop ? "text-white/70" : "text-[#515c74]",
-                    )}
-                  >
-                    {mode === "login"
-                      ? "Sign in with your email, username, or phone"
-                      : mode === "register"
-                        ? "One persistent account per email address"
-                        : "Verify your phone number with SMS OTP"}
-                  </p>
-                </motion.div>
-              </AnimatePresence>
-            </div>
+            <AnimatePresence mode="wait">
+              <motion.div
+                key={mode}
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -6 }}
+                transition={{ duration: 0.18 }}
+              >
+                <h2 className="font-display text-2xl font-extrabold tracking-tight sm:text-[28px]">
+                  {mode === "login"
+                    ? "Welcome Back"
+                    : mode === "register"
+                      ? "Create Your Account"
+                      : "Reset Password"}
+                </h2>
+                <p className={cn("mt-1 text-xs font-medium", mutedTextClass)}>
+                  {mode === "login"
+                    ? "Sign in with Google or your registered email"
+                    : mode === "register"
+                      ? "Create one permanent account — no OTP needed"
+                      : "We will email you a password reset link"}
+                </p>
+              </motion.div>
+            </AnimatePresence>
           </div>
 
-          <div
-            className={cn(
-              "relative -mt-5 rounded-[32px] border p-5 backdrop-blur-2xl sm:p-7",
-              darkBackdrop
-                ? "border-[#3b82f6]/35 bg-[#0e1526]/86 text-white shadow-[inset_0_1.5px_1px_rgba(147,197,253,0.24),0_26px_60px_-14px_rgba(37,99,235,0.42)]"
-                : "border-white/95 bg-white/88 text-[#0f172a] shadow-[inset_0_1.5px_1px_rgba(255,255,255,0.98),0_26px_60px_-14px_rgba(37,99,235,0.3)]",
-            )}
-          >
+          {/* Inset Mode Switcher */}
+          <div className="mt-5">
             {mode !== "forgot" ? (
               <div
                 className={cn(
-                  "grid grid-cols-2 gap-1.5 rounded-full border p-1",
-                  darkBackdrop
-                    ? "border-white/10 bg-[#172038]/85"
-                    : "border-white/90 bg-[#edf3ff]/90 shadow-inner",
+                  "grid grid-cols-2 gap-1.5 rounded-full p-1.5",
+                  isDark
+                    ? "neu-inset-dark"
+                    : isLiquid
+                      ? "liquid-glass-inset border border-white/75"
+                      : "neu-inset-light",
                 )}
               >
                 {(
@@ -503,16 +579,23 @@ function AuthPage() {
                         "relative min-h-[42px] rounded-full text-xs font-bold transition-colors",
                         active
                           ? "text-white"
-                          : darkBackdrop
-                            ? "text-white/70 hover:text-white"
-                            : "text-[#475569] hover:text-[#0f172a]",
+                          : isDark
+                            ? "text-slate-300 hover:text-white"
+                            : isLiquid
+                              ? "text-[#4e4970] hover:text-[#1f1b38]"
+                              : "text-[#475569] hover:text-[#0f172a]",
                       )}
                     >
                       {active && (
                         <motion.span
                           layoutId="authModePill"
-                          transition={{ type: "spring", stiffness: 360, damping: 28 }}
-                          className="glass-sheen absolute inset-0 rounded-full bg-gradient-to-r from-[#2563eb] via-[#dd2a7b] to-[#f58529] shadow-[0_8px_20px_-4px_rgba(37,99,235,0.5)]"
+                          transition={{ type: "spring", stiffness: 420, damping: 24 }}
+                          className={cn(
+                            "glass-sheen absolute inset-0 rounded-full",
+                            isLiquid
+                              ? "border border-white/60 bg-gradient-to-r from-[#9d7cff] via-[#7c5cff] to-[#2dd4bf] shadow-[inset_0_1.5px_1.5px_rgba(255,255,255,0.68),0_10px_24px_-6px_rgba(124,92,255,0.5)]"
+                              : "bg-gradient-to-r from-[#4bc4e2] via-[#249ff0] to-[#0284c7] shadow-[inset_0_1.5px_1px_rgba(255,255,255,0.55),0_8px_18px_-4px_rgba(14,165,233,0.55)]",
+                          )}
                         />
                       )}
                       <span className="relative z-10">{label}</span>
@@ -524,338 +607,218 @@ function AuthPage() {
               <button
                 type="button"
                 onClick={() => switchMode("login")}
-                className="inline-flex min-h-[36px] items-center gap-1.5 text-xs font-bold text-[#3b82f6] hover:underline"
+                className={cn(
+                  "inline-flex min-h-[36px] items-center gap-1.5 text-xs font-bold hover:underline",
+                  linkAccentClass,
+                )}
               >
                 <ArrowLeft className="size-3.5" /> Back to Login
               </button>
             )}
+          </div>
 
-            <AnimatePresence mode="wait">
-              <motion.div
-                key={mode}
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.2 }}
-                className="mt-4"
+          {/* Google Sign-In Button */}
+          {mode !== "forgot" && (
+            <div className="mt-4">
+              <WaterGlowButton
+                type="button"
+                variant={resolveWaterButtonVariant(backdropTheme, "surface")}
+                size="md"
+                sound="pop"
+                soundEnabled={soundEnabled}
+                disabled={googleBusy || busy}
+                onClick={() => void handleGoogleLogin()}
+                className="w-full"
               >
-                {mode === "register" && legacyAccounts.length > 0 && !fullName && (
-                  <div className="mb-3 rounded-2xl border border-amber-300/60 bg-amber-50/90 p-3 text-xs text-amber-950">
-                    <p className="font-semibold">Previous device profile found</p>
-                    <p className="mt-0.5 text-amber-800">
-                      Link an email to upgrade “{legacyAccounts[0]?.username}” without losing
-                      reading data.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const first = legacyAccounts[0];
-                        if (!first) return;
-                        setFullName(first.username);
-                        if (first.bio) setBio(first.bio);
-                        if (first.dp) setDp(first.dp);
-                      }}
-                      className="mt-2 rounded-full bg-amber-900 px-3.5 py-1.5 text-[11px] font-bold text-white"
-                    >
-                      Pre-fill profile details
-                    </button>
-                  </div>
-                )}
+                <GoogleIcon />
+                <span>{googleBusy ? "Connecting Google…" : "Continue with Google"}</span>
+              </WaterGlowButton>
 
-                <form onSubmit={handleSubmit} noValidate className="space-y-3.5">
-                  {mode === "register" && (
-                    <>
-                      <div className="flex items-center gap-3.5">
-                        <button
-                          type="button"
-                          onClick={() => fileRef.current?.click()}
-                          className="glass-sheen relative grid size-16 shrink-0 place-items-center overflow-hidden rounded-full bg-gradient-to-tr from-[#2563eb] via-[#dd2a7b] to-[#f58529] p-0.5 shadow-md"
-                          aria-label="Choose profile photo"
-                        >
-                          <span
-                            className={cn(
-                              "grid size-full place-items-center overflow-hidden rounded-full font-display text-base font-bold",
-                              darkBackdrop
-                                ? "bg-[#1b2236] text-white"
-                                : "bg-[#f3f6ff] text-[#0f172a]",
-                            )}
-                          >
-                            {dp ? (
-                              <img
-                                src={dp}
-                                alt="Profile preview"
-                                className="size-full object-cover"
-                              />
-                            ) : fullName.trim() ? (
-                              initialsOf(fullName)
-                            ) : (
-                              <Camera className="size-5 opacity-60" />
-                            )}
-                          </span>
-                        </button>
-                        <div className="min-w-0 flex-1 text-xs">
-                          <p className="font-bold">Profile photo</p>
-                          <p className={darkBackdrop ? "text-white/60" : "text-[#64748b]"}>
-                            Tap to upload a photo from your device.
-                          </p>
-                        </div>
-                        <input
-                          ref={fileRef}
-                          type="file"
-                          accept="image/*"
-                          onChange={pickDp}
-                          className="hidden"
-                        />
-                      </div>
-
-                      <div
-                        className={cn(
-                          "flex items-center gap-2.5 rounded-full border p-1.5 transition focus-within:ring-2 focus-within:ring-[#2563eb]/35",
-                          darkBackdrop
-                            ? "border-white/15 bg-[#172038]/85 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-                            : "border-white/95 bg-[#f4f7ff]/95 shadow-[inset_0_1px_1px_rgba(255,255,255,1),0_4px_12px_-6px_rgba(37,99,235,0.22)]",
-                        )}
-                      >
-                        <span className="grid size-9 shrink-0 place-items-center rounded-full bg-gradient-to-tr from-[#2563eb] to-[#4f46e5] text-white shadow-[0_6px_14px_-4px_rgba(37,99,235,0.65)]">
-                          <User className="size-4" />
-                        </span>
-                        <input
-                          type="text"
-                          value={fullName}
-                          onChange={(e) => setFullName(e.target.value)}
-                          placeholder="Full name *"
-                          aria-label="Full name"
-                          autoComplete="name"
-                          className="min-w-0 flex-1 bg-transparent pr-3 text-sm outline-none placeholder:opacity-60"
-                        />
-                      </div>
-
-                      <div
-                        className={cn(
-                          "flex items-center gap-2.5 rounded-full border p-1.5 transition focus-within:ring-2 focus-within:ring-[#2563eb]/35",
-                          darkBackdrop
-                            ? "border-white/15 bg-[#172038]/85 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-                            : "border-white/95 bg-[#f4f7ff]/95 shadow-[inset_0_1px_1px_rgba(255,255,255,1),0_4px_12px_-6px_rgba(37,99,235,0.22)]",
-                        )}
-                      >
-                        <span className="grid size-9 shrink-0 place-items-center rounded-full bg-gradient-to-tr from-[#6366f1] to-[#dd2a7b] text-white shadow-[0_6px_14px_-4px_rgba(99,102,241,0.55)]">
-                          <AtSign className="size-4" />
-                        </span>
-                        <input
-                          type="text"
-                          value={username}
-                          onChange={(e) => setUsername(e.target.value)}
-                          placeholder="Username (e.g. aanya.reads)"
-                          aria-label="Username"
-                          autoComplete="username"
-                          className="min-w-0 flex-1 bg-transparent pr-3 text-sm outline-none placeholder:opacity-60"
-                        />
-                      </div>
-
-                      <div
-                        className={cn(
-                          "flex items-center gap-2.5 rounded-full border p-1.5 transition focus-within:ring-2 focus-within:ring-[#2563eb]/35",
-                          darkBackdrop
-                            ? "border-white/15 bg-[#172038]/85 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-                            : "border-white/95 bg-[#f4f7ff]/95 shadow-[inset_0_1px_1px_rgba(255,255,255,1),0_4px_12px_-6px_rgba(37,99,235,0.22)]",
-                        )}
-                      >
-                        <span className="grid size-9 shrink-0 place-items-center rounded-full bg-gradient-to-tr from-[#2563eb] to-[#3b82f6] text-white shadow-[0_6px_14px_-4px_rgba(37,99,235,0.65)]">
-                          <Mail className="size-4" />
-                        </span>
-                        <input
-                          type="email"
-                          inputMode="email"
-                          value={email}
-                          onChange={(e) => setEmail(e.target.value)}
-                          placeholder="Email address *"
-                          aria-label="Email address"
-                          autoComplete="email"
-                          className="min-w-0 flex-1 bg-transparent pr-3 text-sm outline-none placeholder:opacity-60"
-                        />
-                      </div>
-                    </>
+              <div className="my-4 flex items-center gap-3">
+                <span
+                  className={cn(
+                    "h-px flex-1",
+                    isDark ? "bg-white/15" : isLiquid ? "bg-violet-300/45" : "bg-slate-300/70",
                   )}
-
-                  {mode === "login" && (
-                    <div
-                      className={cn(
-                        "flex items-center gap-2.5 rounded-full border p-1.5 transition focus-within:ring-2 focus-within:ring-[#2563eb]/35",
-                        darkBackdrop
-                          ? "border-white/15 bg-[#172038]/85 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-                          : "border-white/95 bg-[#f4f7ff]/95 shadow-[inset_0_1px_1px_rgba(255,255,255,1),0_4px_12px_-6px_rgba(37,99,235,0.22)]",
-                      )}
-                    >
-                      <span className="grid size-9 shrink-0 place-items-center rounded-full bg-gradient-to-tr from-[#2563eb] to-[#3b82f6] text-white shadow-[0_6px_14px_-4px_rgba(37,99,235,0.65)]">
-                        <Mail className="size-4" />
-                      </span>
-                      <input
-                        type="text"
-                        value={identifier}
-                        onChange={(e) => setIdentifier(e.target.value)}
-                        placeholder="Email, username, or phone *"
-                        aria-label="Email, username, or phone"
-                        autoComplete="username"
-                        className="min-w-0 flex-1 bg-transparent pr-3 text-sm outline-none placeholder:opacity-60"
-                      />
-                    </div>
+                />
+                <span
+                  className={cn(
+                    "text-[11px] font-bold uppercase tracking-wider",
+                    isDark ? "text-slate-400" : isLiquid ? "text-[#585478]" : "text-[#64748b]",
                   )}
-
-                  {/* Phone input (optional during registration unless OTP configured, required for forgot password) */}
-                  {(mode === "forgot" || mode === "register") && (
-                    <div className="flex gap-2">
-                      <select
-                        value={countryCode}
-                        onChange={(e) => setCountryCode(e.target.value)}
-                        aria-label="Country code"
-                        className={cn(
-                          "rounded-full border px-3 py-2.5 text-xs font-bold outline-none transition",
-                          darkBackdrop
-                            ? "border-white/15 bg-[#172038]/85 text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-                            : "border-white/95 bg-[#f4f7ff]/95 text-[#0f172a] shadow-[inset_0_1px_1px_rgba(255,255,255,1),0_4px_12px_-6px_rgba(37,99,235,0.22)]",
-                        )}
-                      >
-                        {COUNTRY_CODES.map((c) => (
-                          <option key={c.code} value={c.code}>
-                            {c.label}
-                          </option>
-                        ))}
-                      </select>
-                      <div
-                        className={cn(
-                          "flex flex-1 items-center gap-2.5 rounded-full border p-1.5 transition focus-within:ring-2 focus-within:ring-[#2563eb]/35",
-                          darkBackdrop
-                            ? "border-white/15 bg-[#172038]/85 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-                            : "border-white/95 bg-[#f4f7ff]/95 shadow-[inset_0_1px_1px_rgba(255,255,255,1),0_4px_12px_-6px_rgba(37,99,235,0.22)]",
-                        )}
-                      >
-                        <span className="grid size-9 shrink-0 place-items-center rounded-full bg-gradient-to-tr from-[#2563eb] to-[#3b82f6] text-white shadow-[0_6px_14px_-4px_rgba(37,99,235,0.65)]">
-                          <Phone className="size-4" />
-                        </span>
-                        <input
-                          type="tel"
-                          inputMode="tel"
-                          value={phone}
-                          onChange={(e) => setPhone(e.target.value)}
-                          placeholder={
-                            mode === "forgot"
-                              ? "Registered phone number *"
-                              : "Phone number (optional)"
-                          }
-                          aria-label="Phone number"
-                          autoComplete="tel-national"
-                          className="min-w-0 flex-1 bg-transparent pr-3 text-sm outline-none placeholder:opacity-60"
-                        />
-                      </div>
-                    </div>
+                >
+                  or with email
+                </span>
+                <span
+                  className={cn(
+                    "h-px flex-1",
+                    isDark ? "bg-white/15" : isLiquid ? "bg-violet-300/45" : "bg-slate-300/70",
                   )}
+                />
+              </div>
+            </div>
+          )}
 
-                  {mode === "forgot" && (
-                    <div
-                      className={cn(
-                        "space-y-2.5 rounded-2xl border p-3.5",
-                        darkBackdrop
-                          ? "border-white/15 bg-[#172038]/85"
-                          : "border-white/90 bg-[#f4f7ff]/95 shadow-sm",
-                      )}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-bold">SMS OTP Verification</span>
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void handleSendOtp("reset_password")}
-                          className="glass-sheen rounded-full bg-[#2563eb] px-3.5 py-1.5 text-[11px] font-bold text-white shadow-sm transition hover:opacity-95 disabled:opacity-50"
-                        >
-                          {otpRequested ? "Resend OTP" : "Send SMS OTP"}
-                        </button>
-                      </div>
-
-                      {!otpConfigured && (
-                        <p className="text-[11px] leading-relaxed text-amber-500">
-                          Live SMS OTP requires <code>TWILIO_ACCOUNT_SID</code>,{" "}
-                          <code>TWILIO_AUTH_TOKEN</code>, and <code>TWILIO_VERIFY_SERVICE_SID</code>{" "}
-                          configured on the server.
-                        </p>
-                      )}
-
-                      {(otpRequested || otpConfigured) && (
-                        <div
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={mode}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.2 }}
+              className={mode === "forgot" ? "mt-4" : ""}
+            >
+              <form
+                onSubmit={handleSubmit}
+                noValidate
+                className={mode === "register" ? "space-y-3" : "space-y-3.5"}
+              >
+                {mode === "register" && (
+                  <>
+                    <div className="flex items-center gap-3.5">
+                      <button
+                        type="button"
+                        onClick={() => fileRef.current?.click()}
+                        className={cn(
+                          "glass-sheen relative grid size-16 shrink-0 place-items-center overflow-hidden rounded-full p-0.5",
+                          isLiquid
+                            ? "bg-gradient-to-tr from-[#9d7cff] via-[#7c5cff] to-[#2dd4bf] shadow-[0_8px_22px_-6px_rgba(124,92,255,0.52)]"
+                            : "bg-gradient-to-tr from-[#4bc4e2] via-[#249ff0] to-[#0284c7] shadow-[0_8px_20px_-6px_rgba(14,165,233,0.55)]",
+                        )}
+                        aria-label="Choose profile photo"
+                      >
+                        <span
                           className={cn(
-                            "flex items-center gap-2 rounded-full border p-1",
-                            darkBackdrop
-                              ? "border-white/15 bg-[#121828]"
-                              : "border-[#dbe4f6] bg-white",
+                            "grid size-full place-items-center overflow-hidden rounded-full font-display text-base font-bold",
+                            isDark
+                              ? "bg-[#151f36] text-white"
+                              : isLiquid
+                                ? "bg-white/85 text-[#1f1b38]"
+                                : "bg-[#f3f7fc] text-[#1e293b]",
                           )}
                         >
-                          <span className="grid size-8 shrink-0 place-items-center rounded-full bg-[#2563eb]/15 text-[#2563eb]">
-                            <KeyRound className="size-3.5" />
-                          </span>
-                          <input
-                            type="text"
-                            inputMode="numeric"
-                            maxLength={8}
-                            value={otpCode}
-                            onChange={(e) => setOtpCode(e.target.value)}
-                            placeholder={
-                              otpSentTo ? `Code sent to ${otpSentTo}` : "Enter 6-digit SMS code"
-                            }
-                            className="min-w-0 flex-1 bg-transparent pr-3 text-sm tracking-widest outline-none"
-                          />
-                        </div>
-                      )}
+                          {dp ? (
+                            <img
+                              src={dp}
+                              alt="Profile preview"
+                              className="size-full object-cover"
+                            />
+                          ) : fullName.trim() ? (
+                            initialsOf(fullName)
+                          ) : (
+                            <Camera className="size-5 opacity-60" />
+                          )}
+                        </span>
+                      </button>
+                      <div className="min-w-0 flex-1 text-xs">
+                        <p className="font-bold">Profile photo</p>
+                        <p className={mutedTextClass}>Tap to upload a photo from your device.</p>
+                      </div>
+                      <input
+                        ref={fileRef}
+                        type="file"
+                        accept="image/*"
+                        onChange={pickDp}
+                        className="hidden"
+                      />
                     </div>
-                  )}
 
-                  {/* Password Pill Input */}
+                    <div
+                      className={cn(
+                        "flex min-h-[50px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                        insetClass,
+                      )}
+                    >
+                      <User className={cn("size-4 shrink-0", iconTintClass)} />
+                      <input
+                        type="text"
+                        value={fullName}
+                        onChange={(e) => setFullName(e.target.value)}
+                        placeholder="Full name *"
+                        aria-label="Full name"
+                        autoComplete="name"
+                        className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                      />
+                    </div>
+
+                    <div
+                      className={cn(
+                        "flex min-h-[50px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                        insetClass,
+                      )}
+                    >
+                      <AtSign className={cn("size-4 shrink-0", iconTintClass)} />
+                      <input
+                        type="text"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                        placeholder="Username (optional, e.g. aanya.reads)"
+                        aria-label="Username"
+                        autoComplete="username"
+                        className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                      />
+                    </div>
+                  </>
+                )}
+
+                {/* Recessed Email Input */}
+                <div
+                  className={cn(
+                    "flex min-h-[52px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                    insetClass,
+                  )}
+                >
+                  <Mail className={cn("size-4 shrink-0", iconTintClass)} />
+                  <input
+                    type="email"
+                    inputMode="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="Email address *"
+                    aria-label="Email address"
+                    autoComplete="email"
+                    className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                  />
+                </div>
+
+                {/* Recessed Password Input */}
+                {mode !== "forgot" && (
                   <div
                     className={cn(
-                      "flex items-center gap-2.5 rounded-full border p-1.5 transition focus-within:ring-2 focus-within:ring-[#2563eb]/35",
-                      darkBackdrop
-                        ? "border-white/15 bg-[#172038]/85 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-                        : "border-white/95 bg-[#f4f7ff]/95 shadow-[inset_0_1px_1px_rgba(255,255,255,1),0_4px_12px_-6px_rgba(37,99,235,0.22)]",
+                      "flex min-h-[52px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                      insetClass,
                     )}
                   >
-                    <span className="grid size-9 shrink-0 place-items-center rounded-full bg-gradient-to-tr from-[#2563eb] to-[#dd2a7b] text-white shadow-[0_6px_14px_-4px_rgba(221,42,123,0.55)]">
-                      <Lock className="size-4" />
-                    </span>
+                    <Lock className={cn("size-4 shrink-0", iconTintClass)} />
                     <input
                       type={showPassword ? "text" : "password"}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      placeholder={
-                        mode === "login"
-                          ? "Password *"
-                          : mode === "forgot"
-                            ? "New password (8+ chars) *"
-                            : "Create password (8+ chars) *"
-                      }
+                      placeholder={mode === "login" ? "Password *" : "Create password (8+ chars) *"}
                       aria-label="Password"
                       autoComplete={mode === "login" ? "current-password" : "new-password"}
-                      className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-60"
+                      className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
                     />
                     <button
                       type="button"
                       onClick={() => setShowPassword((s) => !s)}
                       aria-label={showPassword ? "Hide password" : "Show password"}
-                      className="mr-1.5 grid size-8 shrink-0 place-items-center rounded-full opacity-70 hover:opacity-100"
+                      className="grid size-8 shrink-0 place-items-center rounded-full opacity-70 transition hover:opacity-100"
                     >
                       {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
                     </button>
                   </div>
+                )}
 
-                  {mode !== "login" && (
+                {mode === "register" && (
+                  <>
                     <div
                       className={cn(
-                        "flex items-center gap-2.5 rounded-full border p-1.5 transition focus-within:ring-2 focus-within:ring-[#2563eb]/35",
-                        darkBackdrop
-                          ? "border-white/15 bg-[#172038]/85 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-                          : "border-white/95 bg-[#f4f7ff]/95 shadow-[inset_0_1px_1px_rgba(255,255,255,1),0_4px_12px_-6px_rgba(37,99,235,0.22)]",
+                        "flex min-h-[50px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                        insetClass,
                       )}
                     >
-                      <span className="grid size-9 shrink-0 place-items-center rounded-full bg-gradient-to-tr from-[#dd2a7b] to-[#8134af] text-white shadow-[0_6px_14px_-4px_rgba(129,52,175,0.55)]">
-                        <Lock className="size-4" />
-                      </span>
+                      <Lock className={cn("size-4 shrink-0", iconTintClass)} />
                       <input
                         type={showPassword ? "text" : "password"}
                         value={confirm}
@@ -863,12 +826,10 @@ function AuthPage() {
                         placeholder="Confirm password *"
                         aria-label="Confirm password"
                         autoComplete="new-password"
-                        className="min-w-0 flex-1 bg-transparent pr-3 text-sm outline-none placeholder:opacity-60"
+                        className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
                       />
                     </div>
-                  )}
 
-                  {mode === "register" && (
                     <input
                       type="text"
                       value={bio}
@@ -877,89 +838,93 @@ function AuthPage() {
                       aria-label="Bio"
                       maxLength={180}
                       className={cn(
-                        "w-full rounded-full border px-4 py-3 text-sm outline-none transition focus:ring-2 focus:ring-[#2563eb]/35",
-                        darkBackdrop
-                          ? "border-white/15 bg-[#172038]/85 text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-                          : "border-white/95 bg-[#f4f7ff]/95 text-[#0f172a] shadow-[inset_0_1px_1px_rgba(255,255,255,1),0_4px_12px_-6px_rgba(37,99,235,0.22)]",
+                        "min-h-[48px] w-full rounded-full px-4 text-sm outline-none transition placeholder:opacity-65 focus:ring-2",
+                        insetClass,
                       )}
                     />
-                  )}
+                  </>
+                )}
 
-                  {mode === "login" && (
-                    <div className="flex justify-end">
-                      <button
-                        type="button"
-                        onClick={() => switchMode("forgot")}
-                        className="text-xs font-bold text-[#3b82f6] hover:underline"
-                      >
-                        Forgot Password?
-                      </button>
-                    </div>
-                  )}
-
-                  {error && (
-                    <motion.div
-                      initial={{ opacity: 0, y: -4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      role="alert"
-                      className="flex items-start gap-2 rounded-2xl border border-rose-400/30 bg-rose-500/15 px-3.5 py-2.5 text-xs font-semibold text-rose-500"
-                    >
+                {error && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    role="alert"
+                    className="space-y-1.5 rounded-2xl border border-rose-400/30 bg-rose-500/15 px-3.5 py-2.5 text-xs font-semibold text-rose-500"
+                  >
+                    <div className="flex items-start gap-2">
                       <AlertCircle className="mt-0.5 size-4 shrink-0" />
                       <span>{error}</span>
-                    </motion.div>
-                  )}
-
-                  {info && (
-                    <motion.div
-                      initial={{ opacity: 0, y: -4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className="flex items-start gap-2 rounded-2xl border border-emerald-400/30 bg-emerald-500/15 px-3.5 py-2.5 text-xs font-semibold text-emerald-500"
-                    >
-                      <CheckCircle2 className="mt-0.5 size-4 shrink-0" />
-                      <span>{info}</span>
-                    </motion.div>
-                  )}
-
-                  <motion.button
-                    type="submit"
-                    disabled={busy}
-                    whileHover={{ scale: 1.01 }}
-                    whileTap={{ scale: 0.98 }}
-                    className="glass-sheen flex min-h-[50px] w-full items-center justify-center gap-2 rounded-full bg-gradient-to-r from-[#2563eb] via-[#dd2a7b] to-[#f58529] py-3 text-sm font-bold text-white shadow-[0_14px_30px_-8px_rgba(37,99,235,0.58)] transition disabled:opacity-60"
-                  >
-                    <span>
-                      {busy
-                        ? "Please wait…"
-                        : mode === "login"
-                          ? "Login"
-                          : mode === "register"
-                            ? "Create Account"
-                            : "Verify OTP & Reset Password"}
-                    </span>
-                    {!busy && <ArrowRight className="size-4" />}
-                  </motion.button>
-
-                  {mode === "login" && (
-                    <p
-                      className={cn(
-                        "pt-1 text-center text-xs",
-                        darkBackdrop ? "text-white/65" : "text-[#64748b]",
-                      )}
-                    >
-                      Don&apos;t have an account?{" "}
-                      <button
-                        type="button"
-                        onClick={() => switchMode("register")}
-                        className="font-bold text-[#3b82f6] hover:underline"
+                    </div>
+                    {needsProviderHelp && (
+                      <a
+                        href="https://console.firebase.google.com/project/mindful-abode-g91ww/authentication/providers"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 font-bold underline"
                       >
-                        Sign Up
-                      </button>
-                    </p>
-                  )}
-                </form>
-              </motion.div>
-            </AnimatePresence>
-          </div>
+                        Enable Email/Password in Firebase Console{" "}
+                        <ExternalLink className="size-3" />
+                      </a>
+                    )}
+                  </motion.div>
+                )}
+
+                {info && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="flex items-start gap-2 rounded-2xl border border-emerald-400/30 bg-emerald-500/15 px-3.5 py-2.5 text-xs font-semibold text-emerald-500"
+                  >
+                    <CheckCircle2 className="mt-0.5 size-4 shrink-0" />
+                    <span>{info}</span>
+                  </motion.div>
+                )}
+
+                {/* Glowing 3D / Liquid Glass Water-Bounce Primary CTA */}
+                <WaterGlowButton
+                  type="submit"
+                  variant={resolveWaterButtonVariant(backdropTheme, "primary")}
+                  size="lg"
+                  sound="droplet"
+                  soundEnabled={soundEnabled}
+                  disabled={busy || googleBusy}
+                  className="mt-1 w-full"
+                >
+                  <span>
+                    {busy
+                      ? "Please wait…"
+                      : mode === "login"
+                        ? "Login"
+                        : mode === "register"
+                          ? "Create Account"
+                          : "Send Reset Email"}
+                  </span>
+                  {!busy && <ArrowRight className="size-4" />}
+                </WaterGlowButton>
+
+                {mode === "login" && (
+                  <p className={cn("pt-1 text-center text-xs font-medium", mutedTextClass)}>
+                    <button
+                      type="button"
+                      onClick={() => switchMode("forgot")}
+                      className={cn("font-bold hover:underline", linkAccentClass)}
+                    >
+                      Forgot password?
+                    </button>{" "}
+                    <span className="opacity-70">or</span>{" "}
+                    <button
+                      type="button"
+                      onClick={() => switchMode("register")}
+                      className={cn("font-bold hover:underline", linkAccentClass)}
+                    >
+                      Sign Up
+                    </button>
+                  </p>
+                )}
+              </form>
+            </motion.div>
+          </AnimatePresence>
         </motion.div>
       </div>
     </div>

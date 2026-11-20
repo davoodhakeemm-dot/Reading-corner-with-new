@@ -159,6 +159,18 @@ db.exec(`
     details TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS firebase_media (
+    id TEXT PRIMARY KEY,
+    owner_uid TEXT NOT NULL,
+    recipient_uid TEXT,
+    kind TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `);
 
 // Non-destructive column migrations for pre-existing databases
@@ -312,6 +324,37 @@ const NFC_KEY = crypto.createHash("sha256").update(`nfc::${SERVER_SECRET}`).dige
 
 export function sha256(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+export function signCookieToken(uid: string, ttlSeconds = 7 * 24 * 60 * 60): string {
+  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const payload = Buffer.from(JSON.stringify({ uid, exp }), "utf8").toString("base64url");
+  const sig = crypto.createHmac("sha256", SERVER_SECRET).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+export function verifyCookieToken(token: string): { uid: string } | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 2) return null;
+    const [payload, sig] = parts;
+    if (!payload || !sig) return null;
+    const expectedSig = crypto
+      .createHmac("sha256", SERVER_SECRET)
+      .update(payload)
+      .digest("base64url");
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expectedSig);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+      uid?: string;
+      exp?: number;
+    };
+    if (!parsed.uid || !parsed.exp || parsed.exp < Math.floor(Date.now() / 1000)) return null;
+    return { uid: parsed.uid };
+  } catch {
+    return null;
+  }
 }
 
 export function hashPassword(password: string): string {

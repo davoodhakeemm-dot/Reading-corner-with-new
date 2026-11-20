@@ -1,0 +1,197 @@
+{
+  "entities": {
+    "PublicUserProfile": {
+      "title": "PublicUserProfile",
+      "description": "Public, PII-free reader directory profile visible to signed-in readers for discovery and chat.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "fullName": { "type": "string", "minLength": 2, "maxLength": 60 },
+        "displayHandle": { "type": "string", "minLength": 3, "maxLength": 32, "pattern": "^@[a-z0-9._-]+$" },
+        "bio": { "type": "string", "minLength": 0, "maxLength": 200 },
+        "avatarUrl": { "type": "string", "maxLength": 300000 },
+        "theme": { "type": "string", "enum": ["instagram", "emerald", "dark"] },
+        "online": { "type": "boolean" },
+        "followerCount": { "type": "integer" },
+        "followingCount": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "lastActiveAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "fullName", "displayHandle", "bio", "theme", "online", "followerCount", "followingCount", "createdAt", "updatedAt", "lastActiveAt"]
+    },
+    "PrivateUserAccount": {
+      "title": "PrivateUserAccount",
+      "description": "Owner-only private PII and personal preferences isolated from public reads.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 254 },
+        "soundEnabled": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "soundEnabled", "createdAt", "updatedAt"]
+    },
+    "HandleReservation": {
+      "title": "HandleReservation",
+      "description": "Unique lowercase username reservation mapping handleKey to owner uid.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "handle": { "type": "string", "minLength": 3, "maxLength": 32, "pattern": "^@[a-z0-9._-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "handle", "createdAt"]
+    },
+    "ReadingState": {
+      "title": "ReadingState",
+      "description": "Owner-only reading shelf, onboarding preferences, bookmarks, favorites, and progress.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "onboarded": { "type": "boolean" },
+        "languages": { "type": "array" },
+        "categories": { "type": "array" },
+        "appTheme": { "type": "string", "enum": ["light", "dark", "system"] },
+        "reader": { "type": "object" },
+        "notifications": { "type": "object" },
+        "profile": { "type": "object" },
+        "progress": { "type": "object" },
+        "favorites": { "type": "array" },
+        "bookmarks": { "type": "array" },
+        "completed": { "type": "array" },
+        "history": { "type": "array" },
+        "streak": { "type": "integer" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "onboarded", "languages", "categories", "appTheme", "reader", "notifications", "profile", "progress", "favorites", "bookmarks", "completed", "history", "streak", "updatedAt"]
+    },
+    "FollowEdge": {
+      "title": "FollowEdge",
+      "description": "Directed follow relationship between followerId and followingId.",
+      "type": "object",
+      "properties": {
+        "followerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "followingId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["followerId", "followingId", "createdAt"]
+    },
+    "ConversationThread": {
+      "title": "ConversationThread",
+      "description": "Two-participant direct message conversation metadata, pin/mute, typing, and unread counts.",
+      "type": "object",
+      "properties": {
+        "participantA": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "participantB": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "lastMessageText": { "type": "string", "maxLength": 4000 },
+        "lastMessageFrom": { "type": "string", "maxLength": 128 },
+        "lastMessageMediaKind": { "type": "string", "enum": ["image", "video", "audio"] },
+        "lastMessageDeleted": { "type": "boolean" },
+        "lastMessageAt": { "type": "string", "format": "date-time" },
+        "lastMessageSeenAt": { "type": "string", "format": "date-time" },
+        "unreadA": { "type": "integer" },
+        "unreadB": { "type": "integer" },
+        "pinnedA": { "type": "boolean" },
+        "pinnedB": { "type": "boolean" },
+        "mutedA": { "type": "boolean" },
+        "mutedB": { "type": "boolean" },
+        "typingA": { "type": "boolean" },
+        "typingB": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["participantA", "participantB", "lastMessageText", "lastMessageDeleted", "unreadA", "unreadB", "pinnedA", "pinnedB", "mutedA", "mutedB", "typingA", "typingB", "createdAt", "updatedAt"]
+    },
+    "DirectMessage": {
+      "title": "DirectMessage",
+      "description": "Message inside a two-participant conversation thread.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "threadKey": { "type": "string", "minLength": 4, "maxLength": 260 },
+        "senderId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "recipientId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "text": { "type": "string", "maxLength": 4000 },
+        "mediaUrl": { "type": "string", "maxLength": 500 },
+        "mediaId": { "type": "string", "maxLength": 128 },
+        "mediaKind": { "type": "string", "enum": ["image", "video", "audio"] },
+        "mediaName": { "type": "string", "maxLength": 255 },
+        "replyToId": { "type": "string", "maxLength": 128 },
+        "replyTo": { "type": "object" },
+        "reactionA": { "type": "string", "maxLength": 16 },
+        "reactionB": { "type": "string", "maxLength": 16 },
+        "editedAt": { "type": "string", "format": "date-time" },
+        "deletedAt": { "type": "string", "format": "date-time" },
+        "deliveredAt": { "type": "string", "format": "date-time" },
+        "seenAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "threadKey", "senderId", "recipientId", "text", "createdAt", "updatedAt"]
+    },
+    "BlockEdge": {
+      "title": "BlockEdge",
+      "description": "User block record between blockerId and blockedId.",
+      "type": "object",
+      "properties": {
+        "blockerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "blockedId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["blockerId", "blockedId", "createdAt"]
+    },
+    "UserReport": {
+      "title": "UserReport",
+      "description": "Safety report submitted by a signed-in user.",
+      "type": "object",
+      "properties": {
+        "reporterId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "reportedUserId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "reason": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "details": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["reporterId", "reportedUserId", "reason", "details", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users_public/{userId}": {
+      "schema": { "$ref": "#/entities/PublicUserProfile" },
+      "description": "Public, PII-free user profiles for discovery and direct messaging."
+    },
+    "/users_private/{userId}": {
+      "schema": { "$ref": "#/entities/PrivateUserAccount" },
+      "description": "Private PII (email) and sound settings accessible only by the account owner."
+    },
+    "/handles/{handleKey}": {
+      "schema": { "$ref": "#/entities/HandleReservation" },
+      "description": "Unique lowercase handle reservation documents."
+    },
+    "/reading_state/{userId}": {
+      "schema": { "$ref": "#/entities/ReadingState" },
+      "description": "Owner-only synced reading preferences, library progress, favorites, and bookmarks."
+    },
+    "/follows/{followId}": {
+      "schema": { "$ref": "#/entities/FollowEdge" },
+      "description": "Follow relationships keyed as followerId__followingId."
+    },
+    "/conversations/{threadKey}": {
+      "schema": { "$ref": "#/entities/ConversationThread" },
+      "description": "Two-participant conversation threads keyed as sorted uidA__uidB."
+    },
+    "/conversations/{threadKey}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/DirectMessage" },
+      "description": "Direct messages belonging to the parent conversation thread."
+    },
+    "/blocks/{blockId}": {
+      "schema": { "$ref": "#/entities/BlockEdge" },
+      "description": "User block edges keyed as blockerId__blockedId."
+    },
+    "/reports/{reportId}": {
+      "schema": { "$ref": "#/entities/UserReport" },
+      "description": "Safety reports filed against abusive accounts."
+    }
+  }
+}

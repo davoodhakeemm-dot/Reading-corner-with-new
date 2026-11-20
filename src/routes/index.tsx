@@ -1,9 +1,12 @@
-import { Link, createFileRoute } from "@tanstack/react-router";
+import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 
-import { Logo } from "@/components/Logo";
 import { InstallApp } from "@/components/InstallApp";
+import { Logo } from "@/components/Logo";
 import heroBooks from "@/assets/hero-books.jpg";
+import { useChat } from "@/lib/chat-store";
+import { useLibrary } from "@/lib/library-store";
+import { resolveLandingDestination } from "@/lib/social-logic";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -48,14 +51,30 @@ function Splash() {
 }
 
 function Welcome() {
+  const navigate = useNavigate();
+  const { ready: chatReady, me } = useChat();
+  const { ready: libraryReady, state: libraryState } = useLibrary();
   const [splash, setSplash] = useState(true);
 
+  const destination = resolveLandingDestination({
+    chatReady,
+    libraryReady,
+    isSignedIn: Boolean(me),
+    onboarded: libraryState.onboarded,
+  });
+
   useEffect(() => {
-    const t = setTimeout(() => setSplash(false), 1900);
+    if (destination) {
+      navigate({ to: destination, replace: true });
+    }
+  }, [destination, navigate]);
+
+  useEffect(() => {
+    const t = setTimeout(() => setSplash(false), 1200);
     return () => clearTimeout(t);
   }, []);
 
-  if (splash) return <Splash />;
+  if (splash || !chatReady || !libraryReady || destination) return <Splash />;
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-hero">
@@ -99,8 +118,12 @@ function Welcome() {
         </div>
 
         <p className="mt-6 text-xs text-muted-foreground">
-          Already reading with us?{" "}
-          <Link to="/home" className="font-semibold text-primary">
+          Already have an account?{" "}
+          <Link to="/auth" className="font-semibold text-primary hover:underline">
+            Sign in / Sync
+          </Link>
+          {" · "}
+          <Link to="/home" className="font-semibold text-primary hover:underline">
             Continue
           </Link>
         </p>

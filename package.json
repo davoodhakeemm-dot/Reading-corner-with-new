@@ -15,6 +15,7 @@
     "rolldown": "1.2.1"
   },
   "dependencies": {
+    "@firebase/eslint-plugin-security-rules": "^0.0.2",
     "@hookform/resolvers": "^5.2.2",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-alert-dialog": "^1.1.15",
@@ -57,6 +58,8 @@
     "dotenv": "^18.0.10",
     "embla-carousel-react": "^8.6.0",
     "express": "^5.3.0",
+    "firebase": "^13.4.0",
+    "firebase-admin": "^14.5.1",
     "input-otp": "^1.4.2",
     "lucide-react": "^0.575.0",
     "motion": "^14.14.0",
