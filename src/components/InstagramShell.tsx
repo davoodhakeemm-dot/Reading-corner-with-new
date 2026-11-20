@@ -6,8 +6,10 @@ import { useEffect, useMemo, useState } from "react";
 import { DiscoverUsersView } from "@/components/DiscoverUsersView";
 import { InstagramChatView } from "@/components/InstagramChatView";
 import { InstagramProfileView, type ProfileSection } from "@/components/InstagramProfileView";
+import { ReadingActions } from "@/components/ReadingActions";
 import { Logo } from "@/components/Logo";
 import { TripleTapExit } from "@/components/TripleTapExit";
+import { CallMedia } from './CallMedia';
 import { initialsOf, openThread, respondToCall, useChat } from "@/lib/chat-store";
 import { getSecretTheme } from "@/lib/secret-themes";
 import { cn } from "@/lib/utils";
@@ -23,7 +25,7 @@ export function InstagramShell({
   initialProfileSection?: ProfileSection;
 }) {
   const navigate = useNavigate();
-  const { ready, me, conversations, incomingCall, outgoingCall, soundEnabled } = useChat();
+  const { ready, me, nfc, conversations, incomingCall, outgoingCall, soundEnabled } = useChat();
   const [tab, setTab] = useState<ShellTab>(initialTab);
   const [threadOpenOnMobile, setThreadOpenOnMobile] = useState(false);
 
@@ -284,6 +286,15 @@ export function InstagramShell({
             </motion.div>
           )}
         </AnimatePresence>
+        <div
+          className={cn(
+            "shrink-0",
+            !(tab === "chat" && threadOpenOnMobile) &&
+              "mb-[calc(4rem+max(0.5rem,env(safe-area-inset-bottom)))] md:mb-0",
+          )}
+        >
+          <ReadingActions themeId={theme.id} inShell personalPath={nfc?.revoked ? null : nfc?.path} />
+        </div>
       </main>
 
       {/* Floating Glass Mobile Bottom Pill */}
@@ -450,8 +461,9 @@ export function InstagramShell({
                     {outgoingCall.target.fullName}
                   </p>
                   <p className={cn("mt-1 text-xs", theme.mutedText)}>
-                    {outgoingCall.status === "accepted" ? "Connected" : "Ringing…"}
+                    {{ accepted: 'Connected', preparing: 'Preparing your device…', connecting: 'Connecting…', ringing: 'Ringing…' }[outgoingCall.status]}
                   </p>
+                  <CallMedia stream={outgoingCall.stream ?? null} video={outgoingCall.callType === 'video'} />
                   <button
                     type="button"
                     onClick={() =>

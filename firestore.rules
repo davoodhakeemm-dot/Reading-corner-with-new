@@ -308,6 +308,24 @@ service cloud.firestore {
         data.createdAt is timestamp;
     }
 
+    match /calls/{callId} {
+      function unblocked(a, b) {
+        return !exists(/databases/$(database)/documents/blocks/$(a + '__' + b)) &&
+          !exists(/databases/$(database)/documents/blocks/$(b + '__' + a));
+      }
+      function participant() {
+        return isSignedIn() && (existing().caller == request.auth.uid || existing().callee == request.auth.uid);
+      }
+      allow read, delete: if participant();
+      allow create: if isSignedIn() && incoming().keys().hasOnly(['caller','callee','kind','offer','createdAt']) &&
+        incoming().caller == request.auth.uid && isValidId(incoming().callee) && incoming().callee != request.auth.uid &&
+        exists(/databases/$(database)/documents/users_public/$(incoming().callee)) && unblocked(request.auth.uid, incoming().callee) &&
+        incoming().kind in ['audio','video'] && incoming().offer is string && incoming().offer.size() <= 100000 && incoming().createdAt == request.time;
+      allow update: if isSignedIn() && existing().callee == request.auth.uid && !('answer' in existing()) &&
+        request.time < existing().createdAt + duration.value(60, 's') && unblocked(existing().caller, existing().callee) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['answer']) && incoming().answer is string && incoming().answer.size() <= 100000;
+    }
+
     match /users_public/{userId} {
       allow get: if isSignedIn() && isValidId(userId);
       allow list: if isSignedIn();
