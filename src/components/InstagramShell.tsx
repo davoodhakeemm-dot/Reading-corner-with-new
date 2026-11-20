@@ -9,6 +9,7 @@ import { InstagramProfileView, type ProfileSection } from "@/components/Instagra
 import { ReadingActions } from "@/components/ReadingActions";
 import { Logo } from "@/components/Logo";
 import { TripleTapExit } from "@/components/TripleTapExit";
+import { CallMedia } from './CallMedia';
 import { initialsOf, openThread, respondToCall, useChat } from "@/lib/chat-store";
 import { getSecretTheme } from "@/lib/secret-themes";
 import { cn } from "@/lib/utils";
@@ -460,8 +461,9 @@ export function InstagramShell({
                     {outgoingCall.target.fullName}
                   </p>
                   <p className={cn("mt-1 text-xs", theme.mutedText)}>
-                    {outgoingCall.status === "accepted" ? "Connected" : "Ringing…"}
+                    {{ accepted: 'Connected', preparing: 'Preparing your device…', connecting: 'Connecting…', ringing: 'Ringing…' }[outgoingCall.status]}
                   </p>
+                  <CallMedia stream={outgoingCall.stream ?? null} video={outgoingCall.callType === 'video'} />
                   <button
                     type="button"
                     onClick={() =>

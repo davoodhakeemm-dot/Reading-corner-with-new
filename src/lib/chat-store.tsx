@@ -29,6 +29,7 @@ import {
   writeBatch,
   type Unsubscribe,
 } from "firebase/firestore";
+import { createCallClient } from './call-client';
 import { useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
@@ -159,7 +160,8 @@ export type OutgoingCall = {
   callId: string;
   callType: "audio" | "video";
   target: PublicAccount;
-  status: "ringing" | "accepted" | "declined" | "ended";
+  status: "preparing" | "connecting" | "ringing" | "accepted";
+  stream?: MediaStream | null;
 };
 
 type ChatClientState = {
@@ -868,7 +870,10 @@ async function ensureUserProfileDocs(
   return promise;
 }
 
+let callClient: ReturnType<typeof createCallClient> | undefined;
 function clearFirestoreListeners() {
+  callClient?.dispose();
+  callClient = undefined;
   activeListenerUid = null;
   profileUnsub?.();
   privateUnsub?.();
@@ -913,6 +918,8 @@ function startRealtimeListeners(uid: string) {
   currentUid = uid;
   activeListenerUid = uid;
   const db = getFirebaseDb();
+
+  callClient = createCallClient(db, uid, fetchUserProfile, setState, (message) => toast(message));
 
   // 1. My own public profile
   profileUnsub = onSnapshot(
@@ -2284,17 +2291,14 @@ export async function reportUser(reportedUserId: string, reason: string, details
   return { ok: true, reportId };
 }
 
-export async function initiateCall(target: PublicAccount, _callType: "audio" | "video") {
-  toast(`Voice & video calling with ${target.fullName} requires WebRTC peer setup.`);
-  return "";
+export async function initiateCall(target: PublicAccount, kind: "audio" | "video") {
+  if (!callClient) throw new Error('Sign in to place a call.');
+  if (blockedByMeMap.has(target.id) || blockedMeIds.has(target.id)) throw new Error('Calling is blocked.');
+  await callClient.dial(target, kind);
 }
 
-export function respondToCall(
-  _callId: string,
-  _targetId: string,
-  _action: "accepted" | "declined" | "ended",
-) {
-  setState({ incomingCall: null, outgoingCall: null });
+export function respondToCall(id: string, _targetId: string, action: "accepted" | "declined" | "ended") {
+  void callClient?.respond(id, action);
 }
 
 export function setSoundEnabled(enabled: boolean) {
