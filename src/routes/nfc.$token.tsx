@@ -109,7 +109,7 @@ function NfcTapPage() {
       </div>
 
       <TripleTapExit />
-      <ReadingActions />
+      <ReadingActions themeId="dark" />
 
       <motion.div
         initial={{ opacity: 0, y: 18, scale: 0.97 }}

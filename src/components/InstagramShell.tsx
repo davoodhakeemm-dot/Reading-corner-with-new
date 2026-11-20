@@ -292,7 +292,7 @@ export function InstagramShell({
               "mb-[calc(4rem+max(0.5rem,env(safe-area-inset-bottom)))] md:mb-0",
           )}
         >
-          <ReadingActions inShell personalPath={nfc?.revoked ? null : nfc?.path} />
+          <ReadingActions themeId={theme.id} inShell personalPath={nfc?.revoked ? null : nfc?.path} />
         </div>
       </main>
 

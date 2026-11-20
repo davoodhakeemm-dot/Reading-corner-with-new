@@ -1,11 +1,15 @@
 import { Link } from "@tanstack/react-router";
 import { BookOpen, Copy } from "lucide-react";
 import { toast } from "sonner";
+import { getSecretTheme, type SecretThemeId } from "@/lib/secret-themes";
+import { cn } from "@/lib/utils";
 
 export function ReadingActions({
   personalPath,
   inShell = false,
+  themeId,
 }: {
+  themeId?: SecretThemeId;
   personalPath?: string | null;
   inShell?: boolean;
 }) {
@@ -40,7 +44,10 @@ export function ReadingActions({
       <Link
         to="/home"
         replace
-        className="inline-flex min-h-11 items-center gap-2 whitespace-nowrap rounded-full bg-gradient-to-r from-[#7144bb] to-[#a63da4] px-4 text-sm font-semibold text-white shadow-md hover:brightness-110 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-500"
+        className={cn(
+          "inline-flex min-h-11 items-center gap-2 whitespace-nowrap rounded-full bg-black/35 bg-blend-multiply px-4 text-sm font-semibold hover:bg-black/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current",
+          getSecretTheme(themeId).accentBg,
+        )}
       >
         <BookOpen aria-hidden="true" className="size-4" /> Go to Reading
       </Link>

@@ -350,7 +350,7 @@ function AuthPage() {
       </div>
 
       <TripleTapExit />
-      <ReadingActions />
+      <ReadingActions themeId={backdropTheme} />
 
       <div className="relative mx-auto flex min-h-[calc(100dvh-3.5rem)] w-full max-w-5xl flex-col justify-center lg:grid lg:grid-cols-[1fr_460px] lg:items-center lg:gap-12">
         {/* Left Info & Quick Header */}
