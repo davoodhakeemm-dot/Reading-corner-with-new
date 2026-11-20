@@ -1,0 +1,467 @@
+import { useNavigate } from "@tanstack/react-router";
+import { Compass, MessageCircle, Phone, PhoneOff, User, Video } from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
+import { useEffect, useMemo, useState } from "react";
+
+import { DiscoverUsersView } from "@/components/DiscoverUsersView";
+import { InstagramChatView } from "@/components/InstagramChatView";
+import { InstagramProfileView, type ProfileSection } from "@/components/InstagramProfileView";
+import { Logo } from "@/components/Logo";
+import { TripleTapExit } from "@/components/TripleTapExit";
+import { initialsOf, openThread, respondToCall, useChat } from "@/lib/chat-store";
+import { getSecretTheme } from "@/lib/secret-themes";
+import { cn } from "@/lib/utils";
+
+export type ShellTab = "chat" | "discover" | "profile";
+
+export function InstagramShell({
+  initialTab = "chat",
+  initialProfileSection = "gallery",
+}: {
+  initialTab?: ShellTab;
+  initialProfileSection?: ProfileSection;
+}) {
+  const navigate = useNavigate();
+  const { ready, me, conversations, incomingCall, outgoingCall } = useChat();
+  const [tab, setTab] = useState<ShellTab>(initialTab);
+  const [threadOpenOnMobile, setThreadOpenOnMobile] = useState(false);
+
+  useEffect(() => {
+    setTab(initialTab);
+  }, [initialTab]);
+
+  useEffect(() => {
+    if (ready && !me) {
+      navigate({ to: "/auth", replace: true });
+    }
+  }, [ready, me, navigate]);
+
+  useEffect(() => {
+    if (!ready || !me || typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const peer = params.get("peer");
+    if (peer) {
+      setTab("chat");
+      void openThread(peer);
+    }
+  }, [ready, me]);
+
+  const totalUnread = useMemo(
+    () => conversations.reduce((sum, c) => sum + c.unreadCount, 0),
+    [conversations],
+  );
+
+  function handleStartMessage(peerId: string) {
+    setTab("chat");
+    void openThread(peerId);
+  }
+
+  if (!ready || !me) {
+    return (
+      <div className="grid min-h-[100dvh] place-items-center bg-[#090b12] text-white">
+        <div className="text-center">
+          <Logo className="mx-auto size-10 animate-pulse" />
+          <p className="mt-3 text-xs font-medium text-white/70">Opening Reading Corner…</p>
+        </div>
+      </div>
+    );
+  }
+
+  const theme = getSecretTheme(me.theme);
+
+  return (
+    <div
+      className={cn("relative flex h-[100dvh] flex-col overflow-hidden md:flex-row", theme.pageBg)}
+    >
+      {/* Ambient studio backdrop + slow-drifting liquid glass light orbs */}
+      <div className={cn("pointer-events-none fixed inset-0", theme.ambientBackdrop)} />
+      <div className="pointer-events-none fixed inset-0 overflow-hidden">
+        <motion.div
+          animate={{
+            x: [0, 26, -14, 0],
+            y: [0, -18, 22, 0],
+            scale: [1, 1.08, 0.96, 1],
+          }}
+          transition={{ duration: 14, repeat: Infinity, ease: "easeInOut" }}
+          className={cn(
+            "absolute -left-24 -top-24 size-96 rounded-full blur-3xl",
+            theme.glassOrbPrimary,
+          )}
+        />
+        <motion.div
+          animate={{
+            x: [0, -28, 18, 0],
+            y: [0, 22, -16, 0],
+            scale: [1.04, 0.95, 1.07, 1.04],
+          }}
+          transition={{ duration: 17, repeat: Infinity, ease: "easeInOut" }}
+          className={cn(
+            "absolute -bottom-28 -right-24 size-[26rem] rounded-full blur-3xl",
+            theme.glassOrbSecondary,
+          )}
+        />
+      </div>
+      <TripleTapExit />
+
+      {/* Desktop Left Frosted Glass Navigation Rail */}
+      <aside
+        className={cn(
+          "relative z-10 hidden w-20 shrink-0 flex-col justify-between border-r py-5 backdrop-blur-2xl md:flex lg:w-60 lg:px-4",
+          theme.border,
+          theme.surfaceGlass,
+        )}
+      >
+        <div className="space-y-6">
+          <button
+            type="button"
+            onClick={() => setTab("chat")}
+            className="flex w-full items-center justify-center gap-3 px-2 text-left lg:justify-start"
+          >
+            <span
+              className={cn(
+                "glass-sheen grid size-10 shrink-0 place-items-center rounded-2xl p-1.5",
+                theme.accentBg,
+              )}
+            >
+              <Logo className="size-6" />
+            </span>
+            <span className="hidden min-w-0 lg:block">
+              <span className="block truncate font-display text-base font-extrabold">
+                Reading Corner
+              </span>
+              <span className={cn("block truncate text-[11px] font-medium", theme.mutedText)}>
+                Read · Chat · Grow
+              </span>
+            </span>
+          </button>
+
+          <nav className="space-y-2">
+            <button
+              type="button"
+              onClick={() => setTab("chat")}
+              className={cn(
+                "relative flex min-h-[48px] w-full items-center justify-center gap-3 rounded-2xl px-3 text-sm font-bold transition lg:justify-start",
+                tab === "chat" ? theme.navActiveText : theme.mutedText,
+              )}
+            >
+              {tab === "chat" && (
+                <motion.span
+                  layoutId="desktopSecretNav"
+                  transition={{ type: "spring", stiffness: 360, damping: 30 }}
+                  className={cn("absolute inset-0 rounded-2xl", theme.navActiveBg)}
+                />
+              )}
+              <span className="relative z-10">
+                <MessageCircle className="size-5" />
+                {totalUnread > 0 && (
+                  <span
+                    className={cn(
+                      "absolute -right-2 -top-1.5 grid size-4 place-items-center rounded-full text-[9px] font-bold",
+                      theme.badgeBg,
+                    )}
+                  >
+                    {totalUnread > 9 ? "9+" : totalUnread}
+                  </span>
+                )}
+              </span>
+              <span className="relative z-10 hidden lg:inline">Chat</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setTab("discover")}
+              className={cn(
+                "relative flex min-h-[48px] w-full items-center justify-center gap-3 rounded-2xl px-3 text-sm font-bold transition lg:justify-start",
+                tab === "discover" ? theme.navActiveText : theme.mutedText,
+              )}
+            >
+              {tab === "discover" && (
+                <motion.span
+                  layoutId="desktopSecretNav"
+                  transition={{ type: "spring", stiffness: 360, damping: 30 }}
+                  className={cn("absolute inset-0 rounded-2xl", theme.navActiveBg)}
+                />
+              )}
+              <Compass className="relative z-10 size-5" />
+              <span className="relative z-10 hidden lg:inline">Discover</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setTab("profile")}
+              className={cn(
+                "relative flex min-h-[48px] w-full items-center justify-center gap-3 rounded-2xl px-3 text-sm font-bold transition lg:justify-start",
+                tab === "profile" ? theme.navActiveText : theme.mutedText,
+              )}
+            >
+              {tab === "profile" && (
+                <motion.span
+                  layoutId="desktopSecretNav"
+                  transition={{ type: "spring", stiffness: 360, damping: 30 }}
+                  className={cn("absolute inset-0 rounded-2xl", theme.navActiveBg)}
+                />
+              )}
+              <span
+                className={cn(
+                  "relative z-10 grid size-6 place-items-center rounded-full p-[1.5px]",
+                  theme.ringGradient,
+                )}
+              >
+                <span
+                  className={cn(
+                    "grid size-full place-items-center overflow-hidden rounded-full text-[10px] font-bold",
+                    theme.surface,
+                  )}
+                >
+                  {me.avatarUrl ? (
+                    <img src={me.avatarUrl} alt={me.fullName} className="size-full object-cover" />
+                  ) : (
+                    initialsOf(me.fullName)
+                  )}
+                </span>
+              </span>
+              <span className="relative z-10 hidden lg:inline">Profile</span>
+            </button>
+          </nav>
+        </div>
+
+        <p className={cn("hidden px-2 text-[11px] leading-relaxed lg:block", theme.mutedText)}>
+          Discover readers, follow profiles, and sync your reading shelf across devices.
+        </p>
+      </aside>
+
+      {/* Main Content Area with Smooth Glass Transitions */}
+      <main className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <AnimatePresence mode="wait">
+          {tab === "chat" ? (
+            <motion.div
+              key="chat"
+              initial={{ opacity: 0, y: 8, scale: 0.99 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -6, scale: 0.99 }}
+              transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+              className="flex min-h-0 flex-1 flex-col overflow-hidden"
+            >
+              <InstagramChatView
+                theme={theme}
+                onOpenProfile={() => setTab("profile")}
+                onOpenDiscover={() => setTab("discover")}
+                onThreadOpenChange={setThreadOpenOnMobile}
+              />
+            </motion.div>
+          ) : tab === "discover" ? (
+            <motion.div
+              key="discover"
+              initial={{ opacity: 0, y: 8, scale: 0.99 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -6, scale: 0.99 }}
+              transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+              className="flex min-h-0 flex-1 flex-col overflow-hidden"
+            >
+              <DiscoverUsersView theme={theme} onStartMessage={handleStartMessage} />
+            </motion.div>
+          ) : (
+            <motion.div
+              key="profile"
+              initial={{ opacity: 0, y: 8, scale: 0.99 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -6, scale: 0.99 }}
+              transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+              className="flex min-h-0 flex-1 flex-col overflow-hidden"
+            >
+              <InstagramProfileView
+                theme={theme}
+                initialSection={initialProfileSection}
+                onBackToChat={() => setTab("chat")}
+                onOpenDiscover={() => setTab("discover")}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </main>
+
+      {/* Floating Glass Mobile Bottom Pill */}
+      {!(tab === "chat" && threadOpenOnMobile) && (
+        <motion.nav
+          initial={{ y: 24, opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+          className={cn(
+            "fixed inset-x-3 bottom-[max(0.5rem,env(safe-area-inset-bottom))] z-30 rounded-[28px] border p-1.5 backdrop-blur-2xl md:hidden",
+            theme.navBg,
+          )}
+        >
+          <div className="mx-auto grid max-w-md grid-cols-3 gap-1">
+            <button
+              type="button"
+              onClick={() => setTab("chat")}
+              className={cn(
+                "relative flex min-h-[48px] items-center justify-center gap-1.5 rounded-[22px] px-2 text-xs font-bold transition",
+                tab === "chat" ? theme.navActiveText : theme.mutedText,
+              )}
+            >
+              {tab === "chat" && (
+                <motion.span
+                  layoutId="mobileSecretNav"
+                  transition={{ type: "spring", stiffness: 360, damping: 28 }}
+                  className={cn("glass-sheen absolute inset-0 rounded-[22px]", theme.navActiveBg)}
+                />
+              )}
+              <span className="relative z-10">
+                <MessageCircle className="size-5" />
+                {totalUnread > 0 && (
+                  <span
+                    className={cn(
+                      "absolute -right-2.5 -top-1.5 grid size-4 place-items-center rounded-full text-[9px] font-bold",
+                      theme.badgeBg,
+                    )}
+                  >
+                    {totalUnread > 9 ? "9+" : totalUnread}
+                  </span>
+                )}
+              </span>
+              <span className="relative z-10">Chat</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setTab("discover")}
+              className={cn(
+                "relative flex min-h-[48px] items-center justify-center gap-1.5 rounded-[22px] px-2 text-xs font-bold transition",
+                tab === "discover" ? theme.navActiveText : theme.mutedText,
+              )}
+            >
+              {tab === "discover" && (
+                <motion.span
+                  layoutId="mobileSecretNav"
+                  transition={{ type: "spring", stiffness: 360, damping: 28 }}
+                  className={cn("glass-sheen absolute inset-0 rounded-[22px]", theme.navActiveBg)}
+                />
+              )}
+              <Compass className="relative z-10 size-5" />
+              <span className="relative z-10">Discover</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setTab("profile")}
+              className={cn(
+                "relative flex min-h-[48px] items-center justify-center gap-1.5 rounded-[22px] px-2 text-xs font-bold transition",
+                tab === "profile" ? theme.navActiveText : theme.mutedText,
+              )}
+            >
+              {tab === "profile" && (
+                <motion.span
+                  layoutId="mobileSecretNav"
+                  transition={{ type: "spring", stiffness: 360, damping: 28 }}
+                  className={cn("glass-sheen absolute inset-0 rounded-[22px]", theme.navActiveBg)}
+                />
+              )}
+              <User className="relative z-10 size-5" />
+              <span className="relative z-10">Profile</span>
+            </button>
+          </div>
+        </motion.nav>
+      )}
+
+      {/* Real-time Incoming / Outgoing Frosted Glass Call Modal */}
+      <AnimatePresence>
+        {(incomingCall || outgoingCall) && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur-lg"
+          >
+            <motion.div
+              initial={{ scale: 0.92, opacity: 0, y: 12 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.92, opacity: 0, y: 12 }}
+              className={cn(
+                "glass-sheen w-full max-w-xs rounded-[32px] border p-6 text-center backdrop-blur-2xl",
+                theme.surfaceGlass,
+                theme.border,
+              )}
+            >
+              {incomingCall ? (
+                <>
+                  <div
+                    className={cn(
+                      "mx-auto grid size-16 place-items-center rounded-full text-xl font-bold",
+                      theme.accentBg,
+                    )}
+                  >
+                    {incomingCall.callType === "video" ? (
+                      <Video className="size-7" />
+                    ) : (
+                      <Phone className="size-7" />
+                    )}
+                  </div>
+                  <p className="mt-4 font-display text-lg font-extrabold">
+                    {incomingCall.from.fullName}
+                  </p>
+                  <p className={cn("mt-1 text-xs", theme.mutedText)}>
+                    Incoming {incomingCall.callType} call…
+                  </p>
+                  <div className="mt-6 flex justify-center gap-4">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        respondToCall(incomingCall.callId, incomingCall.from.id, "declined")
+                      }
+                      className="grid size-14 place-items-center rounded-full bg-rose-600 text-white shadow-lg transition hover:scale-105"
+                      aria-label="Decline call"
+                    >
+                      <PhoneOff className="size-6" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        respondToCall(incomingCall.callId, incomingCall.from.id, "accepted")
+                      }
+                      className="grid size-14 place-items-center rounded-full bg-emerald-600 text-white shadow-lg transition hover:scale-105"
+                      aria-label="Accept call"
+                    >
+                      <Phone className="size-6" />
+                    </button>
+                  </div>
+                </>
+              ) : outgoingCall ? (
+                <>
+                  <div
+                    className={cn(
+                      "mx-auto grid size-16 place-items-center rounded-full text-xl font-bold",
+                      theme.accentBg,
+                    )}
+                  >
+                    {outgoingCall.callType === "video" ? (
+                      <Video className="size-7" />
+                    ) : (
+                      <Phone className="size-7" />
+                    )}
+                  </div>
+                  <p className="mt-4 font-display text-lg font-extrabold">
+                    {outgoingCall.target.fullName}
+                  </p>
+                  <p className={cn("mt-1 text-xs", theme.mutedText)}>
+                    {outgoingCall.status === "accepted" ? "Connected" : "Ringing…"}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      respondToCall(outgoingCall.callId, outgoingCall.target.id, "ended")
+                    }
+                    className="mx-auto mt-6 grid size-14 place-items-center rounded-full bg-rose-600 text-white shadow-lg transition hover:scale-105"
+                    aria-label="End call"
+                  >
+                    <PhoneOff className="size-6" />
+                  </button>
+                </>
+              ) : null}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
