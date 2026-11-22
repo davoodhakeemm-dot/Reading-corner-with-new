@@ -31,8 +31,8 @@ export function buildIncomingCallAlertPayload(input: {
   const cleanName = input.senderName.trim() || "Someone";
   const label = input.callType === "video" ? "video call" : "audio call";
   return {
-    title: `Incoming ${label} from ${cleanName}`,
-    body: "Tap Receive to answer now.",
+    title: "Reading Corner",
+    body: `Incoming ${label} from ${cleanName}. Open the app to receive or decline.`,
     vibratePattern: [...CALL_RING_VIBRATION_PATTERN],
     tag: "rc-incoming-call",
   };
@@ -45,14 +45,14 @@ export function buildIncomingMessageAlertPayload(input: {
 }) {
   const cleanName = input.senderName.trim() || "New message";
   const cleanText = input.text?.trim();
-  const body = cleanText
-    ? cleanText.slice(0, 160)
+  const preview = cleanText
+    ? cleanText.slice(0, 120)
     : input.mediaKind
       ? `Sent a ${input.mediaKind}`
       : "Sent a message";
   return {
-    title: cleanName,
-    body,
+    title: "Reading Corner",
+    body: `New message from ${cleanName}: ${preview}`.slice(0, 160),
     vibratePattern: [...MESSAGE_VIBRATION_PATTERN],
     tag: `rc-msg-${cleanName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
   };
