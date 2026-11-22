@@ -58,6 +58,7 @@ import {
   formatTime,
   initialsOf,
   initiateCall,
+  loadOlderMessages,
   openThread,
   reactToMessage,
   searchThreadMessages,
@@ -296,6 +297,8 @@ export function InstagramChatView({
     discoveredUsers,
     activePeerId,
     threads,
+    hasOlderMessages,
+    loadingOlderMessages,
     typingByPeer,
     gallery,
     soundEnabled,
@@ -353,6 +356,8 @@ export function InstagramChatView({
   const menuContainerRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const shouldStickToLatestRef = useRef(true);
+  const previousPeerIdRef = useRef<string | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
 
@@ -605,7 +610,12 @@ export function InstagramChatView({
   }, [activeMessages, me]);
 
   useEffect(() => {
-    if (!threadSearchQuery.trim()) {
+    if (previousPeerIdRef.current !== activePeerId) {
+      previousPeerIdRef.current = activePeerId;
+      shouldStickToLatestRef.current = true;
+    }
+
+    if (!threadSearchQuery.trim() && shouldStickToLatestRef.current) {
       const container = messagesScrollRef.current;
       if (container) {
         container.scrollTop = container.scrollHeight;
@@ -717,6 +727,7 @@ export function InstagramChatView({
     if (!text && !pendingMedia) return;
 
     setSending(true);
+    shouldStickToLatestRef.current = true;
     try {
       await sendChatMessage(activePeerId, text, pendingMedia?.id ?? null, replyingTo?.id ?? null);
       playWaterSound("droplet", soundEnabled);
@@ -730,6 +741,19 @@ export function InstagramChatView({
     } finally {
       setSending(false);
     }
+  }
+
+  async function handleLoadOlderMessages() {
+    if (!activePeerId) return;
+    const container = messagesScrollRef.current;
+    const previousHeight = container?.scrollHeight ?? 0;
+    const previousTop = container?.scrollTop ?? 0;
+    await loadOlderMessages(activePeerId);
+    requestAnimationFrame(() => {
+      if (container) {
+        container.scrollTop = container.scrollHeight - previousHeight + previousTop;
+      }
+    });
   }
 
   async function handleReact(msgId: string, emoji: string) {
@@ -1666,8 +1690,30 @@ export function InstagramChatView({
 
                 <div
                   ref={messagesScrollRef}
-                  className="flex-1 space-y-3 overflow-y-auto px-3.5 pb-4 pt-6 sm:px-5"
+                  onScroll={(event) => {
+                    const { scrollTop, scrollHeight, clientHeight } = event.currentTarget;
+                    shouldStickToLatestRef.current = scrollHeight - scrollTop - clientHeight < 96;
+                  }}
+                  className="flex-1 space-y-3 overflow-x-hidden overflow-y-auto overscroll-y-contain px-3.5 pb-4 pt-6 sm:px-5"
                 >
+                  {hasOlderMessages && (
+                    <div className="flex justify-center pb-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleLoadOlderMessages()}
+                        disabled={loadingOlderMessages}
+                        aria-label={
+                          loadingOlderMessages ? "Loading older messages" : "Load older messages"
+                        }
+                        className={cn(
+                          "min-h-10 rounded-full px-4 text-xs font-semibold transition disabled:opacity-60",
+                          theme.surfaceMuted,
+                        )}
+                      >
+                        {loadingOlderMessages ? "Loading older messages…" : "Load older messages"}
+                      </button>
+                    </div>
+                  )}
                   {visibleMessages.map((m) => {
                     const mine = m.from === me.id;
                     const isLastSeen = mine && m.id === lastSeenOutgoingId;
@@ -2245,25 +2291,28 @@ export function InstagramChatView({
                           ref={draftInputRef}
                           data-chat-composer="true"
                           value={draft}
-                          onChange={(e) => handleDraftChange(e.target.value)}
+                          onChange={(e) => {
+                            handleDraftChange(e.target.value);
+                            e.currentTarget.style.height = "auto";
+                            e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 112)}px`;
+                          }}
                           onPointerDown={() => {
                             stopVibration();
                           }}
                           onFocus={() => {
                             stopVibration();
                             setIsComposerFocused(true);
-                            window.setTimeout(() => {
-                              const container = messagesScrollRef.current;
-                              if (container) {
-                                container.scrollTop = container.scrollHeight;
-                              }
-                            }, 120);
                           }}
                           onBlur={() => {
                             setIsComposerFocused(false);
                           }}
                           onKeyDown={(e) => {
-                            if (e.key === "Enter" && !e.shiftKey) {
+                            if (
+                              e.key === "Enter" &&
+                              !e.shiftKey &&
+                              !e.nativeEvent.isComposing &&
+                              e.keyCode !== 229
+                            ) {
                               e.preventDefault();
                               void handleSend(e);
                             }

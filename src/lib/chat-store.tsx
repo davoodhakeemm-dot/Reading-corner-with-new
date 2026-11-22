@@ -15,8 +15,10 @@ import {
   collection,
   deleteDoc,
   doc,
+  endBefore,
   getDoc,
   getDocs,
+  limitToLast,
   increment,
   onSnapshot,
   orderBy,
@@ -27,6 +29,7 @@ import {
   updateDoc,
   where,
   writeBatch,
+  type QueryDocumentSnapshot,
   type Unsubscribe,
 } from "firebase/firestore";
 import { createCallClient } from "./call-client";
@@ -186,6 +189,8 @@ type ChatClientState = {
   discoveredUsers: PublicAccount[];
   activePeerId: string | null;
   threads: Record<string, ChatMessage[]>;
+  hasOlderMessages: boolean;
+  loadingOlderMessages: boolean;
   typingByPeer: Record<string, boolean>;
   blockedUsers: BlockedUserItem[];
   nfc: NfcLinkState | null;
@@ -279,6 +284,8 @@ const INITIAL: ChatClientState = {
   discoveredUsers: [],
   activePeerId: null,
   threads: {},
+  hasOlderMessages: false,
+  loadingOlderMessages: false,
   typingByPeer: {},
   blockedUsers: [],
   nfc: null,
@@ -308,7 +315,13 @@ let blocksOnMeUnsub: Unsubscribe | null = null;
 let convsAUnsub: Unsubscribe | null = null;
 let convsBUnsub: Unsubscribe | null = null;
 let activeThreadUnsub: Unsubscribe | null = null;
+let activeThreadGeneration = 0;
 let presenceTimer: number | null = null;
+const THREAD_PAGE_SIZE = 50;
+const threadOldestDocs = new Map<string, QueryDocumentSnapshot>();
+const threadHasOlder = new Map<string, boolean>();
+const threadHistoryExhausted = new Set<string>();
+const olderMessagesByPeer = new Map<string, ChatMessage[]>();
 
 // Raw snapshot caches so derived state recomputes cleanly without extra Firestore reads
 let rawPublicUsers = new Map<string, RawPublicUser>();
@@ -900,6 +913,11 @@ function clearFirestoreListeners() {
   convsAUnsub?.();
   convsBUnsub?.();
   activeThreadUnsub?.();
+  activeThreadGeneration += 1;
+  threadOldestDocs.clear();
+  threadHasOlder.clear();
+  threadHistoryExhausted.clear();
+  olderMessagesByPeer.clear();
   profileUnsub = null;
   privateUnsub = null;
   usersUnsub = null;
@@ -1811,10 +1829,13 @@ export function dismissIncomingMessageAlert() {
 }
 
 export async function openThread(peerId: string | null) {
+  const generation = ++activeThreadGeneration;
   activeThreadUnsub?.();
   activeThreadUnsub = null;
   setState({
     activePeerId: peerId,
+    hasOlderMessages: peerId ? (threadHasOlder.get(peerId) ?? false) : false,
+    loadingOlderMessages: false,
     ...(peerId && state.incomingMessageAlert?.peer.id === peerId
       ? { incomingMessageAlert: null }
       : {}),
@@ -1826,25 +1847,42 @@ export async function openThread(peerId: string | null) {
   const uid = fbUser.uid;
   const db = getFirebaseDb();
 
-  // Ensure peer exists in cache
   if (!rawPublicUsers.has(peerId)) {
     await fetchUserProfile(peerId).catch(() => null);
   }
+  if (generation !== activeThreadGeneration || state.activePeerId !== peerId) return;
 
   const key = await ensureConversationDoc(uid, peerId);
+  if (generation !== activeThreadGeneration || state.activePeerId !== peerId) return;
   const msgsRef = collection(db, "conversations", key, "messages");
 
   activeThreadUnsub = onSnapshot(
-    query(msgsRef, orderBy("createdAt", "asc")),
+    query(msgsRef, orderBy("createdAt", "asc"), limitToLast(THREAD_PAGE_SIZE + 1)),
     (snap) => {
-      const list = snap.docs.map((d) =>
+      if (generation !== activeThreadGeneration) return;
+      if (snap.docs[0] && !threadOldestDocs.has(peerId)) {
+        threadOldestDocs.set(peerId, snap.docs[0]);
+      }
+      const hasOlderMessages =
+        !threadHistoryExhausted.has(peerId) && snap.docs.length > THREAD_PAGE_SIZE;
+      threadHasOlder.set(peerId, hasOlderMessages);
+      const recent = snap.docs.map((d) =>
         serializeFirestoreMessage(d.data() as RawMessage, key, uid),
       );
+      const merged = new Map(
+        [...(olderMessagesByPeer.get(peerId) ?? []), ...recent].map((message) => [
+          message.id,
+          message,
+        ]),
+      );
+      const messages = Array.from(merged.values()).sort(
+        (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+      );
       setState({
-        threads: { ...state.threads, [peerId]: list },
+        threads: { ...state.threads, [peerId]: messages },
+        hasOlderMessages,
       });
 
-      // Automatically mark incoming unread messages as delivered + seen
       const unseenIncoming = snap.docs.filter((d) => {
         const data = d.data() as RawMessage;
         return data.recipientId === uid && !data.seenAt;
@@ -1870,11 +1908,79 @@ export async function openThread(peerId: string | null) {
       }
     },
     (err) => {
-      console.error("Thread listener error:", err);
+      if (generation === activeThreadGeneration) {
+        console.error("Thread listener error:", err);
+      }
     },
   );
 
   await markThreadSeen(peerId);
+}
+
+export async function loadOlderMessages(peerId: string): Promise<void> {
+  const cursor = threadOldestDocs.get(peerId);
+  if (!cursor || !threadHasOlder.get(peerId) || state.loadingOlderMessages) return;
+  const fbUser = getFirebaseAuth().currentUser;
+  if (!fbUser) return;
+
+  setState({ loadingOlderMessages: true });
+  try {
+    const key = threadKeyFor(fbUser.uid, peerId);
+    const page = await getDocs(
+      query(
+        collection(getFirebaseDb(), "conversations", key, "messages"),
+        orderBy("createdAt", "asc"),
+        endBefore(cursor),
+        limitToLast(THREAD_PAGE_SIZE),
+      ),
+    );
+    const older = page.docs.map((d) =>
+      serializeFirestoreMessage(d.data() as RawMessage, key, fbUser.uid),
+    );
+    const unseen = page.docs.filter((messageDoc) => {
+      const message = messageDoc.data() as RawMessage;
+      return message.recipientId === fbUser.uid && !message.seenAt;
+    });
+    if (unseen.length > 0) {
+      const batch = writeBatch(getFirebaseDb());
+      for (const messageDoc of unseen) {
+        const message = messageDoc.data() as RawMessage;
+        batch.update(messageDoc.ref, {
+          deliveredAt: message.deliveredAt ?? serverTimestamp(),
+          seenAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      batch.update(doc(getFirebaseDb(), "conversations", key), {
+        lastMessageSeenAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      void batch.commit().catch(() => {});
+    }
+    const cached = olderMessagesByPeer.get(peerId) ?? [];
+    const merged = new Map([...cached, ...older].map((message) => [message.id, message]));
+    const messages = Array.from(merged.values()).sort(
+      (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+    );
+    if (page.docs[0]) {
+      threadOldestDocs.set(peerId, page.docs[0]);
+    }
+    const hasOlderMessages = page.docs.length === THREAD_PAGE_SIZE;
+    if (page.docs.length < THREAD_PAGE_SIZE) {
+      threadHistoryExhausted.add(peerId);
+    }
+    threadHasOlder.set(peerId, hasOlderMessages);
+    olderMessagesByPeer.set(peerId, messages);
+    setState({
+      threads: { ...state.threads, [peerId]: messages },
+      ...(state.activePeerId === peerId ? { hasOlderMessages } : {}),
+    });
+  } catch (err) {
+    console.error("Could not load older messages:", err);
+    toast.error("Could not load older messages.");
+  } finally {
+    setState({ loadingOlderMessages: false });
+  }
 }
 
 export async function searchThreadMessages(peerId: string, q: string): Promise<ChatMessage[]> {
