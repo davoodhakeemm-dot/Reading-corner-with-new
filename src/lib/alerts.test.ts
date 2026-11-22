@@ -5,7 +5,9 @@ import {
   buildIncomingCallAlertPayload,
   buildIncomingMessageAlertPayload,
   CALL_RING_VIBRATION_PATTERN,
+  isVibrationEnabled,
   MESSAGE_VIBRATION_PATTERN,
+  setVibrationEnabled,
   stopVibration,
   triggerVibration,
 } from "./alerts";
@@ -35,6 +37,8 @@ test("buildIncomingMessageAlertPayload formats text and media previews cleanly w
 });
 
 test("vibration helpers fail safely in non-browser environments", () => {
+  assert.equal(isVibrationEnabled(), true);
+  assert.doesNotThrow(() => setVibrationEnabled(false));
   assert.equal(triggerVibration(MESSAGE_VIBRATION_PATTERN), false);
   assert.doesNotThrow(() => stopVibration());
 });

@@ -74,6 +74,8 @@ import {
   type MediaKind,
   type PublicAccount,
 } from "@/lib/chat-store";
+import { stopVibration } from "@/lib/alerts";
+import { computeChatKeyboardLayout, type ChatKeyboardLayout } from "@/lib/chat-viewport";
 import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
 import {
   filterConversationsByTab,
@@ -335,14 +337,21 @@ export function InstagramChatView({
     name: string;
   } | null>(null);
 
-  // Mobile keyboard viewport tracking so input is NEVER covered by soft keyboard
-  const [viewportHeight, setViewportHeight] = useState<number | null>(null);
+  // Mobile keyboard viewport tracking so input & chat text are NEVER covered or jittering
+  const [keyboardLayout, setKeyboardLayout] = useState<ChatKeyboardLayout>({
+    isKeyboardOpen: false,
+    viewportHeightPx: null,
+    viewportOffsetTopPx: 0,
+  });
+  const [isMobileViewport, setIsMobileViewport] = useState(false);
+  const [isComposerFocused, setIsComposerFocused] = useState(false);
 
   const fileRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const draftInputRef = useRef<HTMLTextAreaElement>(null);
   const menuContainerRef = useRef<HTMLDivElement>(null);
+  const messagesScrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
@@ -459,20 +468,43 @@ export function InstagramChatView({
   }, [recording]);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !window.visualViewport) return;
-    const vv = window.visualViewport;
+    if (typeof window === "undefined") return;
+    let rafId = 0;
     const syncViewport = () => {
-      setViewportHeight(vv.height);
-      endRef.current?.scrollIntoView({ block: "end" });
+      if (rafId) window.cancelAnimationFrame(rafId);
+      rafId = window.requestAnimationFrame(() => {
+        const isMobile = window.innerWidth < 768;
+        setIsMobileViewport(isMobile);
+        const vv = window.visualViewport;
+        const next = computeChatKeyboardLayout({
+          layoutHeight: window.innerHeight,
+          visualHeight: vv ? vv.height : window.innerHeight,
+          visualOffsetTop: vv ? vv.offsetTop : 0,
+          isMobile,
+          isComposerFocused,
+        });
+        setKeyboardLayout((prev) =>
+          prev.isKeyboardOpen === next.isKeyboardOpen &&
+          prev.viewportHeightPx === next.viewportHeightPx &&
+          prev.viewportOffsetTopPx === next.viewportOffsetTopPx
+            ? prev
+            : next,
+        );
+      });
     };
+
     syncViewport();
-    vv.addEventListener("resize", syncViewport);
-    vv.addEventListener("scroll", syncViewport);
+    window.addEventListener("resize", syncViewport);
+    const vv = window.visualViewport;
+    vv?.addEventListener("resize", syncViewport);
+    vv?.addEventListener("scroll", syncViewport);
     return () => {
-      vv.removeEventListener("resize", syncViewport);
-      vv.removeEventListener("scroll", syncViewport);
+      if (rafId) window.cancelAnimationFrame(rafId);
+      window.removeEventListener("resize", syncViewport);
+      vv?.removeEventListener("resize", syncViewport);
+      vv?.removeEventListener("scroll", syncViewport);
     };
-  }, []);
+  }, [isComposerFocused]);
 
   useEffect(() => {
     const trimmed = query.trim();
@@ -574,9 +606,20 @@ export function InstagramChatView({
 
   useEffect(() => {
     if (!threadSearchQuery.trim()) {
-      endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+      const container = messagesScrollRef.current;
+      if (container) {
+        container.scrollTop = container.scrollHeight;
+      } else {
+        endRef.current?.scrollIntoView({ block: "end" });
+      }
     }
-  }, [activeMessages.length, activePeerId, threadSearchQuery]);
+  }, [
+    activeMessages.length,
+    activePeerId,
+    threadSearchQuery,
+    keyboardLayout.isKeyboardOpen,
+    keyboardLayout.viewportHeightPx,
+  ]);
 
   function handleDraftChange(val: string) {
     setDraft(val);
@@ -778,14 +821,16 @@ export function InstagramChatView({
   const isBlocked = Boolean(activeConv?.blockedByMe || activeConv?.blockedMe);
   const formatRec = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
+  const mobilePinnedStyle =
+    activePeerId && isMobileViewport && keyboardLayout.viewportHeightPx
+      ? {
+          top: `${keyboardLayout.viewportOffsetTopPx}px`,
+          height: `${keyboardLayout.viewportHeightPx}px`,
+        }
+      : undefined;
+
   return (
-    <div
-      style={activePeerId && viewportHeight ? { height: `${viewportHeight}px` } : undefined}
-      className={cn(
-        "flex w-full flex-1 overflow-hidden",
-        activePeerId ? "h-[100dvh] md:h-full" : "h-full",
-      )}
-    >
+    <div className="flex min-h-0 w-full flex-1 overflow-hidden">
       {/* Left Conversation List (Specular Glass Recent Chats Container) */}
       <aside
         className={cn(
@@ -1254,8 +1299,12 @@ export function InstagramChatView({
 
       {/* Right Active Thread Panel */}
       <section
+        style={mobilePinnedStyle}
         className={cn(
           "flex min-w-0 flex-1 flex-col overflow-hidden",
+          activePeerId &&
+            isMobileViewport &&
+            "fixed inset-x-0 z-30 md:static md:inset-auto md:z-auto",
           !activePeer && "hidden md:flex",
         )}
       >
@@ -1575,16 +1624,18 @@ export function InstagramChatView({
             )}
 
             {/* Atmospheric Study Band Behind Rising Curved Glass Conversation Sheet */}
-            <div className="relative flex min-h-0 flex-1 flex-col pt-2.5 md:px-4 md:pt-4">
-              <div className="mx-3 mb-5 flex items-center justify-between gap-2 md:hidden">
-                <CopyPersonalLinkButton
-                  theme={theme}
-                  size="sm"
-                  label="Copy Link"
-                  className="min-h-[34px] px-3 text-[11px]"
-                />
-                <GoToReadingButton size="sm" className="min-h-[34px] px-3.5 text-[11px]" />
-              </div>
+            <div className="relative flex min-h-0 flex-1 flex-col pt-2 md:px-4 md:pt-4">
+              {!keyboardLayout.isKeyboardOpen && (
+                <div className="mx-3 mb-4 flex items-center justify-between gap-2 md:hidden">
+                  <CopyPersonalLinkButton
+                    theme={theme}
+                    size="sm"
+                    label="Copy Link"
+                    className="min-h-[34px] px-3 text-[11px]"
+                  />
+                  <GoToReadingButton size="sm" className="min-h-[34px] px-3.5 text-[11px]" />
+                </div>
+              )}
               <div className="pointer-events-none mx-6 mb-4 hidden items-center justify-center gap-2 text-[11px] font-semibold opacity-65 md:flex">
                 <BookOpen className="size-3.5" />
                 <span>Real-time direct messages &amp; shared media</span>
@@ -1613,7 +1664,10 @@ export function InstagramChatView({
                   </div>
                 )}
 
-                <div className="flex-1 space-y-3 overflow-y-auto px-3.5 pb-4 pt-6 sm:px-5">
+                <div
+                  ref={messagesScrollRef}
+                  className="flex-1 space-y-3 overflow-y-auto px-3.5 pb-4 pt-6 sm:px-5"
+                >
                   {visibleMessages.map((m) => {
                     const mine = m.from === me.id;
                     const isLastSeen = mine && m.id === lastSeenOutgoingId;
@@ -2093,80 +2147,82 @@ export function InstagramChatView({
 
                     <form
                       onSubmit={handleSend}
-                      className="flex items-end gap-1 px-2 py-2 sm:gap-1.5 sm:px-2.5"
+                      className="flex flex-wrap items-end gap-1.5 px-2.5 py-2 sm:flex-nowrap"
                     >
-                      {!editingMsg && (
-                        <>
-                          <button
-                            type="button"
-                            disabled={uploading}
-                            onClick={() => cameraRef.current?.click()}
-                            aria-label="Open camera"
-                            title="Camera"
-                            className={cn(
-                              "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 disabled:opacity-50 sm:size-10",
-                              theme.surfaceMuted,
-                            )}
-                          >
-                            <Camera className="size-4 sm:size-5" />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={uploading}
-                            onClick={() => fileRef.current?.click()}
-                            aria-label="Attach photo or video"
-                            title="Photo or Video"
-                            className={cn(
-                              "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 disabled:opacity-50 sm:size-10",
-                              theme.surfaceMuted,
-                            )}
-                          >
-                            <ImagePlus className="size-4 sm:size-5" />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={uploading}
-                            onClick={handleOpenGalleryPicker}
-                            aria-label="Share from gallery"
-                            title="Share from Gallery"
-                            className={cn(
-                              "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 disabled:opacity-50 sm:size-10",
-                              theme.surfaceMuted,
-                            )}
-                          >
-                            <Grid3X3 className="size-4" />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={uploading}
-                            onClick={() => void toggleRecording()}
-                            aria-label={recording ? "Stop recording" : "Voice note"}
-                            title={recording ? "Stop recording" : "Voice note"}
-                            className={cn(
-                              "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 sm:size-10",
-                              recording ? "bg-rose-600 text-white" : theme.surfaceMuted,
-                            )}
-                          >
-                            {recording ? (
-                              <Square className="size-3.5 sm:size-4" />
-                            ) : (
-                              <Mic className="size-4 sm:size-5" />
-                            )}
-                          </button>
-                        </>
-                      )}
-
-                      <button
-                        type="button"
-                        onClick={() => setEmojiOpen((s) => !s)}
-                        aria-label="Emoji"
-                        className={cn(
-                          "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 sm:size-10",
-                          theme.surfaceMuted,
+                      <div className="order-2 flex w-full items-center gap-1.5 pt-0.5 sm:order-none sm:w-auto sm:pt-0">
+                        {!editingMsg && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={uploading}
+                              onClick={() => cameraRef.current?.click()}
+                              aria-label="Open camera"
+                              title="Camera"
+                              className={cn(
+                                "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 disabled:opacity-50 sm:size-10",
+                                theme.surfaceMuted,
+                              )}
+                            >
+                              <Camera className="size-4 sm:size-5" />
+                            </button>
+                            <button
+                              type="button"
+                              disabled={uploading}
+                              onClick={() => fileRef.current?.click()}
+                              aria-label="Attach photo or video"
+                              title="Photo or Video"
+                              className={cn(
+                                "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 disabled:opacity-50 sm:size-10",
+                                theme.surfaceMuted,
+                              )}
+                            >
+                              <ImagePlus className="size-4 sm:size-5" />
+                            </button>
+                            <button
+                              type="button"
+                              disabled={uploading}
+                              onClick={handleOpenGalleryPicker}
+                              aria-label="Share from gallery"
+                              title="Share from Gallery"
+                              className={cn(
+                                "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 disabled:opacity-50 sm:size-10",
+                                theme.surfaceMuted,
+                              )}
+                            >
+                              <Grid3X3 className="size-4" />
+                            </button>
+                            <button
+                              type="button"
+                              disabled={uploading}
+                              onClick={() => void toggleRecording()}
+                              aria-label={recording ? "Stop recording" : "Voice note"}
+                              title={recording ? "Stop recording" : "Voice note"}
+                              className={cn(
+                                "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 sm:size-10",
+                                recording ? "bg-rose-600 text-white" : theme.surfaceMuted,
+                              )}
+                            >
+                              {recording ? (
+                                <Square className="size-3.5 sm:size-4" />
+                              ) : (
+                                <Mic className="size-4 sm:size-5" />
+                              )}
+                            </button>
+                          </>
                         )}
-                      >
-                        <Smile className="size-4 sm:size-5" />
-                      </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setEmojiOpen((s) => !s)}
+                          aria-label="Emoji"
+                          className={cn(
+                            "grid size-8 shrink-0 place-items-center rounded-full transition hover:scale-105 sm:size-10",
+                            theme.surfaceMuted,
+                          )}
+                        >
+                          <Smile className="size-4 sm:size-5" />
+                        </button>
+                      </div>
 
                       <input
                         ref={cameraRef}
@@ -2184,51 +2240,65 @@ export function InstagramChatView({
                         className="hidden"
                       />
 
-                      <textarea
-                        ref={draftInputRef}
-                        value={draft}
-                        onChange={(e) => handleDraftChange(e.target.value)}
-                        onFocus={() => {
-                          window.setTimeout(() => {
-                            endRef.current?.scrollIntoView({ block: "end" });
-                          }, 150);
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" && !e.shiftKey) {
-                            e.preventDefault();
-                            void handleSend(e);
+                      <div className="order-1 flex w-full items-end gap-2 sm:order-none sm:w-auto sm:flex-1">
+                        <textarea
+                          ref={draftInputRef}
+                          data-chat-composer="true"
+                          value={draft}
+                          onChange={(e) => handleDraftChange(e.target.value)}
+                          onPointerDown={() => {
+                            stopVibration();
+                          }}
+                          onFocus={() => {
+                            stopVibration();
+                            setIsComposerFocused(true);
+                            window.setTimeout(() => {
+                              const container = messagesScrollRef.current;
+                              if (container) {
+                                container.scrollTop = container.scrollHeight;
+                              }
+                            }, 120);
+                          }}
+                          onBlur={() => {
+                            setIsComposerFocused(false);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && !e.shiftKey) {
+                              e.preventDefault();
+                              void handleSend(e);
+                            }
+                          }}
+                          rows={1}
+                          placeholder={
+                            recording
+                              ? `Recording voice note (${formatRec(recordSeconds)})…`
+                              : uploading
+                                ? "Uploading media…"
+                                : editingMsg
+                                  ? "Edit message…"
+                                  : "Message…"
                           }
-                        }}
-                        rows={1}
-                        placeholder={
-                          recording
-                            ? `Recording voice note (${formatRec(recordSeconds)})…`
-                            : uploading
-                              ? "Uploading media…"
-                              : editingMsg
-                                ? "Edit message…"
-                                : "Message…"
-                        }
-                        className={cn(
-                          "max-h-28 min-h-[42px] flex-1 resize-none rounded-full border px-4 py-2.5 text-sm outline-none",
-                          theme.border,
-                          theme.surfaceMuted,
-                        )}
-                      />
-                      <WaterGlowButton
-                        type="submit"
-                        variant={resolveWaterButtonVariant(theme.id, "primary")}
-                        size="icon"
-                        sound="droplet"
-                        soundEnabled={soundEnabled}
-                        disabled={
-                          sending || uploading || (!draft.trim() && !pendingMedia && !editingMsg)
-                        }
-                        aria-label={editingMsg ? "Save edited message" : "Send message"}
-                        className="size-10 shrink-0"
-                      >
-                        {editingMsg ? <Check className="size-4" /> : <Send className="size-4" />}
-                      </WaterGlowButton>
+                          className={cn(
+                            "max-h-28 min-h-[42px] flex-1 resize-none rounded-[22px] border px-4 py-2.5 text-base outline-none sm:rounded-full sm:text-sm",
+                            theme.border,
+                            theme.surfaceMuted,
+                          )}
+                        />
+                        <WaterGlowButton
+                          type="submit"
+                          variant={resolveWaterButtonVariant(theme.id, "primary")}
+                          size="icon"
+                          sound="droplet"
+                          soundEnabled={soundEnabled}
+                          disabled={
+                            sending || uploading || (!draft.trim() && !pendingMedia && !editingMsg)
+                          }
+                          aria-label={editingMsg ? "Save edited message" : "Send message"}
+                          className="size-10 shrink-0"
+                        >
+                          {editingMsg ? <Check className="size-4" /> : <Send className="size-4" />}
+                        </WaterGlowButton>
+                      </div>
                     </form>
                   </div>
                 )}

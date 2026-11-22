@@ -35,6 +35,7 @@ import {
   showSystemNotification,
   triggerVibration,
 } from "./alerts";
+import { isActiveElementTextInput } from "./chat-viewport";
 import { useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
@@ -1096,7 +1097,18 @@ function startRealtimeListeners(uid: string) {
               text: data.lastMessageText,
               mediaKind: data.lastMessageMediaKind ?? null,
             });
-            triggerVibration(payload.vibratePattern);
+            const onChatRoute =
+              typeof window !== "undefined" &&
+              (window.location.pathname.startsWith("/messages") ||
+                window.location.pathname.startsWith("/chat"));
+            const isTypingInChat =
+              typeof document !== "undefined" &&
+              onChatRoute &&
+              isActiveElementTextInput(document.activeElement);
+
+            if (!isTypingInChat) {
+              triggerVibration(payload.vibratePattern);
+            }
             playNotificationTone();
 
             if (state.activePeerId !== peerId) {
@@ -1110,10 +1122,6 @@ function startRealtimeListeners(uid: string) {
               });
             }
 
-            const onChatRoute =
-              typeof window !== "undefined" &&
-              (window.location.pathname.startsWith("/messages") ||
-                window.location.pathname.startsWith("/chat"));
             if (isPageHidden || !onChatRoute || state.activePeerId !== peerId) {
               showSystemNotification({
                 title: payload.title,

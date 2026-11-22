@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   APP_PERMISSION_ITEMS,
   countGrantedPermissions,
+  detectDevicePlatform,
+  getMobilePermissionSettingsGuide,
   normalizePermissionState,
   shouldShowStartupPermissions,
   type PermissionSnapshot,
@@ -66,4 +68,20 @@ test("countGrantedPermissions counts only granted permissions", () => {
     }),
     0,
   );
+});
+
+test("detectDevicePlatform and getMobilePermissionSettingsGuide identify Android, iOS, and Desktop", () => {
+  assert.equal(
+    detectDevicePlatform("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36"),
+    "android",
+  );
+  assert.equal(
+    detectDevicePlatform("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"),
+    "ios",
+  );
+  assert.equal(detectDevicePlatform("Mozilla/5.0 (X11; Linux x86_64) Chrome/128.0"), "desktop");
+
+  const androidGuide = getMobilePermissionSettingsGuide("android");
+  assert.match(androidGuide.title, /Android/i);
+  assert.ok(androidGuide.steps.length >= 2);
 });

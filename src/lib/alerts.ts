@@ -1,5 +1,28 @@
 export const MESSAGE_VIBRATION_PATTERN: number[] = [160, 80, 160];
 export const CALL_RING_VIBRATION_PATTERN: number[] = [500, 220, 500, 750];
+const VIBRATION_STORAGE_KEY = "rc_vibration_enabled_v1";
+
+export function isVibrationEnabled(): boolean {
+  if (typeof window === "undefined") return true;
+  try {
+    return window.localStorage.getItem(VIBRATION_STORAGE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+export function setVibrationEnabled(enabled: boolean): void {
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.setItem(VIBRATION_STORAGE_KEY, String(enabled));
+    } catch {
+      /* ignore storage errors */
+    }
+  }
+  if (!enabled) {
+    stopVibration();
+  }
+}
 
 export function buildIncomingCallAlertPayload(input: {
   senderName: string;
@@ -36,6 +59,7 @@ export function buildIncomingMessageAlertPayload(input: {
 }
 
 export function triggerVibration(pattern: number | number[]): boolean {
+  if (!isVibrationEnabled()) return false;
   if (typeof navigator === "undefined" || typeof navigator.vibrate !== "function") {
     return false;
   }

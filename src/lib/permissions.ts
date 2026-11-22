@@ -47,6 +47,53 @@ export function shouldShowStartupPermissions(
   );
 }
 
+export type DevicePlatform = "android" | "ios" | "desktop";
+
+export function detectDevicePlatform(userAgent?: string): DevicePlatform {
+  const ua = userAgent ?? (typeof navigator !== "undefined" ? navigator.userAgent : "");
+  if (/android/i.test(ua)) return "android";
+  if (/iphone|ipad|ipod/i.test(ua)) return "ios";
+  return "desktop";
+}
+
+export function getMobilePermissionSettingsGuide(platform: DevicePlatform): {
+  title: string;
+  subtitle: string;
+  steps: string[];
+} {
+  if (platform === "android") {
+    return {
+      title: "Android Mobile & Chrome Settings",
+      subtitle: "Turn permissions on whenever you need microphone, camera, or notifications.",
+      steps: [
+        "Open Chrome or your mobile browser menu (⋮) → Settings → Site settings (or tap the lock/tune icon beside the address bar).",
+        "Select Permissions → Microphone, Camera, and Notifications, then switch each one to Allow.",
+        "If blocked at the system level, open Android Settings → Apps → your browser (or Reading Corner) → Permissions and set Microphone, Camera, and Notifications to Allow.",
+      ],
+    };
+  }
+  if (platform === "ios") {
+    return {
+      title: "iPhone & iPad Settings",
+      subtitle: "Allow Reading Corner to access microphone, camera, and alerts on iOS.",
+      steps: [
+        "Open iPhone Settings → Apps → Safari (or your installed browser) to verify Camera & Microphone access is set to Ask or Allow.",
+        "Inside Safari, tap the page menu (AA / puzzle icon in the address bar) → Website Settings and set Camera and Microphone to Allow.",
+        "For call/message notifications on iPhone, add Reading Corner to your Home Screen (Share → Add to Home Screen) and allow Notifications in iPhone Settings → Notifications.",
+      ],
+    };
+  }
+  return {
+    title: "Browser Site Settings",
+    subtitle: "Manage microphone, camera, and notification permissions for Reading Corner.",
+    steps: [
+      "Click the site-info / tune icon on the left side of your browser address bar.",
+      "Toggle Microphone, Camera, and Notifications to Allow whenever you need them.",
+      "If a permission stays Blocked, open your browser Settings → Privacy & security → Site settings and clear the block for this site, then tap Re-check Permissions below.",
+    ],
+  };
+}
+
 export function countGrantedPermissions(snapshot: PermissionSnapshot): number {
   return APP_PERMISSION_ITEMS.reduce(
     (count, item) => count + (snapshot[item.kind] === "granted" ? 1 : 0),

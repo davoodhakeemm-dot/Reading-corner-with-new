@@ -288,8 +288,9 @@ export function InstagramShell({
         <div
           className={cn(
             "shrink-0",
-            !(tab === "chat" && threadOpenOnMobile) &&
-              "mb-[calc(4rem+max(0.5rem,env(safe-area-inset-bottom)))] md:mb-0",
+            tab === "chat" && threadOpenOnMobile
+              ? "hidden md:block"
+              : "mb-[calc(4rem+max(0.5rem,env(safe-area-inset-bottom)))] md:mb-0",
           )}
         >
           <ReadingActions
