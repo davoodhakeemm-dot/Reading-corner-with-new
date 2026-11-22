@@ -684,7 +684,7 @@ export function createApiRouter() {
         created = true;
         const rawName = String(
           body.fullName ||
-            decoded.name ||
+            decoded["name"] ||
             (decodedEmail ? decodedEmail.split("@")[0] : "") ||
             "Reader",
         )

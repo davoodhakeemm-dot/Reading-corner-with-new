@@ -6,9 +6,28 @@ import express from "express";
 import { createApiRouter } from "./api";
 import { attachWebSocketServer } from "./ws";
 
-const PORT = Number.parseInt(process.env["PORT"] ?? "3000", 10) || 3000;
-const HOST = process.env["HOST"] || "0.0.0.0";
+function readCliArg(flag: string): string | undefined {
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (!arg) continue;
+    if (arg === flag && args[i + 1]) return args[i + 1];
+    if (arg.startsWith(`${flag}=`)) return arg.slice(flag.length + 1);
+  }
+  return undefined;
+}
+
 const IS_PROD = process.env["NODE_ENV"] === "production";
+const cliPort = readCliArg("--port") ?? readCliArg("-p");
+const envPort = process.env["PORT"];
+const nginxPort = process.env["NGINX_PORT"];
+const defaultAppPort = process.env["DEFAULT_APP_PORT"] ?? "3000";
+const resolvedPortRaw =
+  cliPort ??
+  (!IS_PROD && envPort && nginxPort && envPort === nginxPort ? defaultAppPort : envPort) ??
+  defaultAppPort;
+const PORT = Number.parseInt(resolvedPortRaw, 10) || 3000;
+const HOST = readCliArg("--host") || process.env["HOST"] || "0.0.0.0";
 
 async function startServer() {
   const app = express();
@@ -27,6 +46,7 @@ async function startServer() {
       server: {
         middlewareMode: true,
         hmr: false,
+        watch: null,
       },
       appType: "custom",
     });

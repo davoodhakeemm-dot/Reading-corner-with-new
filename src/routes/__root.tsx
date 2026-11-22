@@ -10,7 +10,9 @@ import {
 import { useEffect, type ReactNode } from "react";
 import { Toaster } from "sonner";
 
+import { GlobalCallAndAlertLayer } from "../components/GlobalCallAndAlertLayer";
 import { InstallProvider } from "../components/InstallApp";
+import { StartupPermissionsPrompt } from "../components/StartupPermissionsPrompt";
 import appCss from "../styles.css?url";
 import { LibraryProvider } from "../lib/library-store";
 import { SecretGesture } from "../components/SecretGesture";
@@ -153,6 +155,8 @@ function RootComponent() {
     <QueryClientProvider client={queryClient}>
       <LibraryProvider>
         <SecretGesture />
+        <StartupPermissionsPrompt />
+        <GlobalCallAndAlertLayer />
         <Toaster position="top-center" richColors />
         {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
         <InstallProvider>

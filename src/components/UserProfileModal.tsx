@@ -1,4 +1,5 @@
 import {
+  ArrowLeft,
   Ban,
   Check,
   Flag,
@@ -39,26 +40,28 @@ const REPORT_REASONS = [
 export function UserProfileModal({
   user: initialUser,
   theme,
+  initialReportOpen = false,
   onClose,
   onStartMessage,
   onUserUpdated,
 }: {
   user: PublicAccount | null;
   theme: SecretThemeTokens;
+  initialReportOpen?: boolean;
   onClose: () => void;
   onStartMessage: (userId: string) => void;
   onUserUpdated?: (user: PublicAccount) => void;
 }) {
   const [profile, setProfile] = useState<PublicAccount | null>(initialUser);
   const [followBusy, setFollowBusy] = useState(false);
-  const [reportOpen, setReportOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(initialReportOpen);
   const [reason, setReason] = useState(REPORT_REASONS[0] ?? "Spam or unwanted messages");
   const [details, setDetails] = useState("");
   const [reportBusy, setReportBusy] = useState(false);
 
   useEffect(() => {
     setProfile(initialUser);
-    setReportOpen(false);
+    setReportOpen(initialReportOpen);
     setDetails("");
     if (!initialUser) return;
     let active = true;
@@ -72,7 +75,19 @@ export function UserProfileModal({
     return () => {
       active = false;
     };
-  }, [initialUser]);
+  }, [initialUser, initialReportOpen]);
+
+  useEffect(() => {
+    if (!initialUser) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [initialUser, onClose]);
 
   if (!profile) return null;
 
@@ -159,22 +174,36 @@ export function UserProfileModal({
           aria-modal="true"
           aria-label={`${profile.fullName} profile`}
           className={cn(
-            "relative w-full max-w-md overflow-hidden rounded-[32px] border p-6 backdrop-blur-2xl",
+            "relative max-h-[90dvh] w-full max-w-md overflow-y-auto rounded-[32px] border p-6 backdrop-blur-2xl",
             theme.surfaceGlass,
             theme.border,
           )}
         >
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close profile"
-            className={cn(
-              "absolute right-4 top-4 grid size-9 place-items-center rounded-full transition hover:scale-105",
-              theme.surfaceMuted,
-            )}
-          >
-            <X className="size-4" />
-          </button>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Back to chat"
+              className={cn(
+                "inline-flex min-h-[36px] items-center gap-1.5 rounded-full px-3 text-xs font-bold transition hover:opacity-85",
+                theme.surfaceMuted,
+              )}
+            >
+              <ArrowLeft className="size-4" />
+              <span>Back</span>
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close profile"
+              className={cn(
+                "grid size-9 place-items-center rounded-full transition hover:scale-105",
+                theme.surfaceMuted,
+              )}
+            >
+              <X className="size-4" />
+            </button>
+          </div>
 
           <div className="flex flex-col items-center text-center">
             <div className="relative">

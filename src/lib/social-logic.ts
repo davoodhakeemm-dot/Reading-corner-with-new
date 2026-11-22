@@ -150,3 +150,38 @@ export function isFirebaseOfflineError(error: unknown): boolean {
     lower.includes("could not reach cloud firestore backend")
   );
 }
+
+export type ChatEscapeAction =
+  | "closeLightbox"
+  | "closeProfileModal"
+  | "closeGalleryPicker"
+  | "closeMenu"
+  | "closeReactionPicker"
+  | "closeEmoji"
+  | "closeThreadSearch"
+  | "cancelReplyOrEdit"
+  | "closeThread"
+  | null;
+
+export function resolveChatEscapeAction(input: {
+  lightboxOpen: boolean;
+  profileModalOpen: boolean;
+  galleryPickerOpen: boolean;
+  menuOpen: boolean;
+  reactionPickerOpen: boolean;
+  emojiOpen: boolean;
+  threadSearchOpen: boolean;
+  replyOrEditOpen: boolean;
+  hasActivePeer: boolean;
+}): ChatEscapeAction {
+  if (input.lightboxOpen) return "closeLightbox";
+  if (input.profileModalOpen) return "closeProfileModal";
+  if (input.galleryPickerOpen) return "closeGalleryPicker";
+  if (input.menuOpen) return "closeMenu";
+  if (input.reactionPickerOpen) return "closeReactionPicker";
+  if (input.emojiOpen) return "closeEmoji";
+  if (input.threadSearchOpen) return "closeThreadSearch";
+  if (input.replyOrEditOpen) return "cancelReplyOrEdit";
+  if (input.hasActivePeer) return "closeThread";
+  return null;
+}

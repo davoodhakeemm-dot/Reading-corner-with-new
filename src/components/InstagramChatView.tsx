@@ -75,7 +75,11 @@ import {
   type PublicAccount,
 } from "@/lib/chat-store";
 import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
-import { filterConversationsByTab, splitChatSidebarUsers } from "@/lib/social-logic";
+import {
+  filterConversationsByTab,
+  resolveChatEscapeAction,
+  splitChatSidebarUsers,
+} from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
 import { playWaterSound } from "@/lib/water-sound";
 
@@ -148,7 +152,7 @@ export function MediaLightbox({
 }: {
   media: { id?: string; url: string; kind: "image" | "video"; name: string } | null;
   canDelete?: boolean;
-  onDelete?: () => Promise<void> | void;
+  onDelete?: (() => Promise<void> | void) | undefined;
   onClose: () => void;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -159,6 +163,18 @@ export function MediaLightbox({
     setDeleting(false);
   }, [media?.url]);
 
+  useEffect(() => {
+    if (!media) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [media, onClose]);
+
   if (!media) return null;
 
   return (
@@ -167,9 +183,13 @@ export function MediaLightbox({
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
+        onClick={onClose}
         className="fixed inset-0 z-50 flex flex-col bg-black/95 text-white backdrop-blur-md"
       >
-        <div className="flex items-center justify-between gap-3 px-4 py-3">
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="flex items-center justify-between gap-3 px-4 py-3"
+        >
           <p className="truncate text-sm font-semibold">{media.name}</p>
           <div className="flex items-center gap-2">
             {canDelete &&
@@ -232,7 +252,10 @@ export function MediaLightbox({
             </button>
           </div>
         </div>
-        <div className="flex flex-1 items-center justify-center overflow-hidden p-4">
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="flex flex-1 items-center justify-center overflow-hidden p-4"
+        >
           {media.kind === "image" ? (
             <ProtectedImage
               src={media.url}
@@ -298,6 +321,7 @@ export function InstagramChatView({
   const [threadSearchResults, setThreadSearchResults] = useState<ChatMessage[] | null>(null);
 
   const [profileModalUser, setProfileModalUser] = useState<PublicAccount | null>(null);
+  const [profileModalReportOpen, setProfileModalReportOpen] = useState(false);
 
   const [uploading, setUploading] = useState(false);
   const [sending, setSending] = useState(false);
@@ -318,6 +342,7 @@ export function InstagramChatView({
   const cameraRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const draftInputRef = useRef<HTMLTextAreaElement>(null);
+  const menuContainerRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
@@ -334,7 +359,95 @@ export function InstagramChatView({
     setThreadSearchQuery("");
     setThreadSearchResults(null);
     setMenuOpen(false);
+    setEmojiOpen(false);
   }, [activePeerId]);
+
+  useEffect(() => {
+    if (!menuOpen && !reactionPickerForId) return;
+    const handlePointerDown = (e: PointerEvent) => {
+      const target = e.target;
+      if (!(target instanceof Node)) return;
+      if (menuOpen && menuContainerRef.current && !menuContainerRef.current.contains(target)) {
+        setMenuOpen(false);
+      }
+      if (
+        reactionPickerForId &&
+        !(target instanceof Element && target.closest("[data-reaction-picker]"))
+      ) {
+        setReactionPickerForId(null);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [menuOpen, reactionPickerForId]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const action = resolveChatEscapeAction({
+        lightboxOpen: Boolean(lightbox),
+        profileModalOpen: Boolean(profileModalUser),
+        galleryPickerOpen,
+        menuOpen,
+        reactionPickerOpen: Boolean(reactionPickerForId),
+        emojiOpen,
+        threadSearchOpen,
+        replyOrEditOpen: Boolean(replyingTo || editingMsg),
+        hasActivePeer: Boolean(activePeerId),
+      });
+      if (!action) return;
+      e.preventDefault();
+      switch (action) {
+        case "closeLightbox":
+          setLightbox(null);
+          break;
+        case "closeProfileModal":
+          setProfileModalUser(null);
+          setProfileModalReportOpen(false);
+          break;
+        case "closeGalleryPicker":
+          setGalleryPickerOpen(false);
+          break;
+        case "closeMenu":
+          setMenuOpen(false);
+          break;
+        case "closeReactionPicker":
+          setReactionPickerForId(null);
+          break;
+        case "closeEmoji":
+          setEmojiOpen(false);
+          break;
+        case "closeThreadSearch":
+          setThreadSearchOpen(false);
+          setThreadSearchQuery("");
+          setThreadSearchResults(null);
+          break;
+        case "cancelReplyOrEdit":
+          setReplyingTo(null);
+          if (editingMsg) {
+            setEditingMsg(null);
+            setDraft("");
+          }
+          break;
+        case "closeThread":
+          void openThread(null);
+          break;
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [
+    lightbox,
+    profileModalUser,
+    galleryPickerOpen,
+    menuOpen,
+    reactionPickerForId,
+    emojiOpen,
+    threadSearchOpen,
+    replyingTo,
+    editingMsg,
+    activePeerId,
+  ]);
 
   useEffect(() => {
     if (!recording) {
@@ -1154,7 +1267,8 @@ export function InstagramChatView({
               animate={{ y: 0, opacity: 1 }}
               transition={{ duration: 0.22 }}
               className={cn(
-                "relative z-20 mx-2.5 mt-2.5 flex shrink-0 items-center gap-2 rounded-full border px-2.5 py-2 md:mx-4 md:mt-3",
+                "relative mx-2.5 mt-2.5 flex shrink-0 items-center gap-2 rounded-full border px-2.5 py-2 md:mx-4 md:mt-3",
+                menuOpen ? "z-40" : "z-20",
                 theme.glassPill,
               )}
             >
@@ -1172,7 +1286,10 @@ export function InstagramChatView({
 
               <button
                 type="button"
-                onClick={() => setProfileModalUser(activePeer)}
+                onClick={() => {
+                  setProfileModalReportOpen(false);
+                  setProfileModalUser(activePeer);
+                }}
                 className="flex min-w-0 flex-1 items-center gap-2.5 text-left transition hover:opacity-85"
               >
                 <UserAvatar user={activePeer} theme={theme} size="sm" />
@@ -1249,105 +1366,166 @@ export function InstagramChatView({
 
               <GoToReadingButton size="sm" className="hidden md:inline-flex" />
 
-              <div className="relative">
+              <div ref={menuContainerRef} className="relative">
                 <button
                   type="button"
                   onClick={() => setMenuOpen((o) => !o)}
                   aria-label="Conversation options"
-                  className={cn("grid size-9 place-items-center rounded-full", theme.surfaceMuted)}
+                  aria-expanded={menuOpen}
+                  aria-haspopup="menu"
+                  title="Conversation options"
+                  className={cn(
+                    "grid size-9 place-items-center rounded-full transition",
+                    menuOpen ? theme.accentBg : theme.surfaceMuted,
+                  )}
                 >
                   <MoreVertical className="size-4" />
                 </button>
-                {menuOpen && (
-                  <div
-                    className={cn(
-                      "absolute right-0 top-11 z-30 w-52 rounded-2xl border p-1.5 shadow-xl backdrop-blur-2xl",
-                      theme.surfaceGlass,
-                      theme.border,
-                    )}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setMenuOpen(false);
-                        setProfileModalUser(activePeer);
-                      }}
-                      className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
-                    >
-                      <UserIcon className="size-4" /> View profile
-                    </button>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        setMenuOpen(false);
-                        const link = await fetchNfcLink().catch(() => null);
-                        if (!link?.path || link.revoked) {
-                          toast.error("Personal link unavailable or revoked.");
-                          return;
-                        }
-                        try {
-                          await navigator.clipboard.writeText(
-                            `${window.location.origin}${link.path}`,
-                          );
-                          toast.success("Personal link copied");
-                        } catch {
-                          toast.error("Open Profile → NFC Card to copy your link.");
-                        }
-                      }}
-                      className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
-                    >
-                      <Sparkles className="size-4" /> Copy personal link
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleTogglePin()}
-                      className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
-                    >
-                      {activeConv?.pinned ? (
-                        <>
-                          <PinOff className="size-4" /> Unpin conversation
-                        </>
-                      ) : (
-                        <>
-                          <Pin className="size-4" /> Pin conversation
-                        </>
+                <AnimatePresence>
+                  {menuOpen && (
+                    <motion.div
+                      initial={{ opacity: 0, scale: 0.94, y: -6 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.94, y: -6 }}
+                      transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+                      role="menu"
+                      aria-label="Conversation options"
+                      className={cn(
+                        "absolute right-0 top-11 z-50 max-h-[calc(100dvh-5rem)] w-56 overflow-y-auto rounded-2xl border p-1.5 shadow-2xl backdrop-blur-2xl",
+                        theme.surfaceGlass,
+                        theme.border,
                       )}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleToggleMute()}
-                      className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
                     >
-                      {activeConv?.muted ? (
-                        <>
-                          <Bell className="size-4" /> Unmute notifications
-                        </>
-                      ) : (
-                        <>
-                          <BellOff className="size-4" /> Mute notifications
-                        </>
-                      )}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setMenuOpen(false);
-                        setProfileModalUser(activePeer);
-                      }}
-                      className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold text-amber-500 transition hover:bg-amber-500/10"
-                    >
-                      <Flag className="size-4" /> Report user
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleBlockToggle()}
-                      className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold text-rose-500 transition hover:bg-rose-500/10"
-                    >
-                      <Ban className="size-4" />
-                      {activeConv?.blockedByMe ? "Unblock user" : "Block user"}
-                    </button>
-                  </div>
-                )}
+                      <div
+                        className={cn(
+                          "mb-1 flex items-center justify-between border-b px-2.5 pb-1.5 pt-1",
+                          theme.border,
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            "text-[11px] font-bold uppercase tracking-wider",
+                            theme.mutedText,
+                          )}
+                        >
+                          Options
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setMenuOpen(false)}
+                          aria-label="Close options menu"
+                          className={cn(
+                            "grid size-7 place-items-center rounded-full transition hover:opacity-80",
+                            theme.surfaceMuted,
+                          )}
+                        >
+                          <X className="size-3.5" />
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          setProfileModalReportOpen(false);
+                          setProfileModalUser(activePeer);
+                        }}
+                        className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
+                      >
+                        <UserIcon className="size-4" /> View profile
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={async () => {
+                          setMenuOpen(false);
+                          const link = await fetchNfcLink().catch(() => null);
+                          if (!link?.path || link.revoked) {
+                            toast.error("Personal link unavailable or revoked.");
+                            return;
+                          }
+                          try {
+                            await navigator.clipboard.writeText(
+                              `${window.location.origin}${link.path}`,
+                            );
+                            toast.success("Personal link copied");
+                          } catch {
+                            toast.error("Open Profile → NFC Card to copy your link.");
+                          }
+                        }}
+                        className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
+                      >
+                        <Sparkles className="size-4" /> Copy personal link
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void handleTogglePin()}
+                        className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
+                      >
+                        {activeConv?.pinned ? (
+                          <>
+                            <PinOff className="size-4" /> Unpin conversation
+                          </>
+                        ) : (
+                          <>
+                            <Pin className="size-4" /> Pin conversation
+                          </>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void handleToggleMute()}
+                        className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
+                      >
+                        {activeConv?.muted ? (
+                          <>
+                            <Bell className="size-4" /> Unmute notifications
+                          </>
+                        ) : (
+                          <>
+                            <BellOff className="size-4" /> Mute notifications
+                          </>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          setProfileModalReportOpen(true);
+                          setProfileModalUser(activePeer);
+                        }}
+                        className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold text-amber-500 transition hover:bg-amber-500/10"
+                      >
+                        <Flag className="size-4" /> Report user
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void handleBlockToggle()}
+                        className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold text-rose-500 transition hover:bg-rose-500/10"
+                      >
+                        <Ban className="size-4" />
+                        {activeConv?.blockedByMe ? "Unblock user" : "Block user"}
+                      </button>
+                      <div className={cn("mt-1 border-t pt-1", theme.border)}>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            setMenuOpen(false);
+                            void openThread(null);
+                          }}
+                          className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
+                        >
+                          <ArrowLeft className="size-4" /> Back to chats
+                        </button>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
             </motion.header>
 
@@ -1463,6 +1641,7 @@ export function InstagramChatView({
                             <div className="flex shrink-0 items-center gap-0.5 opacity-75 transition md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
                               <button
                                 type="button"
+                                data-reaction-picker
                                 onClick={() => setReactionPickerForId(pickerOpen ? null : m.id)}
                                 aria-label="React to message"
                                 className={cn(
@@ -1673,6 +1852,7 @@ export function InstagramChatView({
                             <div className="flex shrink-0 items-center gap-0.5 opacity-75 transition md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
                               <button
                                 type="button"
+                                data-reaction-picker
                                 onClick={() => setReactionPickerForId(pickerOpen ? null : m.id)}
                                 aria-label="React to message"
                                 className={cn(
@@ -1704,6 +1884,7 @@ export function InstagramChatView({
                         {/* Quick emoji reaction popover */}
                         {pickerOpen && !isDeleted && (
                           <div
+                            data-reaction-picker
                             className={cn(
                               "flex",
                               mine ? "justify-end pr-2" : "justify-start pl-11",
@@ -2121,7 +2302,7 @@ export function InstagramChatView({
               exit={{ scale: 0.94, opacity: 0 }}
               onClick={(e) => e.stopPropagation()}
               className={cn(
-                "w-full max-w-md overflow-hidden rounded-[28px] border p-5 backdrop-blur-2xl",
+                "max-h-[90dvh] w-full max-w-md overflow-y-auto rounded-[28px] border p-5 backdrop-blur-2xl",
                 theme.surfaceGlass,
                 theme.border,
               )}
@@ -2189,7 +2370,11 @@ export function InstagramChatView({
       <UserProfileModal
         user={profileModalUser}
         theme={theme}
-        onClose={() => setProfileModalUser(null)}
+        initialReportOpen={profileModalReportOpen}
+        onClose={() => {
+          setProfileModalUser(null);
+          setProfileModalReportOpen(false);
+        }}
         onStartMessage={(userId) => void openThread(userId)}
       />
 

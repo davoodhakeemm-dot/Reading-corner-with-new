@@ -1,5 +1,5 @@
 import { motion, type HTMLMotionProps } from "motion/react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 import { computeWaterRippleGeometry, playWaterSound, type WaterSoundKind } from "@/lib/water-sound";
@@ -22,7 +22,8 @@ type RippleInstance = {
   diameter: number;
 };
 
-export interface WaterGlowButtonProps extends Omit<HTMLMotionProps<"button">, "ref"> {
+export interface WaterGlowButtonProps extends Omit<HTMLMotionProps<"button">, "ref" | "children"> {
+  children?: ReactNode;
   variant?: WaterGlowVariant;
   size?: WaterGlowSize;
   sound?: WaterSoundKind | "none";
@@ -135,8 +136,9 @@ export function WaterGlowButton({
       disabled={disabled}
       onPointerDown={handlePointerDown}
       onClick={handleClick}
-      whileHover={disabled ? undefined : { y: -2, scale: 1.025 }}
-      whileTap={disabled ? undefined : { y: 1.5, scale: 0.93 }}
+      {...(!disabled
+        ? { whileHover: { y: -2, scale: 1.025 }, whileTap: { y: 1.5, scale: 0.93 } }
+        : {})}
       transition={{ type: "spring", stiffness: 460, damping: 14, mass: 0.78 }}
       className={cn(
         "group relative inline-flex cursor-pointer select-none items-center justify-center gap-2 overflow-hidden tracking-tight transition-[box-shadow,filter,background-color] duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-55",

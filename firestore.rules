@@ -26,6 +26,11 @@ service cloud.firestore {
       return threadKey is string && threadKey.size() >= 4 && threadKey.size() <= 260 && threadKey.matches('^[a-zA-Z0-9_\\-]+__[a-zA-Z0-9_\\-]+$');
     }
 
+    function isCompositeParticipant(compositeId) {
+      return compositeId.split('__').size() == 2 &&
+        (compositeId.split('__')[0] == request.auth.uid || compositeId.split('__')[1] == request.auth.uid);
+    }
+
     function getConversation(threadKey) {
       return get(/databases/$(database)/documents/conversations/$(threadKey)).data;
     }
@@ -313,15 +318,20 @@ service cloud.firestore {
         return !exists(/databases/$(database)/documents/blocks/$(a + '__' + b)) &&
           !exists(/databases/$(database)/documents/blocks/$(b + '__' + a));
       }
-      function participant() {
-        return isSignedIn() && (existing().caller == request.auth.uid || existing().callee == request.auth.uid);
-      }
-      allow read, delete: if participant();
-      allow create: if isSignedIn() && incoming().keys().hasOnly(['caller','callee','kind','offer','createdAt']) &&
+      allow get: if isSignedIn() && isValidId(callId) && resource != null &&
+        (existing().caller == request.auth.uid || existing().callee == request.auth.uid);
+      allow list: if isSignedIn() &&
+        (resource.data.caller == request.auth.uid || resource.data.callee == request.auth.uid);
+      allow delete: if isSignedIn() && isValidId(callId) && resource != null &&
+        (existing().caller == request.auth.uid || existing().callee == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(callId) &&
+        incoming().keys().hasAll(['caller', 'callee', 'kind', 'offer', 'createdAt']) &&
+        incoming().keys().hasOnly(['caller', 'callee', 'kind', 'offer', 'createdAt']) &&
         incoming().caller == request.auth.uid && isValidId(incoming().callee) && incoming().callee != request.auth.uid &&
         exists(/databases/$(database)/documents/users_public/$(incoming().callee)) && unblocked(request.auth.uid, incoming().callee) &&
-        incoming().kind in ['audio','video'] && incoming().offer is string && incoming().offer.size() <= 100000 && incoming().createdAt == request.time;
-      allow update: if isSignedIn() && existing().callee == request.auth.uid && !('answer' in existing()) &&
+        incoming().kind in ['audio', 'video'] && incoming().offer is string && incoming().offer.size() <= 100000 && incoming().createdAt == request.time;
+      allow update: if isSignedIn() && isValidId(callId) && resource != null &&
+        existing().callee == request.auth.uid && !('answer' in existing()) &&
         request.time < existing().createdAt + duration.value(60, 's') && unblocked(existing().caller, existing().callee) &&
         incoming().diff(existing()).affectedKeys().hasOnly(['answer']) && incoming().answer is string && incoming().answer.size() <= 100000;
     }
@@ -407,8 +417,10 @@ service cloud.firestore {
     }
 
     match /follows/{followId} {
-      allow get: if isSignedIn() && isValidId(followId) &&
-        (existing().followerId == request.auth.uid || existing().followingId == request.auth.uid);
+      allow get: if isSignedIn() && isValidId(followId) && (
+        (resource == null && isCompositeParticipant(followId)) ||
+        (resource != null && (existing().followerId == request.auth.uid || existing().followingId == request.auth.uid))
+      );
       allow list: if isSignedIn() &&
         (resource.data.followerId == request.auth.uid || resource.data.followingId == request.auth.uid);
       allow create: if isSignedIn() && isValidId(followId) &&
@@ -417,12 +429,14 @@ service cloud.firestore {
         incoming().createdAt == request.time &&
         exists(/databases/$(database)/documents/users_public/$(incoming().followingId)) &&
         !exists(/databases/$(database)/documents/blocks/$(incoming().followingId + '__' + request.auth.uid));
-      allow delete: if isSignedIn() && isValidId(followId) && existing().followerId == request.auth.uid;
+      allow delete: if isSignedIn() && isValidId(followId) && resource != null && existing().followerId == request.auth.uid;
     }
 
     match /conversations/{threadKey} {
-      allow get: if isSignedIn() && isValidThreadKey(threadKey) &&
-        (existing().participantA == request.auth.uid || existing().participantB == request.auth.uid);
+      allow get: if isSignedIn() && isValidThreadKey(threadKey) && (
+        (resource == null && isCompositeParticipant(threadKey)) ||
+        (resource != null && (existing().participantA == request.auth.uid || existing().participantB == request.auth.uid))
+      );
       allow list: if isSignedIn() &&
         (resource.data.participantA == request.auth.uid || resource.data.participantB == request.auth.uid);
       allow create: if isSignedIn() && isValidThreadKey(threadKey) &&
@@ -506,15 +520,17 @@ service cloud.firestore {
     }
 
     match /blocks/{blockId} {
-      allow get: if isSignedIn() && isValidId(blockId) &&
-        (existing().blockerId == request.auth.uid || existing().blockedId == request.auth.uid);
+      allow get: if isSignedIn() && isValidId(blockId) && (
+        (resource == null && isCompositeParticipant(blockId)) ||
+        (resource != null && (existing().blockerId == request.auth.uid || existing().blockedId == request.auth.uid))
+      );
       allow list: if isSignedIn() &&
         (resource.data.blockerId == request.auth.uid || resource.data.blockedId == request.auth.uid);
       allow create: if isSignedIn() && isValidId(blockId) &&
         isValidBlock(incoming(), blockId) &&
         incoming().blockerId == request.auth.uid &&
         incoming().createdAt == request.time;
-      allow delete: if isSignedIn() && isValidId(blockId) && existing().blockerId == request.auth.uid;
+      allow delete: if isSignedIn() && isValidId(blockId) && resource != null && existing().blockerId == request.auth.uid;
     }
 
     match /reports/{reportId} {

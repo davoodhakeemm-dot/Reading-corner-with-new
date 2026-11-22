@@ -154,6 +154,20 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["reporterId", "reportedUserId", "reason", "details", "createdAt"]
+    },
+    "CallSignaling": {
+      "title": "CallSignaling",
+      "description": "WebRTC audio/video call offer and answer signaling document between caller and callee.",
+      "type": "object",
+      "properties": {
+        "caller": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "callee": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "kind": { "type": "string", "enum": ["audio", "video"] },
+        "offer": { "type": "string", "maxLength": 100000 },
+        "answer": { "type": "string", "maxLength": 100000 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["caller", "callee", "kind", "offer", "createdAt"]
     }
   },
   "firestore": {
@@ -192,6 +206,10 @@
     "/reports/{reportId}": {
       "schema": { "$ref": "#/entities/UserReport" },
       "description": "Safety reports filed against abusive accounts."
+    },
+    "/calls/{callId}": {
+      "schema": { "$ref": "#/entities/CallSignaling" },
+      "description": "Ephemeral WebRTC audio/video call signaling records between two readers."
     }
   }
 }

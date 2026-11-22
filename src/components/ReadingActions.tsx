@@ -9,9 +9,9 @@ export function ReadingActions({
   inShell = false,
   themeId,
 }: {
-  themeId?: SecretThemeId;
-  personalPath?: string | null;
-  inShell?: boolean;
+  themeId?: SecretThemeId | undefined;
+  personalPath?: string | null | undefined;
+  inShell?: boolean | undefined;
 }) {
   async function copyLink() {
     if (!personalPath) return;

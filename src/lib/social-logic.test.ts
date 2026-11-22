@@ -177,3 +177,37 @@ test("isDynamicImportError and isFirebaseOfflineError classify transient network
   );
   assert.equal(isFirebaseOfflineError(new Error("Missing or insufficient permissions.")), false);
 });
+
+test("resolveChatEscapeAction prioritizes topmost overlay before backing out of thread", async () => {
+  const { resolveChatEscapeAction } = await import("./social-logic");
+  const base = {
+    lightboxOpen: false,
+    profileModalOpen: false,
+    galleryPickerOpen: false,
+    menuOpen: false,
+    reactionPickerOpen: false,
+    emojiOpen: false,
+    threadSearchOpen: false,
+    replyOrEditOpen: false,
+    hasActivePeer: true,
+  };
+
+  assert.equal(
+    resolveChatEscapeAction({ ...base, lightboxOpen: true, menuOpen: true }),
+    "closeLightbox",
+  );
+  assert.equal(
+    resolveChatEscapeAction({ ...base, profileModalOpen: true, menuOpen: true }),
+    "closeProfileModal",
+  );
+  assert.equal(resolveChatEscapeAction({ ...base, menuOpen: true }), "closeMenu");
+  assert.equal(
+    resolveChatEscapeAction({ ...base, reactionPickerOpen: true }),
+    "closeReactionPicker",
+  );
+  assert.equal(resolveChatEscapeAction({ ...base, emojiOpen: true }), "closeEmoji");
+  assert.equal(resolveChatEscapeAction({ ...base, threadSearchOpen: true }), "closeThreadSearch");
+  assert.equal(resolveChatEscapeAction({ ...base, replyOrEditOpen: true }), "cancelReplyOrEdit");
+  assert.equal(resolveChatEscapeAction(base), "closeThread");
+  assert.equal(resolveChatEscapeAction({ ...base, hasActivePeer: false }), null);
+});

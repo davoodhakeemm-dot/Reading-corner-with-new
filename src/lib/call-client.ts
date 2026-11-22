@@ -106,7 +106,13 @@ export function createCallClient(
     query(calls, where("callee", "==", uid)),
     (snapshot) => {
       for (const change of snapshot.docChanges()) {
-        const data = change.doc.data() as { caller: string; kind: Kind; offer: string; answer?: string; createdAt: { toMillis(): number } | null };
+        const data = change.doc.data() as {
+          caller: string;
+          kind: Kind;
+          offer: string;
+          answer?: string;
+          createdAt: { toMillis(): number } | null;
+        };
         if (change.type === "removed" || data.answer) {
           if (
             current?.ref.id === change.doc.id &&
@@ -185,7 +191,7 @@ export function createCallClient(
               finish(s, false, "Call ended.");
               return;
             }
-            const answer = snap.get('answer');
+            const answer = snap.get("answer");
             if (answer && s.status === "ringing") {
               s.status = "connecting";
               display(s);

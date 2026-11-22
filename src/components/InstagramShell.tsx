@@ -1,5 +1,5 @@
 import { useNavigate } from "@tanstack/react-router";
-import { Compass, MessageCircle, Phone, PhoneOff, User, Video } from "lucide-react";
+import { Compass, MessageCircle, User } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useMemo, useState } from "react";
 
@@ -9,8 +9,7 @@ import { InstagramProfileView, type ProfileSection } from "@/components/Instagra
 import { ReadingActions } from "@/components/ReadingActions";
 import { Logo } from "@/components/Logo";
 import { TripleTapExit } from "@/components/TripleTapExit";
-import { CallMedia } from './CallMedia';
-import { initialsOf, openThread, respondToCall, useChat } from "@/lib/chat-store";
+import { initialsOf, openThread, useChat } from "@/lib/chat-store";
 import { getSecretTheme } from "@/lib/secret-themes";
 import { cn } from "@/lib/utils";
 import { playWaterSound } from "@/lib/water-sound";
@@ -25,7 +24,7 @@ export function InstagramShell({
   initialProfileSection?: ProfileSection;
 }) {
   const navigate = useNavigate();
-  const { ready, me, nfc, conversations, incomingCall, outgoingCall, soundEnabled } = useChat();
+  const { ready, me, nfc, conversations, soundEnabled } = useChat();
   const [tab, setTab] = useState<ShellTab>(initialTab);
   const [threadOpenOnMobile, setThreadOpenOnMobile] = useState(false);
 
@@ -293,7 +292,11 @@ export function InstagramShell({
               "mb-[calc(4rem+max(0.5rem,env(safe-area-inset-bottom)))] md:mb-0",
           )}
         >
-          <ReadingActions themeId={theme.id} inShell personalPath={nfc?.revoked ? null : nfc?.path} />
+          <ReadingActions
+            themeId={theme.id}
+            inShell
+            personalPath={nfc?.revoked ? null : nfc?.path}
+          />
         </div>
       </main>
 
@@ -380,106 +383,6 @@ export function InstagramShell({
           </div>
         </motion.nav>
       )}
-
-      {/* Real-time Incoming / Outgoing Frosted Glass Call Modal */}
-      <AnimatePresence>
-        {(incomingCall || outgoingCall) && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur-lg"
-          >
-            <motion.div
-              initial={{ scale: 0.92, opacity: 0, y: 12 }}
-              animate={{ scale: 1, opacity: 1, y: 0 }}
-              exit={{ scale: 0.92, opacity: 0, y: 12 }}
-              className={cn(
-                "glass-sheen w-full max-w-xs rounded-[32px] border p-6 text-center backdrop-blur-2xl",
-                theme.surfaceGlass,
-                theme.border,
-              )}
-            >
-              {incomingCall ? (
-                <>
-                  <div
-                    className={cn(
-                      "mx-auto grid size-16 place-items-center rounded-full text-xl font-bold",
-                      theme.accentBg,
-                    )}
-                  >
-                    {incomingCall.callType === "video" ? (
-                      <Video className="size-7" />
-                    ) : (
-                      <Phone className="size-7" />
-                    )}
-                  </div>
-                  <p className="mt-4 font-display text-lg font-extrabold">
-                    {incomingCall.from.fullName}
-                  </p>
-                  <p className={cn("mt-1 text-xs", theme.mutedText)}>
-                    Incoming {incomingCall.callType} call…
-                  </p>
-                  <div className="mt-6 flex justify-center gap-4">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        respondToCall(incomingCall.callId, incomingCall.from.id, "declined")
-                      }
-                      className="grid size-14 place-items-center rounded-full bg-rose-600 text-white shadow-lg transition hover:scale-105"
-                      aria-label="Decline call"
-                    >
-                      <PhoneOff className="size-6" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        respondToCall(incomingCall.callId, incomingCall.from.id, "accepted")
-                      }
-                      className="grid size-14 place-items-center rounded-full bg-emerald-600 text-white shadow-lg transition hover:scale-105"
-                      aria-label="Accept call"
-                    >
-                      <Phone className="size-6" />
-                    </button>
-                  </div>
-                </>
-              ) : outgoingCall ? (
-                <>
-                  <div
-                    className={cn(
-                      "mx-auto grid size-16 place-items-center rounded-full text-xl font-bold",
-                      theme.accentBg,
-                    )}
-                  >
-                    {outgoingCall.callType === "video" ? (
-                      <Video className="size-7" />
-                    ) : (
-                      <Phone className="size-7" />
-                    )}
-                  </div>
-                  <p className="mt-4 font-display text-lg font-extrabold">
-                    {outgoingCall.target.fullName}
-                  </p>
-                  <p className={cn("mt-1 text-xs", theme.mutedText)}>
-                    {{ accepted: 'Connected', preparing: 'Preparing your device…', connecting: 'Connecting…', ringing: 'Ringing…' }[outgoingCall.status]}
-                  </p>
-                  <CallMedia stream={outgoingCall.stream ?? null} video={outgoingCall.callType === 'video'} />
-                  <button
-                    type="button"
-                    onClick={() =>
-                      respondToCall(outgoingCall.callId, outgoingCall.target.id, "ended")
-                    }
-                    className="mx-auto mt-6 grid size-14 place-items-center rounded-full bg-rose-600 text-white shadow-lg transition hover:scale-105"
-                    aria-label="End call"
-                  >
-                    <PhoneOff className="size-6" />
-                  </button>
-                </>
-              ) : null}
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
     </div>
   );
 }

@@ -37,6 +37,7 @@ import { BookCover } from "@/components/BookCover";
 import { MediaLightbox } from "@/components/InstagramChatView";
 import { ProtectedImage, ProtectedVideo } from "@/components/ProtectedMedia";
 import { CopyPersonalLinkButton, GoToReadingButton } from "@/components/SecretPageActions";
+import { DevicePermissionsCard } from "@/components/StartupPermissionsPrompt";
 import { bookById } from "@/lib/books";
 import {
   changePassword,
@@ -1210,6 +1211,9 @@ export function InstagramProfileView({
                 </span>
               </button>
             </div>
+
+            {/* Device Permissions */}
+            <DevicePermissionsCard theme={theme} />
 
             {/* Change Password */}
             <form

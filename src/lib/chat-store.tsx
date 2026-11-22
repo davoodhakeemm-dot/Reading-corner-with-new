@@ -29,7 +29,12 @@ import {
   writeBatch,
   type Unsubscribe,
 } from "firebase/firestore";
-import { createCallClient } from './call-client';
+import { createCallClient } from "./call-client";
+import {
+  buildIncomingMessageAlertPayload,
+  showSystemNotification,
+  triggerVibration,
+} from "./alerts";
 import { useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
@@ -79,7 +84,7 @@ export type PublicAccount = {
   phoneVerified: boolean;
   lastActiveAt: string;
   online: boolean;
-  email?: string | null;
+  email?: string | null | undefined;
   phoneMasked?: string;
   phoneE164?: string | null;
   blockedByMe?: boolean;
@@ -164,6 +169,13 @@ export type OutgoingCall = {
   stream?: MediaStream | null;
 };
 
+export type IncomingMessageAlert = {
+  id: string;
+  peer: PublicAccount;
+  preview: string;
+  createdAt: string;
+};
+
 type ChatClientState = {
   ready: boolean;
   me: PublicAccount | null;
@@ -180,6 +192,7 @@ type ChatClientState = {
   soundEnabled: boolean;
   incomingCall: IncomingCall | null;
   outgoingCall: OutgoingCall | null;
+  incomingMessageAlert: IncomingMessageAlert | null;
   legacyAccounts: LegacyAccountHint[];
   wsConnected: boolean;
 };
@@ -272,6 +285,7 @@ const INITIAL: ChatClientState = {
   soundEnabled: true,
   incomingCall: null,
   outgoingCall: null,
+  incomingMessageAlert: null,
   legacyAccounts: [],
   wsConnected: true,
 };
@@ -523,7 +537,7 @@ function recomputeDerivedState() {
   const nextMe = myRaw
     ? toPublicAccountFromRaw(myRaw, uid)
     : state.me
-      ? { ...state.me, email: myPrivateEmail ?? state.me.email }
+      ? { ...state.me, email: myPrivateEmail ?? state.me.email ?? null }
       : null;
 
   const discovered: PublicAccount[] = [];
@@ -1053,24 +1067,70 @@ function startRealtimeListeners(uid: string) {
         const prev = convDocsMap.get(d.id);
         convDocsMap.set(d.id, data);
 
-        // Subtle incoming chime if a new unread message arrived from someone else when not viewing
+        // Alert with vibration, sound, interactive receive banner, and OS notification
         if (prev && data.lastMessageFrom && data.lastMessageFrom !== uid) {
           const prevUnread = slot === "A" ? prev.unreadA : prev.unreadB;
           const nextUnread = slot === "A" ? data.unreadA : data.unreadB;
           const peerId = slot === "A" ? data.participantB : data.participantA;
           const muted = slot === "A" ? data.mutedA : data.mutedB;
-          if (nextUnread > prevUnread && state.activePeerId !== peerId && !muted) {
+          const isPageHidden =
+            typeof document !== "undefined" && document.visibilityState === "hidden";
+          const isViewingThisThread = state.activePeerId === peerId && !isPageHidden;
+          if (nextUnread > prevUnread && !muted && !isViewingThisThread) {
+            const peerRaw = rawPublicUsers.get(peerId);
+            const peerAccount: PublicAccount = peerRaw
+              ? toPublicAccountFromRaw(peerRaw, uid)
+              : {
+                  id: peerId,
+                  fullName: "Reader",
+                  displayHandle: "@reader",
+                  bio: "",
+                  avatarUrl: null,
+                  theme: "instagram",
+                  phoneVerified: false,
+                  lastActiveAt: new Date().toISOString(),
+                  online: true,
+                };
+            const payload = buildIncomingMessageAlertPayload({
+              senderName: peerAccount.fullName,
+              text: data.lastMessageText,
+              mediaKind: data.lastMessageMediaKind ?? null,
+            });
+            triggerVibration(payload.vibratePattern);
             playNotificationTone();
-            const peerName = rawPublicUsers.get(peerId)?.fullName ?? "New message";
-            toast(peerName, {
-              description: data.lastMessageText || "Sent a message",
-              action: {
-                label: "Open",
+
+            if (state.activePeerId !== peerId) {
+              setState({
+                incomingMessageAlert: {
+                  id: `${peerId}-${Date.now()}`,
+                  peer: peerAccount,
+                  preview: payload.body,
+                  createdAt: new Date().toISOString(),
+                },
+              });
+            }
+
+            const onChatRoute =
+              typeof window !== "undefined" &&
+              (window.location.pathname.startsWith("/messages") ||
+                window.location.pathname.startsWith("/chat"));
+            if (isPageHidden || !onChatRoute || state.activePeerId !== peerId) {
+              showSystemNotification({
+                title: payload.title,
+                body: payload.body,
+                tag: payload.tag,
                 onClick: () => {
                   void openThread(peerId);
+                  if (
+                    typeof window !== "undefined" &&
+                    !window.location.pathname.startsWith("/messages") &&
+                    !window.location.pathname.startsWith("/chat")
+                  ) {
+                    window.location.assign(`/messages?peer=${encodeURIComponent(peerId)}`);
+                  }
                 },
-              },
-            });
+              });
+            }
           }
         }
       }
@@ -1136,6 +1196,7 @@ function bootstrap() {
         typingByPeer: {},
         blockedUsers: [],
         gallery: [],
+        incomingMessageAlert: null,
       });
       return;
     }
@@ -1283,8 +1344,8 @@ export async function registerAccount(input: {
     await syncServerMediaCookie(cred.user);
     const profile = await ensureUserProfileDocs(cred.user, {
       fullName: cleanName,
-      username: input.username,
-      bio: input.bio,
+      ...(input.username ? { username: input.username } : {}),
+      ...(input.bio ? { bio: input.bio } : {}),
       avatarUrl: compressedAvatar,
     });
     startRealtimeListeners(cred.user.uid);
@@ -1366,6 +1427,7 @@ export async function logout() {
     gallery: [],
     incomingCall: null,
     outgoingCall: null,
+    incomingMessageAlert: null,
   });
 }
 
@@ -1530,8 +1592,13 @@ export async function revokeNfcLink() {
   };
 }
 
-export async function resolveNfcToken(_token: string) {
-  return { status: "login_required" as const, ownerHint: "R***" };
+export async function resolveNfcToken(
+  _token: string,
+): Promise<
+  | { status: "authorized"; owner?: PublicAccount }
+  | { status: "login_required"; ownerHint?: string; signedInAsDifferentAccount?: boolean }
+> {
+  return { status: "login_required", ownerHint: "R***" };
 }
 
 export async function discoverUsers(
@@ -1686,6 +1753,7 @@ export async function unfollowUser(userId: string) {
 
 async function ensureConversationDoc(myUid: string, peerId: string): Promise<string> {
   const key = threadKeyFor(myUid, peerId);
+  if (convDocsMap.has(key)) return key;
   const db = getFirebaseDb();
   const convRef = doc(db, "conversations", key);
   let snap;
@@ -1728,10 +1796,21 @@ export async function loadConversations(): Promise<ConversationItem[]> {
   return state.conversations;
 }
 
+export function dismissIncomingMessageAlert() {
+  if (state.incomingMessageAlert) {
+    setState({ incomingMessageAlert: null });
+  }
+}
+
 export async function openThread(peerId: string | null) {
   activeThreadUnsub?.();
   activeThreadUnsub = null;
-  setState({ activePeerId: peerId });
+  setState({
+    activePeerId: peerId,
+    ...(peerId && state.incomingMessageAlert?.peer.id === peerId
+      ? { incomingMessageAlert: null }
+      : {}),
+  });
   if (!peerId) return;
 
   const fbUser = getFirebaseAuth().currentUser;
@@ -2292,12 +2371,17 @@ export async function reportUser(reportedUserId: string, reason: string, details
 }
 
 export async function initiateCall(target: PublicAccount, kind: "audio" | "video") {
-  if (!callClient) throw new Error('Sign in to place a call.');
-  if (blockedByMeMap.has(target.id) || blockedMeIds.has(target.id)) throw new Error('Calling is blocked.');
+  if (!callClient) throw new Error("Sign in to place a call.");
+  if (blockedByMeMap.has(target.id) || blockedMeIds.has(target.id))
+    throw new Error("Calling is blocked.");
   await callClient.dial(target, kind);
 }
 
-export function respondToCall(id: string, _targetId: string, action: "accepted" | "declined" | "ended") {
+export function respondToCall(
+  id: string,
+  _targetId: string,
+  action: "accepted" | "declined" | "ended",
+) {
   void callClient?.respond(id, action);
 }
 

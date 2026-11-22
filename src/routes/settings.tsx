@@ -3,6 +3,7 @@ import { InstallApp } from "@/components/InstallApp";
 import { RotateCcw } from "lucide-react";
 
 import { AppShell, PageHeader } from "@/components/AppShell";
+import { DevicePermissionsCard } from "@/components/StartupPermissionsPrompt";
 import { useLibrary } from "@/lib/library-store";
 import { cn } from "@/lib/utils";
 
@@ -110,6 +111,8 @@ function SettingsPage() {
             </Link>
           </div>
         </Card>
+
+        <DevicePermissionsCard />
 
         <InstallApp />
 
