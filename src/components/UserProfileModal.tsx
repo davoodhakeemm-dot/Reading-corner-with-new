@@ -1,4 +1,14 @@
-import { Ban, Check, Flag, MessageCircle, UserCheck, UserPlus, X } from "lucide-react";
+import {
+  Ban,
+  Check,
+  Flag,
+  MessageCircle,
+  Phone,
+  UserCheck,
+  UserPlus,
+  Video,
+  X,
+} from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -9,6 +19,7 @@ import {
   followUser,
   formatRelative,
   initialsOf,
+  initiateCall,
   reportUser,
   unblockUser,
   unfollowUser,
@@ -284,6 +295,47 @@ export function UserProfileModal({
                 )}
               >
                 <MessageCircle className="size-4" /> Message
+              </button>
+            </div>
+
+            <div className="mt-2.5 grid w-full grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                disabled={isBlocked}
+                onClick={async () => {
+                  onClose();
+                  try {
+                    await initiateCall(profile, "audio");
+                  } catch (err) {
+                    toast.error(err instanceof Error ? err.message : "Cannot initiate audio call.");
+                  }
+                }}
+                className={cn(
+                  "inline-flex min-h-[42px] items-center justify-center gap-1.5 rounded-2xl border px-3 text-xs font-bold transition disabled:opacity-50",
+                  theme.surfaceMuted,
+                  theme.border,
+                )}
+              >
+                <Phone className="size-4" /> Audio Call
+              </button>
+              <button
+                type="button"
+                disabled={isBlocked}
+                onClick={async () => {
+                  onClose();
+                  try {
+                    await initiateCall(profile, "video");
+                  } catch (err) {
+                    toast.error(err instanceof Error ? err.message : "Cannot initiate video call.");
+                  }
+                }}
+                className={cn(
+                  "inline-flex min-h-[42px] items-center justify-center gap-1.5 rounded-2xl border px-3 text-xs font-bold transition disabled:opacity-50",
+                  theme.surfaceMuted,
+                  theme.border,
+                )}
+              >
+                <Video className="size-4" /> Video Call
               </button>
             </div>
 

@@ -3,6 +3,7 @@ import { motion } from "motion/react";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
+import { CopyPersonalLinkButton } from "@/components/SecretPageActions";
 import { UserProfileModal } from "@/components/UserProfileModal";
 import { WaterGlowButton } from "@/components/WaterGlowButton";
 import {
@@ -60,10 +61,10 @@ export function DiscoverUsersView({
 
   // Keep live presence / follow updates synchronized when showing full directory
   useEffect(() => {
-    if (!query.trim() && filter === "all" && discoveredUsers.length > 0) {
+    if (!query.trim() && filter === "all" && !loading) {
       setUsers(discoveredUsers);
     }
-  }, [discoveredUsers, query, filter]);
+  }, [discoveredUsers, query, filter, loading]);
 
   async function handleFollowToggle(user: PublicAccount) {
     if (busyId) return;
@@ -85,7 +86,7 @@ export function DiscoverUsersView({
   }
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-5 pb-28 md:px-8 md:py-7 md:pb-10">
+    <div className="flex-1 overflow-y-auto px-4 py-5 pb-36 md:px-8 md:py-7 md:pb-24">
       <div className="mx-auto max-w-4xl space-y-5">
         {/* Header */}
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -99,18 +100,21 @@ export function DiscoverUsersView({
           </div>
 
           {me && (
-            <WaterGlowButton
-              type="button"
-              variant={resolveWaterButtonVariant(theme.id, "surface")}
-              size="sm"
-              sound="pop"
-              soundEnabled={soundEnabled}
-              onClick={() => void setSecretTheme(theme.isDark ? "instagram" : "dark")}
-              aria-label={theme.isDark ? "Switch to light mode" : "Switch to dark mode"}
-            >
-              {theme.isDark ? <Sun className="size-4" /> : <Moon className="size-4" />}
-              <span>{theme.isDark ? "Light" : "Dark"}</span>
-            </WaterGlowButton>
+            <div className="flex flex-wrap items-center gap-2">
+              <CopyPersonalLinkButton theme={theme} size="sm" label="Copy Personal Link" />
+              <WaterGlowButton
+                type="button"
+                variant={resolveWaterButtonVariant(theme.id, "surface")}
+                size="sm"
+                sound="pop"
+                soundEnabled={soundEnabled}
+                onClick={() => void setSecretTheme(theme.isDark ? "instagram" : "dark")}
+                aria-label={theme.isDark ? "Switch to light mode" : "Switch to dark mode"}
+              >
+                {theme.isDark ? <Sun className="size-4" /> : <Moon className="size-4" />}
+                <span>{theme.isDark ? "Light" : "Dark"}</span>
+              </WaterGlowButton>
+            </div>
           )}
         </div>
 

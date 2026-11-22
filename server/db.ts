@@ -171,6 +171,19 @@ db.exec(`
     size_bytes INTEGER NOT NULL,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS firebase_nfc_links (
+    id TEXT PRIMARY KEY,
+    uid TEXT UNIQUE NOT NULL,
+    full_name TEXT NOT NULL,
+    display_handle TEXT NOT NULL,
+    token_ciphertext TEXT,
+    token_hash TEXT UNIQUE,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `);
 
 // Non-destructive column migrations for pre-existing databases
@@ -249,6 +262,13 @@ function runSafeMigrations() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_handle_unique ON users(LOWER(display_handle));
   `);
 
+  const userColSet = new Set(
+    (db.prepare("PRAGMA table_info(users)").all() as { name: string }[]).map((c) => c.name),
+  );
+  if (!userColSet.has("avatar_external_url")) {
+    db.exec("ALTER TABLE users ADD COLUMN avatar_external_url TEXT;");
+  }
+
   const msgCols = db.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
   const msgColSet = new Set(msgCols.map((c) => c.name));
   if (!msgColSet.has("reply_to_id")) {
@@ -285,6 +305,7 @@ export type DbUser = {
   display_handle: string;
   bio: string;
   avatar_media_id: string | null;
+  avatar_external_url?: string | null;
   password_hash: string;
   theme: SecretTheme;
   created_at: string;
@@ -494,7 +515,9 @@ export function toPublicUser(u: DbUser, onlineOverride?: boolean, viewerId?: str
     fullName: u.full_name,
     displayHandle: u.display_handle,
     bio: u.bio,
-    avatarUrl: u.avatar_media_id ? `/api/media/${u.avatar_media_id}` : null,
+    avatarUrl: u.avatar_media_id
+      ? `/api/media/${u.avatar_media_id}`
+      : (u.avatar_external_url ?? null),
     theme: u.theme === "emerald" || u.theme === "dark" ? u.theme : "instagram",
     phoneVerified: u.phone_verified === 1,
     lastActiveAt: u.last_active_at,
@@ -523,6 +546,36 @@ export function createNfcTokenForUser(userId: string): { token: string; version:
   db.prepare(
     "INSERT INTO nfc_links (id, user_id, token_ciphertext, token_hash, revoked, version, created_at, updated_at) VALUES (?, ?, ?, ?, 0, 1, ?, ?)",
   ).run(`nfc_${crypto.randomUUID()}`, userId, ciphertext, tokenHash, now, now);
+  return { token, version: 1 };
+}
+
+export function createFirebaseNfcToken(
+  uid: string,
+  fullName = "Reader",
+  displayHandle = "",
+): { token: string; version: number } {
+  const token = `rc_${crypto.randomBytes(24).toString("base64url")}`;
+  const tokenHash = sha256(token);
+  const ciphertext = encryptToken(token);
+  const now = new Date().toISOString();
+  const safeName = fullName.trim().slice(0, 60) || "Reader";
+  const safeHandle = displayHandle.trim().slice(0, 32) || `@reader.${uid.slice(-4).toLowerCase()}`;
+
+  const existing = db
+    .prepare("SELECT id, version FROM firebase_nfc_links WHERE uid = ?")
+    .get(uid) as { id: string; version: number } | undefined;
+
+  if (existing) {
+    const nextVersion = existing.version + 1;
+    db.prepare(
+      "UPDATE firebase_nfc_links SET full_name = ?, display_handle = ?, token_ciphertext = ?, token_hash = ?, revoked = 0, version = ?, updated_at = ? WHERE uid = ?",
+    ).run(safeName, safeHandle, ciphertext, tokenHash, nextVersion, now, uid);
+    return { token, version: nextVersion };
+  }
+
+  db.prepare(
+    "INSERT INTO firebase_nfc_links (id, uid, full_name, display_handle, token_ciphertext, token_hash, revoked, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)",
+  ).run(`fbnfc_${crypto.randomUUID()}`, uid, safeName, safeHandle, ciphertext, tokenHash, now, now);
   return { token, version: 1 };
 }
 

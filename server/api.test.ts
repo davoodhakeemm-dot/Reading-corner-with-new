@@ -5,23 +5,28 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import express from "express";
+import { WebSocket } from "ws";
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "rc-api-test-"));
 process.env["DATA_DIR"] = testDataDir;
 
 const { createApiRouter } = await import("./api");
+const { attachWebSocketServer } = await import("./ws");
 
 let server: http.Server;
 let baseUrl = "";
+let wsBaseUrl = "";
 
 test.before(async () => {
   const app = express();
   app.use("/api", createApiRouter());
   server = http.createServer(app);
+  attachWebSocketServer(server);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
   const addr = server.address();
   if (!addr || typeof addr === "string") throw new Error("Failed to bind test server");
   baseUrl = `http://127.0.0.1:${addr.port}/api`;
+  wsBaseUrl = `ws://127.0.0.1:${addr.port}/ws`;
 });
 
 test.after(async () => {
@@ -339,4 +344,348 @@ test("Gallery real image upload, binary retrieval, and owner-only delete", async
     headers: { Authorization: `Bearer ${ownerToken}` },
   });
   assert.equal(afterMedia.status, 404);
+});
+
+test("Personal NFC link generation, verification, regeneration, revocation, and /auth/session restore", async () => {
+  const regA = await api<{ token: string; user: { id: string; fullName: string } }>(
+    "/auth/register",
+    {
+      method: "POST",
+      body: {
+        fullName: "Nadia Reader",
+        username: "nadia_reads",
+        email: "nadia@example.com",
+        password: "NadiaPassword123!",
+      },
+    },
+  );
+  assert.equal(regA.status, 201);
+  const tokenA = regA.data.token;
+
+  const regB = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Sam Reader",
+      username: "sam_reads",
+      email: "sam@example.com",
+      password: "SamPassword123!",
+    },
+  });
+  assert.equal(regB.status, 201);
+  const tokenB = regB.data.token;
+
+  // Session check returns authenticated user for valid bearer token and null user without token
+  const anonSess = await api<{ user: unknown }>("/auth/session");
+  assert.equal(anonSess.status, 200);
+  assert.equal(anonSess.data.user, null);
+
+  const authSess = await api<{ user: { id: string; email: string } }>("/auth/session", {
+    token: tokenA,
+  });
+  assert.equal(authSess.status, 200);
+  assert.equal(authSess.data.user.id, regA.data.user.id);
+  assert.equal(authSess.data.user.email, "nadia@example.com");
+
+  // Fetch initial NFC personal link for User A
+  const nfc1 = await api<{ token: string; path: string; version: number; revoked: boolean }>(
+    "/nfc",
+    { token: tokenA },
+  );
+  assert.equal(nfc1.status, 200);
+  assert.equal(nfc1.data.revoked, false);
+  assert.equal(nfc1.data.version, 1);
+  assert.ok(nfc1.data.token);
+  assert.equal(nfc1.data.path, `/nfc/${nfc1.data.token}`);
+
+  // Owner session resolves as authorized; anonymous / different user gets login_required
+  const resolveSelf = await api<{ status: string; owner?: { id: string } }>(
+    `/nfc/resolve?token=${encodeURIComponent(nfc1.data.token)}`,
+    { token: tokenA },
+  );
+  assert.equal(resolveSelf.status, 200);
+  assert.equal(resolveSelf.data.status, "authorized");
+  assert.equal(resolveSelf.data.owner?.id, regA.data.user.id);
+
+  const resolveOther = await api<{
+    status: string;
+    signedInAsDifferentAccount?: boolean;
+  }>(`/nfc/resolve?token=${encodeURIComponent(nfc1.data.token)}`, { token: tokenB });
+  assert.equal(resolveOther.status, 200);
+  assert.equal(resolveOther.data.status, "login_required");
+  assert.equal(resolveOther.data.signedInAsDifferentAccount, true);
+
+  // Regenerating link invalidates old token and increments version
+  const regen = await api<{ token: string; path: string; version: number; revoked: boolean }>(
+    "/nfc/regenerate",
+    { method: "POST", token: tokenA },
+  );
+  assert.equal(regen.status, 200);
+  assert.equal(regen.data.version, 2);
+  assert.notEqual(regen.data.token, nfc1.data.token);
+
+  const oldResolve = await api(`/nfc/resolve?token=${encodeURIComponent(nfc1.data.token)}`, {
+    token: tokenA,
+  });
+  assert.equal(oldResolve.status, 404);
+
+  const newResolve = await api<{ status: string }>(
+    `/nfc/resolve?token=${encodeURIComponent(regen.data.token)}`,
+    { token: tokenA },
+  );
+  assert.equal(newResolve.status, 200);
+  assert.equal(newResolve.data.status, "authorized");
+
+  // Revoking disables token
+  const revoke = await api<{ revoked: boolean; token: string | null }>("/nfc/revoke", {
+    method: "POST",
+    token: tokenA,
+  });
+  assert.equal(revoke.status, 200);
+  assert.equal(revoke.data.revoked, true);
+  assert.equal(revoke.data.token, null);
+
+  const revokedResolve = await api(`/nfc/resolve?token=${encodeURIComponent(regen.data.token)}`, {
+    token: tokenA,
+  });
+  assert.equal(revokedResolve.status, 404);
+});
+
+function connectWs(token: string): Promise<{
+  ws: WebSocket;
+  waitForEvent: (name: string, timeoutMs?: number) => Promise<Record<string, unknown>>;
+}> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${wsBaseUrl}?token=${encodeURIComponent(token)}`);
+    const queue: { event: string; payload: Record<string, unknown> }[] = [];
+    const waiters: {
+      event: string;
+      done: (payload: Record<string, unknown>) => void;
+    }[] = [];
+
+    ws.on("message", (raw) => {
+      const parsed = JSON.parse(raw.toString()) as {
+        event?: string;
+        payload?: Record<string, unknown>;
+      };
+      if (!parsed.event) return;
+      const idx = waiters.findIndex((w) => w.event === parsed.event);
+      if (idx >= 0) {
+        const [w] = waiters.splice(idx, 1);
+        w?.done(parsed.payload ?? {});
+      } else {
+        queue.push({ event: parsed.event, payload: parsed.payload ?? {} });
+      }
+    });
+
+    const waitForEvent = (name: string, timeoutMs = 4000) => {
+      const existingIdx = queue.findIndex((item) => item.event === name);
+      if (existingIdx >= 0) {
+        const [item] = queue.splice(existingIdx, 1);
+        return Promise.resolve(item!.payload);
+      }
+      return new Promise<Record<string, unknown>>((res, rej) => {
+        const timer = setTimeout(() => {
+          rej(new Error(`Timed out waiting for WS event '${name}'`));
+        }, timeoutMs);
+        waiters.push({
+          event: name,
+          done: (payload) => {
+            clearTimeout(timer);
+            res(payload);
+          },
+        });
+      });
+    };
+
+    ws.on("open", () => resolve({ ws, waitForEvent }));
+    ws.on("error", reject);
+  });
+}
+
+test("Real-time user registration broadcast, live chat delivery, WebRTC call SDP/ICE relay, and firebase-session guard", async () => {
+  const regA = await api<{ token: string; user: { id: string; fullName: string } }>(
+    "/auth/register",
+    {
+      method: "POST",
+      body: {
+        fullName: "Live Caller",
+        username: "live_caller",
+        email: "caller@example.com",
+        password: "Password123!",
+      },
+    },
+  );
+  assert.equal(regA.status, 201);
+
+  const regB = await api<{ token: string; user: { id: string; fullName: string } }>(
+    "/auth/register",
+    {
+      method: "POST",
+      body: {
+        fullName: "Live Callee",
+        username: "live_callee",
+        email: "callee@example.com",
+        password: "Password123!",
+      },
+    },
+  );
+  assert.equal(regB.status, 201);
+
+  const clientA = await connectWs(regA.data.token);
+  const clientB = await connectWs(regB.data.token);
+  await Promise.all([clientA.waitForEvent("connected"), clientB.waitForEvent("connected")]);
+
+  try {
+    // 1. Registering User C broadcasts live user:registered to all connected clients without leaking email
+    const broadcastA = clientA.waitForEvent("user:registered");
+    const broadcastB = clientB.waitForEvent("user:registered");
+    const regC = await api<{ token: string; user: { id: string; fullName: string } }>(
+      "/auth/register",
+      {
+        method: "POST",
+        body: {
+          fullName: "Newcomer Reader",
+          username: "newcomer_reader",
+          email: "newcomer@example.com",
+          password: "Password123!",
+        },
+      },
+    );
+    assert.equal(regC.status, 201);
+    const [evtA, evtB] = await Promise.all([broadcastA, broadcastB]);
+    const userOnA = evtA["user"] as Record<string, unknown>;
+    const userOnB = evtB["user"] as Record<string, unknown>;
+    assert.equal(userOnA["id"], regC.data.user.id);
+    assert.equal(userOnB["fullName"], "Newcomer Reader");
+    assert.equal(userOnA["email"], undefined);
+
+    // 2. Live chat message reaches recipient over WebSocket
+    const dmIncoming = clientB.waitForEvent("message:new");
+    const sendRes = await api<{ message: { id: string; text: string } }>("/messages", {
+      method: "POST",
+      token: regA.data.token,
+      body: { peerId: regB.data.user.id, text: "Realtime WS message check" },
+    });
+    assert.equal(sendRes.status, 201);
+    const dmPayload = await dmIncoming;
+    assert.equal((dmPayload["message"] as { text?: string })?.text, "Realtime WS message check");
+
+    // 3. Live WebRTC audio/video call signaling preserves callId, SDP offer/answer, and ICE candidates
+    const callIncomingB = clientB.waitForEvent("call:incoming");
+    const callRingingA = clientA.waitForEvent("call:ringing");
+    clientA.ws.send(
+      JSON.stringify({
+        event: "call:initiate",
+        payload: {
+          callId: "call_test_1234",
+          targetId: regB.data.user.id,
+          callType: "video",
+        },
+      }),
+    );
+    const [incomingData, ringingData] = await Promise.all([callIncomingB, callRingingA]);
+    assert.equal(incomingData["callId"], "call_test_1234");
+    assert.equal(incomingData["callType"], "video");
+    assert.equal((incomingData["from"] as { id?: string })?.id, regA.data.user.id);
+    assert.equal(ringingData["recipientOnline"], true);
+
+    const acceptedA = clientA.waitForEvent("call:signal");
+    clientB.ws.send(
+      JSON.stringify({
+        event: "call:signal",
+        payload: { targetId: regA.data.user.id, callId: "call_test_1234", action: "accepted" },
+      }),
+    );
+    assert.equal((await acceptedA)["action"], "accepted");
+
+    const offerB = clientB.waitForEvent("call:signal");
+    clientA.ws.send(
+      JSON.stringify({
+        event: "call:signal",
+        payload: {
+          targetId: regB.data.user.id,
+          callId: "call_test_1234",
+          action: "offer",
+          sdp: { type: "offer", sdp: "v=0\r\no=- 123 2 IN IP4 127.0.0.1\r\n" },
+        },
+      }),
+    );
+    const receivedOffer = await offerB;
+    assert.equal(receivedOffer["action"], "offer");
+    assert.equal((receivedOffer["sdp"] as { type?: string })?.type, "offer");
+
+    const answerA = clientA.waitForEvent("call:signal");
+    clientB.ws.send(
+      JSON.stringify({
+        event: "call:signal",
+        payload: {
+          targetId: regA.data.user.id,
+          callId: "call_test_1234",
+          action: "answer",
+          sdp: { type: "answer", sdp: "v=0\r\no=- 456 2 IN IP4 127.0.0.1\r\n" },
+        },
+      }),
+    );
+    const receivedAnswer = await answerA;
+    assert.equal(receivedAnswer["action"], "answer");
+    assert.equal((receivedAnswer["sdp"] as { type?: string })?.type, "answer");
+
+    const iceA = clientA.waitForEvent("call:signal");
+    clientB.ws.send(
+      JSON.stringify({
+        event: "call:signal",
+        payload: {
+          targetId: regA.data.user.id,
+          callId: "call_test_1234",
+          action: "ice-candidate",
+          candidate: { candidate: "candidate:1 1 udp 2122260223 127.0.0.1 50000 typ host" },
+        },
+      }),
+    );
+    const receivedIce = await iceA;
+    assert.equal(receivedIce["action"], "ice-candidate");
+    assert.ok((receivedIce["candidate"] as { candidate?: string })?.candidate?.includes("host"));
+
+    const endedB = clientB.waitForEvent("call:signal");
+    clientA.ws.send(
+      JSON.stringify({
+        event: "call:signal",
+        payload: { targetId: regB.data.user.id, callId: "call_test_1234", action: "ended" },
+      }),
+    );
+    assert.equal((await endedB)["action"], "ended");
+
+    // 4. firebase-session endpoint validates ID token presence & signature
+    const missingFb = await api("/auth/firebase-session", { method: "POST", body: {} });
+    assert.equal(missingFb.status, 400);
+    const badFb = await api("/auth/firebase-session", {
+      method: "POST",
+      body: { idToken: "not-a-valid-jwt" },
+    });
+    assert.equal(badFb.status, 401);
+
+    // 5. Account deletion removes user from directory & broadcasts user:deleted live
+    const deletedEventPromise = clientA.waitForEvent("user:deleted");
+    const delC = await api<{ ok: boolean; deletedUserId: string }>("/auth/account", {
+      method: "DELETE",
+      token: regC.data.token,
+    });
+    assert.equal(delC.status, 200);
+    assert.equal(delC.data.ok, true);
+    assert.equal(delC.data.deletedUserId, regC.data.user.id);
+    const deletedEv = await deletedEventPromise;
+    assert.equal(deletedEv["userId"], regC.data.user.id);
+
+    const listAfterDel = await api<{ users: Array<{ id: string }> }>("/users", {
+      token: regA.data.token,
+    });
+    assert.equal(listAfterDel.status, 200);
+    assert.equal(
+      listAfterDel.data.users.some((u) => u.id === regC.data.user.id),
+      false,
+    );
+  } finally {
+    clientA.ws.close();
+    clientB.ws.close();
+  }
 });

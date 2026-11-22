@@ -123,3 +123,30 @@ export function filterConversationsByTab<T extends MinimalConversation>(
   }
   return conversations;
 }
+
+export function isDynamicImportError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    msg.includes("Failed to fetch dynamically imported module") ||
+    msg.includes("Importing a module script failed") ||
+    msg.includes("error loading dynamically imported module") ||
+    msg.includes("ChunkLoadError")
+  );
+}
+
+export function isFirebaseOfflineError(error: unknown): boolean {
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+  const msg = error instanceof Error ? error.message : String(error ?? "");
+  const lower = msg.toLowerCase();
+  return (
+    code === "unavailable" ||
+    code === "auth/network-request-failed" ||
+    lower.includes("the client is offline") ||
+    lower.includes("because the client is offline") ||
+    lower.includes("network-request-failed") ||
+    lower.includes("could not reach cloud firestore backend")
+  );
+}

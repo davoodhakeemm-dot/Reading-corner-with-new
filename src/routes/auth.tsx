@@ -169,7 +169,7 @@ function AuthPage() {
 
     if (mode === "login") {
       if (!email.trim()) {
-        setError("Enter your account email address.");
+        setError("Enter your account email or @username.");
         return;
       }
       if (!password) {
@@ -763,7 +763,7 @@ function AuthPage() {
                   </>
                 )}
 
-                {/* Recessed Email Input */}
+                {/* Recessed Email / Login Identifier Input */}
                 <div
                   className={cn(
                     "flex min-h-[52px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
@@ -772,13 +772,13 @@ function AuthPage() {
                 >
                   <Mail className={cn("size-4 shrink-0", iconTintClass)} />
                   <input
-                    type="email"
-                    inputMode="email"
+                    type={mode === "login" ? "text" : "email"}
+                    inputMode={mode === "login" ? "text" : "email"}
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="Email address *"
-                    aria-label="Email address"
-                    autoComplete="email"
+                    placeholder={mode === "login" ? "Email or @username *" : "Email address *"}
+                    aria-label={mode === "login" ? "Email or @username" : "Email address"}
+                    autoComplete={mode === "login" ? "username" : "email"}
                     className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
                   />
                 </div>

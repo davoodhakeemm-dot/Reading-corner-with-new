@@ -15,6 +15,7 @@ import appCss from "../styles.css?url";
 import { LibraryProvider } from "../lib/library-store";
 import { SecretGesture } from "../components/SecretGesture";
 import { reportLovableError } from "../lib/lovable-error-reporting";
+import { isDynamicImportError } from "../lib/social-logic";
 
 function NotFoundComponent() {
   return (
@@ -38,12 +39,28 @@ function NotFoundComponent() {
   );
 }
 
+const CHUNK_RELOAD_KEY = "rc_chunk_reload_at";
+
 function ErrorComponent({ error, reset }: { error: unknown; reset: () => void }) {
-  console.error(error);
   const router = useRouter();
+  const isChunkErr = isDynamicImportError(error);
+
   useEffect(() => {
+    if (isChunkErr && typeof window !== "undefined") {
+      try {
+        const last = Number(window.sessionStorage.getItem(CHUNK_RELOAD_KEY) || "0");
+        if (!last || Date.now() - last > 15_000) {
+          window.sessionStorage.setItem(CHUNK_RELOAD_KEY, String(Date.now()));
+          window.location.reload();
+          return;
+        }
+      } catch {
+        /* ignore sessionStorage failures */
+      }
+    }
+    console.error(error);
     reportLovableError(error, { boundary: "tanstack_root_error_component" });
-  }, [error]);
+  }, [error, isChunkErr]);
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">

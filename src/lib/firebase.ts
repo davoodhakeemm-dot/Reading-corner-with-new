@@ -9,6 +9,7 @@ import {
 import { doc, getDocFromServer, getFirestore, type Firestore } from "firebase/firestore";
 
 import firebaseConfig from "../../firebase-applet-config.json";
+import { isFirebaseOfflineError } from "./social-logic";
 
 export enum OperationType {
   CREATE = "create",
@@ -99,13 +100,31 @@ export function handleFirestoreError(
 let testedConnection = false;
 export async function testFirestoreConnection(): Promise<void> {
   if (testedConnection || typeof window === "undefined") return;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    window.addEventListener(
+      "online",
+      () => {
+        void testFirestoreConnection();
+      },
+      { once: true },
+    );
+    return;
+  }
   testedConnection = true;
   try {
     const db = getFirebaseDb();
     await getDocFromServer(doc(db, "test", "connection"));
   } catch (error) {
-    if (error instanceof Error && error.message.includes("the client is offline")) {
-      console.error("Please check your Firebase configuration (Firestore client is offline).");
+    if (isFirebaseOfflineError(error)) {
+      testedConnection = false;
+      window.addEventListener(
+        "online",
+        () => {
+          void testFirestoreConnection();
+        },
+        { once: true },
+      );
+      return;
     }
   }
 }

@@ -44,6 +44,7 @@ import { toast } from "sonner";
 
 import { Logo } from "@/components/Logo";
 import { ProtectedAudio, ProtectedImage, ProtectedVideo } from "@/components/ProtectedMedia";
+import { CopyPersonalLinkButton, GoToReadingButton } from "@/components/SecretPageActions";
 import { UserProfileModal } from "@/components/UserProfileModal";
 import { WaterGlowButton } from "@/components/WaterGlowButton";
 import {
@@ -52,6 +53,7 @@ import {
   downloadProtectedMedia,
   editChatMessage,
   fetchGallery,
+  fetchNfcLink,
   formatRelative,
   formatTime,
   initialsOf,
@@ -888,7 +890,7 @@ export function InstagramChatView({
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto px-3 pb-16">
+          <div className="flex-1 overflow-y-auto px-3 pb-24">
             {query.trim() ? (
               <div className="space-y-2">
                 <p className={cn("px-2 py-1 text-xs font-bold", theme.mutedText)}>
@@ -929,21 +931,29 @@ export function InstagramChatView({
               </div>
             ) : (
               <div className="space-y-2">
-                <div className="flex items-center justify-between px-2 py-1">
+                <div className="flex flex-wrap items-center justify-between gap-2 px-1.5 py-1">
                   <span
                     className={cn("inline-flex items-center gap-1.5 text-xs font-bold", theme.text)}
                   >
                     <Users className={cn("size-3.5", theme.accentText)} /> Messages
                   </span>
-                  {onOpenDiscover && (
-                    <button
-                      type="button"
-                      onClick={onOpenDiscover}
-                      className={cn("text-xs font-bold hover:underline", theme.accentText)}
-                    >
-                      Discover people
-                    </button>
-                  )}
+                  <div className="flex items-center gap-2">
+                    <CopyPersonalLinkButton theme={theme} size="sm" label="Copy Link" />
+                    {onOpenDiscover && (
+                      <button
+                        type="button"
+                        onClick={onOpenDiscover}
+                        aria-label="Start new chat"
+                        className={cn(
+                          "inline-flex items-center gap-1 text-xs font-bold hover:underline",
+                          theme.accentText,
+                        )}
+                      >
+                        <PenLine className="size-3.5" />
+                        <span>New</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
                 {filteredConversations.map((c, idx) => {
                   const selected = c.peer.id === activePeerId;
@@ -1034,7 +1044,7 @@ export function InstagramChatView({
                   );
                 })}
 
-                {directoryPeers.length > 0 && (
+                {chatFilterTab === "all" && directoryPeers.length > 0 && (
                   <div className={cn(conversations.length > 0 ? "pt-3" : "pt-1", "space-y-2")}>
                     <div className="flex items-center justify-between px-2 py-1">
                       <span
@@ -1092,7 +1102,7 @@ export function InstagramChatView({
 
                 {chatFilterTab === "unread" &&
                   filteredConversations.length === 0 &&
-                  conversations.length > 0 && (
+                  (conversations.length > 0 || directoryPeers.length > 0) && (
                     <div className="px-4 py-8 text-center">
                       <p className="text-xs font-bold">All caught up</p>
                       <p className={cn("mt-1 text-xs", theme.mutedText)}>
@@ -1126,20 +1136,6 @@ export function InstagramChatView({
               </div>
             )}
           </div>
-
-          {/* Floating 3D Water-Glow Compose Pencil FAB */}
-          <WaterGlowButton
-            type="button"
-            variant={resolveWaterButtonVariant(theme.id, "secondary")}
-            size="icon"
-            sound="droplet"
-            soundEnabled={soundEnabled}
-            onClick={() => (onOpenDiscover ? onOpenDiscover() : searchInputRef.current?.focus())}
-            aria-label="Start new chat"
-            className="absolute bottom-3.5 right-3.5 size-12"
-          >
-            <PenLine className="size-5" />
-          </WaterGlowButton>
         </motion.div>
       </aside>
 
@@ -1251,6 +1247,8 @@ export function InstagramChatView({
                 <Phone className="size-4" />
               </motion.button>
 
+              <GoToReadingButton size="sm" className="hidden md:inline-flex" />
+
               <div className="relative">
                 <button
                   type="button"
@@ -1277,6 +1275,28 @@ export function InstagramChatView({
                       className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
                     >
                       <UserIcon className="size-4" /> View profile
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setMenuOpen(false);
+                        const link = await fetchNfcLink().catch(() => null);
+                        if (!link?.path || link.revoked) {
+                          toast.error("Personal link unavailable or revoked.");
+                          return;
+                        }
+                        try {
+                          await navigator.clipboard.writeText(
+                            `${window.location.origin}${link.path}`,
+                          );
+                          toast.success("Personal link copied");
+                        } catch {
+                          toast.error("Open Profile → NFC Card to copy your link.");
+                        }
+                      }}
+                      className="flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-bold transition hover:bg-black/5 dark:hover:bg-white/5"
+                    >
+                      <Sparkles className="size-4" /> Copy personal link
                     </button>
                     <button
                       type="button"
@@ -1377,8 +1397,17 @@ export function InstagramChatView({
             )}
 
             {/* Atmospheric Study Band Behind Rising Curved Glass Conversation Sheet */}
-            <div className="relative flex min-h-0 flex-1 flex-col pt-3 md:px-4 md:pt-4">
-              <div className="pointer-events-none mx-6 mb-4 flex items-center justify-center gap-2 text-[11px] font-semibold opacity-65">
+            <div className="relative flex min-h-0 flex-1 flex-col pt-2.5 md:px-4 md:pt-4">
+              <div className="mx-3 mb-5 flex items-center justify-between gap-2 md:hidden">
+                <CopyPersonalLinkButton
+                  theme={theme}
+                  size="sm"
+                  label="Copy Link"
+                  className="min-h-[34px] px-3 text-[11px]"
+                />
+                <GoToReadingButton size="sm" className="min-h-[34px] px-3.5 text-[11px]" />
+              </div>
+              <div className="pointer-events-none mx-6 mb-4 hidden items-center justify-center gap-2 text-[11px] font-semibold opacity-65 md:flex">
                 <BookOpen className="size-3.5" />
                 <span>Real-time direct messages &amp; shared media</span>
                 <Sparkles className="size-3.5" />

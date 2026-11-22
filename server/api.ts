@@ -7,6 +7,7 @@ import { getAuth } from "firebase-admin/auth";
 import multer from "multer";
 
 import {
+  createFirebaseNfcToken,
   createNfcTokenForUser,
   db,
   decryptToken,
@@ -27,7 +28,7 @@ import {
   type DbUser,
   type SecretTheme,
 } from "./db";
-import { isUserConnected, sendToUser } from "./ws";
+import { broadcastEvent, isUserConnected, sendToUser } from "./ws";
 
 type AuthedRequest = Request & { authUser?: DbUser; authToken?: string; firebaseUid?: string };
 
@@ -251,6 +252,7 @@ function issueSession(userId: string, req: Request, res: Response): string {
   );
 
   const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
+  res.clearCookie("rc_fb_session", { path: "/" });
   res.cookie("rc_session", token, {
     httpOnly: true,
     sameSite: isHttps ? "none" : "lax",
@@ -582,6 +584,8 @@ export function createApiRouter() {
       const token = issueSession(userId, req, res);
       const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as DbUser;
 
+      broadcastEvent("user:registered", { user: toPublicUser(user, true) }, user.id);
+
       res.status(201).json({
         token,
         user: toSelfUser(user),
@@ -631,6 +635,160 @@ export function createApiRouter() {
     });
   });
 
+  // Bridge verified Firebase (Google) accounts into the unified SQLite & WebSocket directory
+  router.post("/auth/firebase-session", async (req, res) => {
+    const authHeader = req.headers.authorization;
+    const body = (req.body ?? {}) as {
+      idToken?: string;
+      fullName?: string;
+      username?: string;
+      bio?: string;
+      avatarUrl?: string;
+    };
+    const rawToken =
+      (authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : "") ||
+      String(body.idToken ?? "").trim();
+
+    if (!rawToken) {
+      res.status(400).json({ error: "Firebase ID token is required." });
+      return;
+    }
+
+    try {
+      const decoded = await getFirebaseAdminAuth().verifyIdToken(rawToken);
+      const fbUid = decoded.uid;
+      const decodedEmail = decoded.email ? normalizeEmail(decoded.email) : null;
+      const now = new Date().toISOString();
+
+      const rawPic =
+        (typeof decoded.picture === "string" && decoded.picture.startsWith("https://")
+          ? decoded.picture
+          : null) ||
+        (typeof body.avatarUrl === "string" && body.avatarUrl.startsWith("https://")
+          ? body.avatarUrl
+          : null);
+      const externalAvatar = rawPic ? rawPic.slice(0, 1024) : null;
+
+      const fbUserId = `fb_${fbUid}`;
+      let user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(fbUserId) as
+        DbUser | undefined;
+
+      if (!user && decodedEmail) {
+        user = db
+          .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1")
+          .get(decodedEmail) as DbUser | undefined;
+      }
+
+      let created = false;
+      if (!user) {
+        created = true;
+        const rawName = String(
+          body.fullName ||
+            decoded.name ||
+            (decodedEmail ? decodedEmail.split("@")[0] : "") ||
+            "Reader",
+        )
+          .trim()
+          .slice(0, 60);
+        const fullName = rawName.length >= 2 ? rawName : `${rawName} Reader`.slice(0, 60);
+
+        let finalHandle: string | null = null;
+        if (body.username) {
+          const candidate = normalizeHandle(body.username);
+          if (candidate) {
+            const exists = db
+              .prepare("SELECT id FROM users WHERE LOWER(display_handle) = LOWER(?) LIMIT 1")
+              .get(candidate);
+            if (!exists) finalHandle = candidate;
+          }
+        }
+        if (!finalHandle) {
+          finalHandle = makeUniqueHandle(fullName);
+        }
+
+        const bio = String(body.bio ?? "")
+          .trim()
+          .slice(0, 200);
+
+        db.prepare(
+          `INSERT INTO users (id, email, phone_e164, phone_verified, full_name, display_handle, bio, avatar_media_id, avatar_external_url, password_hash, theme, created_at, last_active_at)
+           VALUES (?, ?, NULL, 0, ?, ?, ?, NULL, ?, ?, 'instagram', ?, ?)`,
+        ).run(
+          fbUserId,
+          decodedEmail,
+          fullName,
+          finalHandle,
+          bio,
+          externalAvatar,
+          hashPassword(crypto.randomBytes(24).toString("hex")),
+          now,
+          now,
+        );
+
+        // Preserve any legacy firebase_nfc_links token for continuity, or create a fresh one
+        const legacyNfc = db
+          .prepare(
+            "SELECT token_ciphertext, token_hash, revoked, version, created_at, updated_at FROM firebase_nfc_links WHERE uid = ? LIMIT 1",
+          )
+          .get(fbUid) as
+          | {
+              token_ciphertext: string | null;
+              token_hash: string | null;
+              revoked: number;
+              version: number;
+              created_at: string;
+              updated_at: string;
+            }
+          | undefined;
+
+        if (
+          legacyNfc &&
+          legacyNfc.revoked === 0 &&
+          legacyNfc.token_ciphertext &&
+          legacyNfc.token_hash
+        ) {
+          db.prepare(
+            "INSERT OR IGNORE INTO nfc_links (id, user_id, token_ciphertext, token_hash, revoked, version, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+          ).run(
+            `nfc_${crypto.randomUUID()}`,
+            fbUserId,
+            legacyNfc.token_ciphertext,
+            legacyNfc.token_hash,
+            legacyNfc.version,
+            legacyNfc.created_at,
+            now,
+          );
+        } else {
+          createNfcTokenForUser(fbUserId);
+        }
+
+        user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(fbUserId) as DbUser;
+        broadcastEvent("user:registered", { user: toPublicUser(user, true) }, user.id);
+      } else {
+        db.prepare(
+          "UPDATE users SET last_active_at = ?, avatar_external_url = COALESCE(avatar_external_url, ?) WHERE id = ?",
+        ).run(now, externalAvatar, user.id);
+        const existingNfc = db
+          .prepare("SELECT id FROM nfc_links WHERE user_id = ? LIMIT 1")
+          .get(user.id);
+        if (!existingNfc) {
+          createNfcTokenForUser(user.id);
+        }
+        user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(user.id) as DbUser;
+      }
+
+      const token = issueSession(user.id, req, res);
+      res.status(created ? 201 : 200).json({
+        token,
+        created,
+        user: toSelfUser(user),
+      });
+    } catch (err) {
+      console.error("firebase-session error:", err);
+      res.status(401).json({ error: "Invalid Firebase ID token." });
+    }
+  });
+
   router.post("/auth/firebase-cookie", async (req, res) => {
     const authHeader = req.headers.authorization;
     const bodyToken = (req.body as { idToken?: string } | undefined)?.idToken;
@@ -647,6 +805,7 @@ export function createApiRouter() {
       const decoded = await getFirebaseAdminAuth().verifyIdToken(rawToken);
       const signed = signCookieToken(decoded.uid);
       const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
+      res.clearCookie("rc_session", { path: "/" });
       res.cookie("rc_fb_session", signed, {
         httpOnly: true,
         sameSite: isHttps ? "none" : "lax",
@@ -668,6 +827,30 @@ export function createApiRouter() {
     res.clearCookie("rc_session", { path: "/" });
     res.clearCookie("rc_fb_session", { path: "/" });
     res.json({ ok: true });
+  });
+
+  router.delete("/auth/account", requireAuth, (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const mediaRows = db
+      .prepare("SELECT file_path FROM media_objects WHERE owner_id = ?")
+      .all(me.id) as { file_path: string }[];
+
+    db.prepare("DELETE FROM users WHERE id = ?").run(me.id);
+
+    for (const m of mediaRows) {
+      if (!m.file_path) continue;
+      const diskPath = path.join(mediaDir, m.file_path);
+      try {
+        if (fs.existsSync(diskPath)) fs.unlinkSync(diskPath);
+      } catch {
+        /* ignore file cleanup errors */
+      }
+    }
+
+    res.clearCookie("rc_session", { path: "/" });
+    res.clearCookie("rc_fb_session", { path: "/" });
+    broadcastEvent("user:deleted", { userId: me.id }, me.id);
+    res.json({ ok: true, deletedUserId: me.id });
   });
 
   router.get("/auth/session", (req, res) => {
@@ -929,10 +1112,53 @@ export function createApiRouter() {
     });
   });
 
-  // Personal NFC Card & Secret Link Management
-  router.get("/nfc", requireAuth, (req: AuthedRequest, res) => {
-    const user = req.authUser!;
-    let row = db.prepare("SELECT * FROM nfc_links WHERE user_id = ?").get(user.id) as
+  // Personal NFC Card & Secret Link Management (supports SQLite sessions + Firebase users)
+  router.get("/nfc", async (req: AuthedRequest, res) => {
+    const resolved = lookupSessionUser(req);
+    if (resolved) {
+      const user = resolved.user;
+      let row = db.prepare("SELECT * FROM nfc_links WHERE user_id = ?").get(user.id) as
+        | {
+            token_ciphertext: string | null;
+            revoked: number;
+            version: number;
+            updated_at: string;
+          }
+        | undefined;
+
+      if (!row) {
+        createNfcTokenForUser(user.id);
+        row = db.prepare("SELECT * FROM nfc_links WHERE user_id = ?").get(user.id) as {
+          token_ciphertext: string | null;
+          revoked: number;
+          version: number;
+          updated_at: string;
+        };
+      }
+
+      const token =
+        row.revoked === 0 && row.token_ciphertext ? decryptToken(row.token_ciphertext) : null;
+
+      res.json({
+        revoked: row.revoked === 1 || !token,
+        version: row.version,
+        updatedAt: row.updated_at,
+        token,
+        path: token ? `/nfc/${token}` : null,
+      });
+      return;
+    }
+
+    const fbUid = await resolveFirebaseUid(req);
+    if (!fbUid) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    const hintName = String(req.query["fullName"] ?? "").trim();
+    const hintHandle = String(req.query["displayHandle"] ?? "").trim();
+
+    let fbRow = db.prepare("SELECT * FROM firebase_nfc_links WHERE uid = ?").get(fbUid) as
       | {
           token_ciphertext: string | null;
           revoked: number;
@@ -941,9 +1167,9 @@ export function createApiRouter() {
         }
       | undefined;
 
-    if (!row) {
-      createNfcTokenForUser(user.id);
-      row = db.prepare("SELECT * FROM nfc_links WHERE user_id = ?").get(user.id) as {
+    if (!fbRow) {
+      createFirebaseNfcToken(fbUid, hintName || "Reader", hintHandle);
+      fbRow = db.prepare("SELECT * FROM firebase_nfc_links WHERE uid = ?").get(fbUid) as {
         token_ciphertext: string | null;
         revoked: number;
         version: number;
@@ -952,20 +1178,43 @@ export function createApiRouter() {
     }
 
     const token =
-      row.revoked === 0 && row.token_ciphertext ? decryptToken(row.token_ciphertext) : null;
+      fbRow.revoked === 0 && fbRow.token_ciphertext ? decryptToken(fbRow.token_ciphertext) : null;
 
     res.json({
-      revoked: row.revoked === 1 || !token,
-      version: row.version,
-      updatedAt: row.updated_at,
+      revoked: fbRow.revoked === 1 || !token,
+      version: fbRow.version,
+      updatedAt: fbRow.updated_at,
       token,
       path: token ? `/nfc/${token}` : null,
     });
   });
 
-  router.post("/nfc/regenerate", requireAuth, (req: AuthedRequest, res) => {
-    const user = req.authUser!;
-    const { token, version } = createNfcTokenForUser(user.id);
+  router.post("/nfc/regenerate", async (req: AuthedRequest, res) => {
+    const resolved = lookupSessionUser(req);
+    if (resolved) {
+      const { token, version } = createNfcTokenForUser(resolved.user.id);
+      res.json({
+        revoked: false,
+        version,
+        updatedAt: new Date().toISOString(),
+        token,
+        path: `/nfc/${token}`,
+      });
+      return;
+    }
+
+    const fbUid = await resolveFirebaseUid(req);
+    if (!fbUid) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    const body = (req.body ?? {}) as { fullName?: string; displayHandle?: string };
+    const { token, version } = createFirebaseNfcToken(
+      fbUid,
+      String(body.fullName ?? "Reader"),
+      String(body.displayHandle ?? ""),
+    );
     res.json({
       revoked: false,
       version,
@@ -975,22 +1224,40 @@ export function createApiRouter() {
     });
   });
 
-  router.post("/nfc/revoke", requireAuth, (req: AuthedRequest, res) => {
-    const user = req.authUser!;
+  router.post("/nfc/revoke", async (req: AuthedRequest, res) => {
+    const resolved = lookupSessionUser(req);
     const now = new Date().toISOString();
+    if (resolved) {
+      db.prepare(
+        "UPDATE nfc_links SET revoked = 1, token_ciphertext = NULL, token_hash = NULL, updated_at = ? WHERE user_id = ?",
+      ).run(now, resolved.user.id);
+      res.json({ revoked: true, token: null, path: null, updatedAt: now });
+      return;
+    }
+
+    const fbUid = await resolveFirebaseUid(req);
+    if (!fbUid) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
     db.prepare(
-      "UPDATE nfc_links SET revoked = 1, token_ciphertext = NULL, token_hash = NULL, updated_at = ? WHERE user_id = ?",
-    ).run(now, user.id);
+      "UPDATE firebase_nfc_links SET revoked = 1, token_ciphertext = NULL, token_hash = NULL, updated_at = ? WHERE uid = ?",
+    ).run(now, fbUid);
     res.json({ revoked: true, token: null, path: null, updatedAt: now });
   });
 
   // Resolve NFC tap securely — NEVER exposes passwords, phone numbers, emails, or other user data
-  router.get("/nfc/resolve", (req, res) => {
+  router.get("/nfc/resolve", async (req, res) => {
     const token = String(req.query["token"] ?? "").trim();
     if (!token || token.length < 16) {
       res.status(404).json({ status: "invalid" });
       return;
     }
+
+    const tokenHash = sha256(token);
+    const resolved = lookupSessionUser(req);
+    const fbUid = await resolveFirebaseUid(req);
 
     const link = db
       .prepare(
@@ -1000,31 +1267,63 @@ export function createApiRouter() {
          WHERE n.token_hash = ? AND n.revoked = 0
          LIMIT 1`,
       )
-      .get(sha256(token)) as
+      .get(tokenHash) as
       { user_id: string; revoked: number; full_name: string; display_handle: string } | undefined;
 
-    if (!link) {
+    if (link) {
+      if (resolved && resolved.user.id === link.user_id) {
+        res.json({
+          status: "authorized",
+          owner: {
+            id: link.user_id,
+            fullName: link.full_name,
+            displayHandle: link.display_handle,
+          },
+        });
+        return;
+      }
+
+      const initial = link.full_name.trim().slice(0, 1).toUpperCase() || "R";
+      res.json({
+        status: "login_required",
+        signedInAsDifferentAccount: Boolean(
+          (resolved && resolved.user.id !== link.user_id) || fbUid,
+        ),
+        ownerHint: `${initial}***`,
+      });
+      return;
+    }
+
+    const fbLink = db
+      .prepare(
+        `SELECT uid, full_name, display_handle
+         FROM firebase_nfc_links
+         WHERE token_hash = ? AND revoked = 0
+         LIMIT 1`,
+      )
+      .get(tokenHash) as { uid: string; full_name: string; display_handle: string } | undefined;
+
+    if (!fbLink) {
       res.status(404).json({ status: "invalid" });
       return;
     }
 
-    const resolved = lookupSessionUser(req);
-    if (resolved && resolved.user.id === link.user_id) {
+    if (fbUid && fbUid === fbLink.uid) {
       res.json({
         status: "authorized",
         owner: {
-          id: link.user_id,
-          fullName: link.full_name,
-          displayHandle: link.display_handle,
+          id: fbLink.uid,
+          fullName: fbLink.full_name,
+          displayHandle: fbLink.display_handle,
         },
       });
       return;
     }
 
-    const initial = link.full_name.trim().slice(0, 1).toUpperCase() || "R";
+    const initial = fbLink.full_name.trim().slice(0, 1).toUpperCase() || "R";
     res.json({
       status: "login_required",
-      signedInAsDifferentAccount: Boolean(resolved && resolved.user.id !== link.user_id),
+      signedInAsDifferentAccount: Boolean((fbUid && fbUid !== fbLink.uid) || resolved),
       ownerHint: `${initial}***`,
     });
   });
@@ -1046,7 +1345,7 @@ export function createApiRouter() {
            WHERE id != ?
              AND (LOWER(full_name) LIKE ? OR LOWER(display_handle) LIKE ? OR LOWER(bio) LIKE ?)
            ORDER BY last_active_at DESC
-           LIMIT 100`,
+           LIMIT 500`,
         )
         .all(me.id, like, like, like) as DbUser[];
     } else {
@@ -1055,7 +1354,7 @@ export function createApiRouter() {
           `SELECT * FROM users
            WHERE id != ?
            ORDER BY last_active_at DESC
-           LIMIT 100`,
+           LIMIT 500`,
         )
         .all(me.id) as DbUser[];
     }
@@ -1087,7 +1386,7 @@ export function createApiRouter() {
     const raw = String(req.query["q"] ?? "").trim();
     if (!raw) {
       const recent = db
-        .prepare("SELECT * FROM users WHERE id != ? ORDER BY last_active_at DESC LIMIT 30")
+        .prepare("SELECT * FROM users WHERE id != ? ORDER BY last_active_at DESC LIMIT 100")
         .all(me.id) as DbUser[];
       const visible = recent
         .filter((u) => !didUserBlock(u.id, me.id))

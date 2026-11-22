@@ -36,6 +36,7 @@ import { toast } from "sonner";
 import { BookCover } from "@/components/BookCover";
 import { MediaLightbox } from "@/components/InstagramChatView";
 import { ProtectedImage, ProtectedVideo } from "@/components/ProtectedMedia";
+import { CopyPersonalLinkButton, GoToReadingButton } from "@/components/SecretPageActions";
 import { bookById } from "@/lib/books";
 import {
   changePassword,
@@ -344,10 +345,10 @@ export function InstagramProfileView({
   }
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-5 pb-28 md:px-8 md:py-7 md:pb-10">
+    <div className="flex-1 overflow-y-auto px-4 py-5 pb-36 md:px-8 md:py-7 md:pb-24">
       <div className="mx-auto max-w-3xl space-y-5">
         {/* Top Profile Utility Bar with Back to Chat */}
-        <div className="flex items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2.5">
           <button
             type="button"
             onClick={() => {
@@ -367,7 +368,8 @@ export function InstagramProfileView({
             <span>Back to Chat</span>
           </button>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <CopyPersonalLinkButton theme={theme} size="sm" label="Copy Link" />
             {onOpenDiscover ? (
               <button
                 type="button"
@@ -392,16 +394,6 @@ export function InstagramProfileView({
                 <span>Discover</span>
               </Link>
             )}
-            <Link
-              to="/home"
-              className={cn(
-                "glass-sheen inline-flex min-h-[42px] items-center gap-1.5 rounded-full border px-4 text-xs font-bold transition hover:scale-[1.02]",
-                theme.glassPill,
-              )}
-            >
-              <BookOpen className="size-4" />
-              <span>Library</span>
-            </Link>
           </div>
         </div>
 
@@ -1268,17 +1260,7 @@ export function InstagramProfileView({
 
             {/* Account Navigation & Sign Out */}
             <div className="grid gap-2.5 sm:grid-cols-2">
-              <button
-                type="button"
-                onClick={() => navigate({ to: "/home" })}
-                className={cn(
-                  "inline-flex min-h-[46px] items-center justify-center gap-2 rounded-2xl border text-xs font-bold",
-                  theme.surface,
-                  theme.border,
-                )}
-              >
-                <BookOpen className="size-4" /> Back to Reading Corner
-              </button>
+              <GoToReadingButton size="md" className="min-h-[46px] w-full" />
               <button
                 type="button"
                 onClick={() =>
@@ -1286,7 +1268,7 @@ export function InstagramProfileView({
                     navigate({ to: "/auth", replace: true });
                   })
                 }
-                className="inline-flex min-h-[46px] items-center justify-center gap-2 rounded-2xl bg-rose-600 text-xs font-bold text-white"
+                className="inline-flex min-h-[46px] items-center justify-center gap-2 rounded-full bg-rose-600 text-xs font-bold text-white"
               >
                 <LogOut className="size-4" /> Log Out
               </button>

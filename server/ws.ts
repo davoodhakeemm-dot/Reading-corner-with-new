@@ -1,11 +1,13 @@
+import crypto from "node:crypto";
 import type { IncomingMessage, Server as HttpServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 
-import { db, isBlockedBetween, sha256, threadKeyFor, type DbUser } from "./db";
+import { db, isBlockedBetween, sha256, threadKeyFor, toPublicUser, type DbUser } from "./db";
 
 type ClientSocket = WebSocket & { userId?: string; isAlive?: boolean };
 
 const userSockets = new Map<string, Set<ClientSocket>>();
+const activeCallPeers = new Map<string, { callId: string; peerId: string }>();
 
 export function isUserConnected(userId: string): boolean {
   const set = userSockets.get(userId);
@@ -19,6 +21,18 @@ export function sendToUser(userId: string, event: string, payload: unknown) {
   for (const ws of set) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(serialized);
+    }
+  }
+}
+
+export function broadcastEvent(event: string, payload: unknown, excludeUserId?: string) {
+  const serialized = JSON.stringify({ event, payload });
+  for (const [connectedUserId, set] of userSockets.entries()) {
+    if (excludeUserId && connectedUserId === excludeUserId) continue;
+    for (const ws of set) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(serialized);
+      }
     }
   }
 }
@@ -201,43 +215,65 @@ export function attachWebSocketServer(httpServer: HttpServer) {
             );
             return;
           }
-          const caller = db
-            .prepare(
-              "SELECT id, full_name, display_handle, avatar_media_id FROM users WHERE id = ?",
-            )
-            .get(userId) as
-            | {
-                id: string;
-                full_name: string;
-                display_handle: string;
-                avatar_media_id: string | null;
-              }
-            | undefined;
-          if (!caller) return;
-          const callId = `call_${Date.now().toString(36)}`;
-          sendToUser(targetId, "call:incoming", {
+          const caller = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(userId) as
+            DbUser | undefined;
+          const target = db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(targetId) as
+            { id: string } | undefined;
+          if (!caller || !target) {
+            ws.send(
+              JSON.stringify({
+                event: "call:error",
+                payload: { error: "Recipient account not found." },
+              }),
+            );
+            return;
+          }
+          const rawCallId = typeof payload["callId"] === "string" ? payload["callId"].trim() : "";
+          const callId =
+            rawCallId && /^[a-zA-Z0-9_-]{4,64}$/.test(rawCallId)
+              ? rawCallId
+              : `call_${crypto.randomUUID()}`;
+          const recipientOnline = isUserConnected(targetId);
+
+          activeCallPeers.set(userId, { callId, peerId: targetId });
+          if (recipientOnline) {
+            sendToUser(targetId, "call:incoming", {
+              callId,
+              callType,
+              from: toPublicUser(caller, true, targetId),
+            });
+          }
+          sendToUser(userId, "call:ringing", {
             callId,
+            targetId,
             callType,
-            from: {
-              id: caller.id,
-              fullName: caller.full_name,
-              displayHandle: caller.display_handle,
-              avatarUrl: caller.avatar_media_id ? `/api/media/${caller.avatar_media_id}` : null,
-            },
+            recipientOnline,
           });
-          ws.send(
-            JSON.stringify({ event: "call:ringing", payload: { callId, targetId, callType } }),
-          );
           return;
         }
 
         if (event === "call:signal") {
           const targetId = typeof payload["targetId"] === "string" ? payload["targetId"] : "";
-          if (!targetId || isBlockedBetween(userId, targetId)) return;
+          const callId = typeof payload["callId"] === "string" ? payload["callId"] : "";
+          const action = typeof payload["action"] === "string" ? payload["action"] : "";
+          if (!targetId || !action || isBlockedBetween(userId, targetId)) return;
+
+          if (action === "accepted") {
+            activeCallPeers.set(userId, { callId, peerId: targetId });
+            activeCallPeers.set(targetId, { callId, peerId: userId });
+          } else if (action === "declined" || action === "ended" || action === "busy") {
+            const mine = activeCallPeers.get(userId);
+            if (!mine || mine.callId === callId) activeCallPeers.delete(userId);
+            const theirs = activeCallPeers.get(targetId);
+            if (theirs && theirs.callId === callId) activeCallPeers.delete(targetId);
+          }
+
           sendToUser(targetId, "call:signal", {
             fromUserId: userId,
-            callId: payload["callId"],
-            action: payload["action"],
+            callId,
+            action,
+            sdp: payload["sdp"] ?? null,
+            candidate: payload["candidate"] ?? null,
           });
         }
       } catch {
@@ -251,6 +287,21 @@ export function attachWebSocketServer(httpServer: HttpServer) {
         current.delete(ws);
         if (current.size === 0) {
           userSockets.delete(userId);
+          const activeCall = activeCallPeers.get(userId);
+          if (activeCall) {
+            activeCallPeers.delete(userId);
+            const peerActive = activeCallPeers.get(activeCall.peerId);
+            if (peerActive && peerActive.callId === activeCall.callId) {
+              activeCallPeers.delete(activeCall.peerId);
+            }
+            sendToUser(activeCall.peerId, "call:signal", {
+              fromUserId: userId,
+              callId: activeCall.callId,
+              action: "ended",
+              sdp: null,
+              candidate: null,
+            });
+          }
           broadcastPresence(userId, false);
         }
       }
@@ -268,7 +319,11 @@ export function attachWebSocketServer(httpServer: HttpServer) {
       client.ping();
     }
   }, 30_000);
+  interval.unref();
 
+  httpServer.once("close", () => {
+    wss.close();
+  });
   wss.on("close", () => clearInterval(interval));
   return wss;
 }

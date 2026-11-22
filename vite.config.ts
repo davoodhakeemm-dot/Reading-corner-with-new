@@ -6,6 +6,7 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
     vite: { installDevServerMiddleware: true },
+    router: { autoCodeSplitting: false },
   },
   nitro: {
     preset: process.env["VERCEL"] === "1" ? "vercel" : "node-server",

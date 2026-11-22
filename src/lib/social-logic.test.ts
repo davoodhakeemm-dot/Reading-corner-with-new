@@ -152,3 +152,28 @@ test("filterConversationsByTab filters unread conversations cleanly", () => {
     ["c2", "c3"],
   );
 });
+
+test("isDynamicImportError and isFirebaseOfflineError classify transient network failures", async () => {
+  const { isDynamicImportError, isFirebaseOfflineError } = await import("./social-logic");
+  assert.equal(
+    isDynamicImportError(
+      new TypeError(
+        "Failed to fetch dynamically imported module: https://app/src/routes/index.tsx",
+      ),
+    ),
+    true,
+  );
+  assert.equal(isDynamicImportError(new Error("Unexpected render bug")), false);
+
+  assert.equal(
+    isFirebaseOfflineError(new Error("Failed to get document because the client is offline.")),
+    true,
+  );
+  assert.equal(
+    isFirebaseOfflineError(
+      Object.assign(new Error("net"), { code: "auth/network-request-failed" }),
+    ),
+    true,
+  );
+  assert.equal(isFirebaseOfflineError(new Error("Missing or insufficient permissions.")), false);
+});
