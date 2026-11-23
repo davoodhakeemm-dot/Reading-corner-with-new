@@ -590,28 +590,8 @@ export function StartupPermissionsPrompt() {
   const [busyKind, setBusyKind] = useState<AppPermissionKind | "all" | null>(null);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (hasPromptedStartupPermissions()) return;
-
-    let cancelled = false;
-    const isRootSplash = window.location.pathname === "/";
-    const timer = window.setTimeout(
-      () => {
-        void queryAllAppPermissions().then((next) => {
-          if (cancelled) return;
-          setSnapshot(next);
-          if (shouldShowStartupPermissions(next, hasPromptedStartupPermissions())) {
-            setOpen(true);
-          }
-        });
-      },
-      isRootSplash ? 1400 : 450,
-    );
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
+    // Permissions are requested only from the feature that needs them; never on app startup.
+    return;
   }, []);
 
   useEffect(() => {

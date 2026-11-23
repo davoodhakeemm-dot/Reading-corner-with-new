@@ -76,6 +76,7 @@ import {
   type PublicAccount,
 } from "@/lib/chat-store";
 import { stopVibration } from "@/lib/alerts";
+import { requestFeatureMediaPermission } from "@/lib/permissions";
 import { computeChatKeyboardLayout, type ChatKeyboardLayout } from "@/lib/chat-viewport";
 import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
 import {
@@ -669,6 +670,15 @@ export function InstagramChatView({
     }
     if (!activePeerId) return;
     try {
+      const permission = await requestFeatureMediaPermission("microphone");
+      if (permission !== "granted") {
+        toast.info(
+          permission === "denied"
+            ? "Microphone access is blocked. Enable it in Android Settings → Apps → Chrome → Permissions, then retry."
+            : "Voice recording was not started. You can allow microphone access the next time you record.",
+        );
+        return;
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const rec = new MediaRecorder(stream);
       const chunks: Blob[] = [];
@@ -822,6 +832,20 @@ export function InstagramChatView({
   async function handleStartCall(callType: "audio" | "video") {
     if (!activePeer) return;
     try {
+      const microphone = await requestFeatureMediaPermission("microphone");
+      if (microphone !== "granted") {
+        toast.info(
+          "Microphone access is needed for calls. Enable it in Android Settings → Apps → Chrome → Permissions and retry.",
+        );
+        return;
+      }
+      if (callType === "video") {
+        const camera = await requestFeatureMediaPermission("camera");
+        if (camera !== "granted") {
+          toast.info("Camera access is needed for video calls. You can still place an audio call.");
+          return;
+        }
+      }
       await initiateCall(activePeer, callType);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Cannot initiate call.");
