@@ -65,7 +65,7 @@ function statusBadge(status: AppPermissionState) {
     };
   }
   return {
-    label: "Turn On When Needed",
+    label: "Not Allowed Yet",
     className: "bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30",
   };
 }
@@ -590,8 +590,15 @@ export function StartupPermissionsPrompt() {
   const [busyKind, setBusyKind] = useState<AppPermissionKind | "all" | null>(null);
 
   useEffect(() => {
-    // Permissions are requested only from the feature that needs them; never on app startup.
-    return;
+    let cancelled = false;
+    void queryAllAppPermissions().then((next) => {
+      if (cancelled) return;
+      setSnapshot(next);
+      setOpen(true);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -681,7 +688,9 @@ export function StartupPermissionsPrompt() {
                     Enable App Permissions
                   </h2>
                   <p className="text-xs text-muted-foreground">
-                    Grant microphone, camera, and notification access first
+                    Choose microphone, camera, and notification access for this app. Tap Allow All
+                    to review each Android/browser prompt; permissions already allowed stay enabled
+                    until revoked in site settings.
                   </p>
                 </div>
               </div>
