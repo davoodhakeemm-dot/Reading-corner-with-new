@@ -1,5 +1,6 @@
 import {
   createUserWithEmailAndPassword,
+  deleteUser,
   onAuthStateChanged,
   reauthenticateWithCredential,
   EmailAuthProvider,
@@ -1392,13 +1393,47 @@ export async function loginAccount(input: {
   countryCode?: string;
   password: string;
 }): Promise<PublicAccount> {
-  const rawId = (input.email ?? input.identifier ?? "").trim();
-  const cleanEmail = normalizeEmail(rawId);
-  if (!cleanEmail) {
+  const rawId = (input.email ?? input.identifier ?? input.phone ?? "").trim();
+  if (!rawId) {
     throw new Error(
-      "Please enter the email address for your account (or use Continue with Google).",
+      "Please enter your email, username, or phone number (or use Continue with Google).",
     );
   }
+
+  let targetEmail = rawId;
+  const db = getFirebaseDb();
+
+  if (!rawId.includes("@")) {
+    try {
+      const usersRef = collection(db, "users_public");
+      // 1. Try matching phone
+      const phoneSnap = await getDocs(query(usersRef, where("phone", "==", rawId)));
+      if (!phoneSnap.empty) {
+        const data = phoneSnap.docs[0]?.data() as { email?: string } | undefined;
+        if (data?.email) targetEmail = data.email;
+      } else {
+        // 2. Try matching username / displayHandle
+        const cleanHandle = rawId.replace(/^@+/, "").toLowerCase();
+        const handleSnap = await getDocs(
+          query(usersRef, where("displayHandle", "==", `@${cleanHandle}`)),
+        );
+        if (!handleSnap.empty) {
+          const data = handleSnap.docs[0]?.data() as { email?: string } | undefined;
+          if (data?.email) targetEmail = data.email;
+        } else {
+          const nameSnap = await getDocs(query(usersRef, where("username", "==", cleanHandle)));
+          if (!nameSnap.empty) {
+            const data = nameSnap.docs[0]?.data() as { email?: string } | undefined;
+            if (data?.email) targetEmail = data.email;
+          }
+        }
+      }
+    } catch {
+      // fallback to rawId as email
+    }
+  }
+
+  const cleanEmail = normalizeEmail(targetEmail) ?? targetEmail;
   const auth = getFirebaseAuth();
   try {
     const cred = await signInWithEmailAndPassword(auth, cleanEmail, input.password);
@@ -1455,6 +1490,68 @@ export async function logout() {
     outgoingCall: null,
     incomingMessageAlert: null,
   });
+}
+
+export async function deleteAccount(password: string): Promise<void> {
+  const auth = getFirebaseAuth();
+  const user = auth.currentUser;
+  if (!user) throw new Error("No authenticated user.");
+  if (!user.email) throw new Error("Account email not found.");
+
+  try {
+    const cred = EmailAuthProvider.credential(user.email, password);
+    await reauthenticateWithCredential(user, cred);
+  } catch {
+    throw new Error(
+      "Incorrect password. Please enter your correct password to confirm account deletion.",
+    );
+  }
+
+  const db = getFirebaseDb();
+  const uid = user.uid;
+
+  await deleteDoc(doc(db, "users_public", uid)).catch(() => {});
+  await deleteDoc(doc(db, "users_private", uid)).catch(() => {});
+
+  await deleteUser(user);
+  await logout();
+}
+
+export async function removeAllUsersAndData(): Promise<void> {
+  const db = getFirebaseDb();
+  const collectionsToClean = [
+    "users_public",
+    "users_private",
+    "conversations",
+    "follows",
+    "blocks",
+    "handles",
+    "reports",
+    "reading_state",
+  ];
+
+  try {
+    for (const colName of collectionsToClean) {
+      const snap = await getDocs(collection(db, colName));
+      const batch = writeBatch(db);
+      let count = 0;
+      for (const d of snap.docs) {
+        batch.delete(d.ref);
+        count++;
+        if (count >= 400) {
+          await batch.commit();
+          count = 0;
+        }
+      }
+      if (count > 0) {
+        await batch.commit();
+      }
+    }
+  } catch (err) {
+    console.error("Error removing all users and data:", err);
+  }
+
+  await logout();
 }
 
 // Legacy OTP stubs kept for compatibility with profile/NFC components without breaking imports

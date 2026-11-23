@@ -776,8 +776,10 @@ function AuthPage() {
                     inputMode={mode === "login" ? "text" : "email"}
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder={mode === "login" ? "Email or @username *" : "Email address *"}
-                    aria-label={mode === "login" ? "Email or @username" : "Email address"}
+                    placeholder={
+                      mode === "login" ? "Email, @username, or Phone *" : "Email address *"
+                    }
+                    aria-label={mode === "login" ? "Email, @username, or Phone" : "Email address"}
                     autoComplete={mode === "login" ? "username" : "email"}
                     className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
                   />

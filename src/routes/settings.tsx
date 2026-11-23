@@ -1,9 +1,12 @@
-import { Link, createFileRoute } from "@tanstack/react-router";
+import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
 import { InstallApp } from "@/components/InstallApp";
-import { RotateCcw } from "lucide-react";
+import { RotateCcw, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { toast } from "sonner";
 
 import { AppShell, PageHeader } from "@/components/AppShell";
 import { DevicePermissionsCard } from "@/components/StartupPermissionsPrompt";
+import { removeAllUsersAndData, useChat } from "@/lib/chat-store";
 import { useLibrary } from "@/lib/library-store";
 import { cn } from "@/lib/utils";
 
@@ -14,7 +17,7 @@ export const Route = createFileRoute("/settings")({
       {
         name: "description",
         content:
-          "Control app appearance, reading defaults, notifications and reset your local reading data.",
+          "Control app appearance, reading defaults, notifications, account settings and reset reading data.",
       },
       { property: "og:title", content: "Settings — Reading Corner" },
       { property: "og:description", content: "Tune Reading Corner to the way you read." },
@@ -26,12 +29,79 @@ export const Route = createFileRoute("/settings")({
 });
 
 function SettingsPage() {
+  const navigate = useNavigate();
   const { state, update, setReader, reset } = useLibrary();
+  const { me, logout, deleteAccount, sendPasswordReset, changePassword } = useChat();
+
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [deletePassword, setDeletePassword] = useState("");
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [currentPw, setCurrentPw] = useState("");
+  const [newPw, setNewPw] = useState("");
 
   return (
     <AppShell>
       <div className="mx-auto max-w-2xl space-y-6 px-4 py-5 sm:px-6">
-        <PageHeader title="Settings" subtitle="Appearance, reading defaults and data." />
+        <PageHeader title="Settings" subtitle="Appearance, reading defaults, account and data." />
+
+        {me && (
+          <Card title="Account Management">
+            <div className="space-y-3">
+              <div className="flex items-center justify-between text-sm">
+                <div>
+                  <p className="font-semibold">{me.fullName}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {me.email ?? me.phoneMasked ?? me.displayHandle}
+                  </p>
+                </div>
+                <button
+                  onClick={async () => {
+                    await logout();
+                    toast.success("Signed out successfully.");
+                    navigate({ to: "/auth", replace: true });
+                  }}
+                  className="press rounded-full bg-secondary px-3 py-1.5 text-xs font-bold text-secondary-foreground"
+                >
+                  Log Out
+                </button>
+              </div>
+
+              <div className="flex flex-wrap gap-2 pt-2 border-t border-border/50">
+                <button
+                  onClick={() => setShowPasswordModal(true)}
+                  className="press rounded-full bg-secondary px-3.5 py-2 text-xs font-bold text-secondary-foreground"
+                >
+                  Change Password
+                </button>
+                <button
+                  onClick={async () => {
+                    if (!me.email) {
+                      toast.error("No email associated with this account for password reset.");
+                      return;
+                    }
+                    try {
+                      await sendPasswordReset(me.email);
+                      toast.success(`Password reset email sent to ${me.email}`);
+                    } catch (err) {
+                      toast.error(
+                        err instanceof Error ? err.message : "Could not send reset email.",
+                      );
+                    }
+                  }}
+                  className="press rounded-full bg-secondary px-3.5 py-2 text-xs font-bold text-secondary-foreground"
+                >
+                  Forgot Password
+                </button>
+                <button
+                  onClick={() => setShowDeleteModal(true)}
+                  className="press rounded-full bg-rose-600 px-3.5 py-2 text-xs font-bold text-white hover:bg-rose-500"
+                >
+                  Delete Account
+                </button>
+              </div>
+            </div>
+          </Card>
+        )}
 
         <Card title="Appearance">
           <Row label="App theme">
@@ -120,67 +190,163 @@ function SettingsPage() {
           <p className="text-sm text-muted-foreground">
             Your progress, favorites and bookmarks are stored on this device only.
           </p>
-          <button
-            onClick={() => reset()}
-            className="press mt-3 inline-flex items-center gap-2 rounded-full bg-destructive px-4 py-2 text-xs font-bold text-destructive-foreground"
-          >
-            <RotateCcw className="size-3.5" /> Reset all reading data
-          </button>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              onClick={() => reset()}
+              className="press inline-flex items-center gap-2 rounded-full bg-destructive px-4 py-2 text-xs font-bold text-destructive-foreground"
+            >
+              <RotateCcw className="size-3.5" /> Reset all reading data
+            </button>
+            <button
+              onClick={async () => {
+                if (
+                  window.confirm(
+                    "Are you sure you want to remove all users and reset the database? All registered accounts and database records will be permanently deleted.",
+                  )
+                ) {
+                  try {
+                    await removeAllUsersAndData();
+                    toast.success("All users and database records removed.");
+                    navigate({ to: "/auth", replace: true });
+                  } catch (err) {
+                    toast.error(err instanceof Error ? err.message : "Could not remove all users.");
+                  }
+                }
+              }}
+              className="press inline-flex items-center gap-2 rounded-full bg-rose-600 px-4 py-2 text-xs font-bold text-white shadow-md hover:bg-rose-500"
+            >
+              <Trash2 className="size-3.5" /> Remove all users &amp; database
+            </button>
+          </div>
         </Card>
       </div>
+
+      {showDeleteModal && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-3xl bg-card p-6 shadow-2xl space-y-4">
+            <h3 className="text-lg font-bold text-rose-600">Permanently Delete Account?</h3>
+            <p className="text-sm text-muted-foreground">
+              Are you sure you want to permanently delete your account? All your profile data, chat
+              messages, and personal information will be permanently removed according to our
+              data-retention policy. This action cannot be undone.
+            </p>
+            <div>
+              <label className="mb-1 block text-xs font-semibold">
+                Enter your password to confirm:
+              </label>
+              <input
+                type="password"
+                value={deletePassword}
+                onChange={(e) => setDeletePassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full rounded-xl border border-border bg-background px-3.5 py-2 text-sm"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                onClick={() => {
+                  setShowDeleteModal(false);
+                  setDeletePassword("");
+                }}
+                className="press rounded-full bg-secondary px-4 py-2 text-xs font-bold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  try {
+                    await deleteAccount(deletePassword);
+                    toast.success("Account permanently deleted.");
+                    navigate({ to: "/auth", replace: true });
+                  } catch (err) {
+                    toast.error(err instanceof Error ? err.message : "Deletion failed.");
+                  }
+                }}
+                className="press rounded-full bg-rose-600 px-4 py-2 text-xs font-bold text-white"
+              >
+                Confirm Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showPasswordModal && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-3xl bg-card p-6 shadow-2xl space-y-4">
+            <h3 className="text-lg font-bold">Change Password</h3>
+            <div className="space-y-3">
+              <div>
+                <label className="mb-1 block text-xs font-semibold">Current Password</label>
+                <input
+                  type="password"
+                  value={currentPw}
+                  onChange={(e) => setCurrentPw(e.target.value)}
+                  className="w-full rounded-xl border border-border bg-background px-3.5 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-semibold">
+                  New Password (at least 8 chars)
+                </label>
+                <input
+                  type="password"
+                  value={newPw}
+                  onChange={(e) => setNewPw(e.target.value)}
+                  className="w-full rounded-xl border border-border bg-background px-3.5 py-2 text-sm"
+                />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                onClick={() => {
+                  setShowPasswordModal(false);
+                  setCurrentPw("");
+                  setNewPw("");
+                }}
+                className="press rounded-full bg-secondary px-4 py-2 text-xs font-bold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  try {
+                    await changePassword(currentPw, newPw);
+                    toast.success("Password changed successfully.");
+                    setShowPasswordModal(false);
+                    setCurrentPw("");
+                    setNewPw("");
+                  } catch (err) {
+                    toast.error(err instanceof Error ? err.message : "Could not change password.");
+                  }
+                }}
+                className="press rounded-full bg-brand px-4 py-2 text-xs font-bold text-primary-foreground"
+              >
+                Update Password
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </AppShell>
   );
 }
 
 function Card({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section className="space-y-4 rounded-3xl bg-card p-5 shadow-soft">
-      <h2 className="font-display text-base font-bold">{title}</h2>
-      {children}
-    </section>
+    <div className="rounded-3xl bg-card p-5 shadow-soft sm:p-6">
+      <h2 className="mb-4 font-display text-base font-bold sm:text-lg">{title}</h2>
+      <div className="space-y-4">{children}</div>
+    </div>
   );
 }
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div>
-      <p className="mb-2 text-xs font-semibold text-muted-foreground">{label}</p>
+    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+      <span className="text-sm font-medium text-muted-foreground">{label}</span>
       {children}
     </div>
-  );
-}
-
-function Toggle({
-  label,
-  checked,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <button
-      onClick={() => onChange(!checked)}
-      role="switch"
-      aria-checked={checked}
-      className="flex w-full items-center justify-between gap-3 text-left"
-    >
-      <span className="text-sm font-medium">{label}</span>
-      <span
-        className={cn(
-          "relative h-6 w-11 shrink-0 rounded-full transition-colors",
-          checked ? "bg-brand" : "bg-secondary",
-        )}
-      >
-        <span
-          className={cn(
-            "absolute top-0.5 size-5 rounded-full bg-card shadow transition-all",
-            checked ? "left-[22px]" : "left-0.5",
-          )}
-        />
-      </span>
-    </button>
   );
 }
 
@@ -194,21 +360,43 @@ function Segmented({
   onChange: (v: string) => void;
 }) {
   return (
-    <div className="flex gap-2">
+    <div className="flex rounded-2xl bg-secondary p-1">
       {options.map((o) => (
         <button
           key={o.value}
           onClick={() => onChange(o.value)}
           className={cn(
-            "press flex-1 rounded-full px-3 py-2 text-xs font-bold transition-colors",
+            "press rounded-xl px-3.5 py-1.5 text-xs font-bold transition-colors",
             value === o.value
-              ? "bg-brand text-primary-foreground"
-              : "bg-secondary text-secondary-foreground",
+              ? "bg-brand text-primary-foreground shadow-soft"
+              : "text-muted-foreground hover:text-foreground",
           )}
         >
           {o.label}
         </button>
       ))}
     </div>
+  );
+}
+
+function Toggle({
+  label,
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  label: string;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex cursor-pointer items-center justify-between">
+      <span className="text-sm font-medium text-muted-foreground">{label}</span>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="size-4 rounded border-border accent-brand"
+      />
+    </label>
   );
 }

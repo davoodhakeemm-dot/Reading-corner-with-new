@@ -1,7 +1,18 @@
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import { MessageCircle, Phone, PhoneOff, Video, X } from "lucide-react";
+import {
+  Camera,
+  CameraOff,
+  MessageCircle,
+  Mic,
+  MicOff,
+  Phone,
+  PhoneOff,
+  Volume2,
+  Video,
+  X,
+} from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { CallMedia } from "@/components/CallMedia";
 import {
@@ -26,8 +37,33 @@ export function GlobalCallAndAlertLayer() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const { me, incomingCall, outgoingCall, incomingMessageAlert, soundEnabled } = useChat();
 
+  const [micMuted, setMicMuted] = useState(false);
+  const [videoOff, setVideoOff] = useState(false);
+  const [speakerOn, setSpeakerOn] = useState(true);
+  const [seconds, setSeconds] = useState(0);
+
   const isOnChatSurface = pathname.startsWith("/messages") || pathname.startsWith("/chat");
   const theme = getSecretTheme(me?.theme);
+
+  const isConnected = outgoingCall?.status === "accepted";
+
+  // Call duration timer
+  useEffect(() => {
+    if (!isConnected) {
+      setSeconds(0);
+      return;
+    }
+    const timerId = window.setInterval(() => {
+      setSeconds((s) => s + 1);
+    }, 1000);
+    return () => window.clearInterval(timerId);
+  }, [isConnected]);
+
+  const formatDuration = (sec: number) => {
+    const mins = Math.floor(sec / 60);
+    const rem = sec % 60;
+    return `${String(mins).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
+  };
 
   // Repeating vibration + ringtone + OS notification while an incoming call is ringing
   useEffect(() => {
@@ -96,6 +132,17 @@ export function GlobalCallAndAlertLayer() {
       void navigate({ to: "/messages" });
     }
   }
+
+  const activePeerData = incomingCall
+    ? incomingCall.from
+    : outgoingCall
+      ? outgoingCall.target
+      : null;
+  const isVideo = incomingCall
+    ? incomingCall.callType === "video"
+    : outgoingCall
+      ? outgoingCall.callType === "video"
+      : false;
 
   return (
     <>
@@ -175,9 +222,9 @@ export function GlobalCallAndAlertLayer() {
         )}
       </AnimatePresence>
 
-      {/* Real-time Incoming / Outgoing Call Modal (Available on Chat & Reading Pages) */}
+      {/* Full-Screen Immersive Call Interface (WhatsApp / Instagram Style) */}
       <AnimatePresence>
-        {(incomingCall || outgoingCall) && (
+        {(incomingCall || outgoingCall) && activePeerData && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -185,132 +232,147 @@ export function GlobalCallAndAlertLayer() {
             role="dialog"
             aria-modal="true"
             aria-label={incomingCall ? "Incoming call" : "Active call"}
-            className="fixed inset-0 z-[70] grid place-items-center bg-black/75 p-4 backdrop-blur-lg"
+            className="fixed inset-0 z-[80] flex flex-col justify-between bg-zinc-950 p-6 text-white md:p-12"
           >
-            <motion.div
-              initial={{ scale: 0.92, opacity: 0, y: 12 }}
-              animate={{ scale: 1, opacity: 1, y: 0 }}
-              exit={{ scale: 0.92, opacity: 0, y: 12 }}
-              className={cn(
-                "glass-sheen w-full max-w-sm rounded-[32px] border p-6 text-center backdrop-blur-2xl",
-                theme.surfaceGlass,
-                theme.border,
-              )}
-            >
-              {incomingCall ? (
-                <>
-                  <div className="relative mx-auto w-fit">
-                    <span className="absolute -inset-2 animate-ping rounded-full bg-emerald-500/25" />
-                    <div
-                      className={cn(
-                        "relative grid size-20 place-items-center overflow-hidden rounded-full text-xl font-bold shadow-lg",
-                        theme.accentBg,
-                      )}
-                    >
-                      {incomingCall.from.avatarUrl ? (
-                        <img
-                          src={incomingCall.from.avatarUrl}
-                          alt={incomingCall.from.fullName}
-                          className="size-full object-cover"
-                        />
-                      ) : incomingCall.callType === "video" ? (
-                        <Video className="size-8" />
-                      ) : (
-                        <Phone className="size-8" />
-                      )}
-                    </div>
-                  </div>
-
-                  <p className="mt-4 font-display text-xl font-extrabold">
-                    {incomingCall.from.fullName}
-                  </p>
-                  <p className={cn("mt-1 text-xs font-semibold", theme.mutedText)}>
-                    Incoming {incomingCall.callType} call…
-                  </p>
-                  <span className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-3 py-1 text-[11px] font-bold text-emerald-500">
-                    <span className="size-2 animate-pulse rounded-full bg-emerald-500" />
-                    Ringing &amp; vibrating
-                  </span>
-
-                  <div className="mt-6 grid grid-cols-2 gap-3">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        stopVibration();
-                        respondToCall(incomingCall.callId, incomingCall.from.id, "declined");
-                      }}
-                      className="inline-flex min-h-[48px] items-center justify-center gap-2 rounded-full bg-rose-600 px-4 text-sm font-bold text-white shadow-lg transition hover:bg-rose-500"
-                      aria-label="Decline call"
-                    >
-                      <PhoneOff className="size-5" />
-                      <span>Decline</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleReceiveCall}
-                      className="inline-flex min-h-[48px] items-center justify-center gap-2 rounded-full bg-emerald-600 px-4 text-sm font-bold text-white shadow-[0_10px_26px_-4px_rgba(16,185,129,0.65)] transition hover:bg-emerald-500"
-                      aria-label="Receive call"
-                    >
-                      {incomingCall.callType === "video" ? (
-                        <Video className="size-5" />
-                      ) : (
-                        <Phone className="size-5" />
-                      )}
-                      <span>Receive</span>
-                    </button>
-                  </div>
-                </>
-              ) : outgoingCall ? (
-                <>
-                  <div
-                    className={cn(
-                      "mx-auto grid size-16 place-items-center overflow-hidden rounded-full text-xl font-bold",
-                      theme.accentBg,
-                    )}
-                  >
-                    {outgoingCall.target.avatarUrl ? (
-                      <img
-                        src={outgoingCall.target.avatarUrl}
-                        alt={outgoingCall.target.fullName}
-                        className="size-full object-cover"
-                      />
-                    ) : outgoingCall.callType === "video" ? (
-                      <Video className="size-7" />
-                    ) : (
-                      <Phone className="size-7" />
-                    )}
-                  </div>
-                  <p className="mt-4 font-display text-lg font-extrabold">
-                    {outgoingCall.target.fullName}
-                  </p>
-                  <p className={cn("mt-1 text-xs", theme.mutedText)}>
-                    {
-                      {
-                        accepted: "Connected",
+            {/* Top Bar: Call Type & Encryption / Status */}
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 rounded-full bg-white/10 px-4 py-1.5 text-xs font-semibold backdrop-blur-md">
+                <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
+                <span>
+                  {incomingCall
+                    ? `Incoming ${incomingCall.callType} call`
+                    : {
+                        accepted: `Encrypted call · ${formatDuration(seconds)}`,
                         preparing: "Preparing your device…",
                         connecting: "Connecting…",
                         ringing: "Ringing…",
-                      }[outgoingCall.status]
-                    }
-                  </p>
-                  <CallMedia
-                    stream={outgoingCall.stream ?? null}
-                    video={outgoingCall.callType === "video"}
-                  />
+                      }[outgoingCall!.status]}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSpeakerOn((s) => !s)}
+                aria-label="Toggle speaker"
+                className={cn(
+                  "grid size-11 place-items-center rounded-full bg-white/10 backdrop-blur-md transition hover:bg-white/20",
+                  speakerOn ? "text-emerald-400" : "text-white/70",
+                )}
+              >
+                <Volume2 className="size-5" />
+              </button>
+            </div>
+
+            {/* Center: Profile Avatar / Remote Video Stream */}
+            <div className="relative my-auto flex flex-col items-center justify-center text-center">
+              {isVideo && isConnected && outgoingCall?.stream ? (
+                <div className="absolute inset-0 overflow-hidden rounded-[32px] bg-black shadow-2xl">
+                  <CallMedia stream={outgoingCall.stream} video={true} />
+                </div>
+              ) : (
+                <div className="relative mb-6">
+                  {incomingCall && (
+                    <span className="absolute -inset-4 animate-ping rounded-full bg-emerald-500/30" />
+                  )}
+                  <div className="relative grid size-32 place-items-center overflow-hidden rounded-full border-4 border-white/20 bg-gradient-to-br from-violet-600 to-indigo-800 text-3xl font-extrabold shadow-2xl md:size-40">
+                    {activePeerData.avatarUrl ? (
+                      <img
+                        src={activePeerData.avatarUrl}
+                        alt={activePeerData.fullName}
+                        className="size-full object-cover"
+                      />
+                    ) : (
+                      initialsOf(activePeerData.fullName)
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <h2 className="font-display text-2xl font-extrabold md:text-3xl">
+                {activePeerData.fullName}
+              </h2>
+              <p className="mt-1 text-sm text-zinc-400">
+                {activePeerData.displayHandle || "@reader"}
+              </p>
+            </div>
+
+            {/* Bottom Bar: Action Controls & End Call / Receive */}
+            <div className="mx-auto flex w-full max-w-md flex-col gap-6">
+              {incomingCall ? (
+                <div className="grid grid-cols-2 gap-4">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      stopVibration();
+                      respondToCall(incomingCall.callId, incomingCall.from.id, "declined");
+                    }}
+                    className="inline-flex min-h-[56px] items-center justify-center gap-2 rounded-full bg-rose-600 px-6 text-sm font-bold text-white shadow-xl transition hover:bg-rose-500"
+                    aria-label="Decline call"
+                  >
+                    <PhoneOff className="size-5" />
+                    <span>Decline</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleReceiveCall}
+                    className="inline-flex min-h-[56px] items-center justify-center gap-2 rounded-full bg-emerald-600 px-6 text-sm font-bold text-white shadow-[0_10px_30px_rgba(16,185,129,0.5)] transition hover:bg-emerald-500"
+                    aria-label="Receive call"
+                  >
+                    {incomingCall.callType === "video" ? (
+                      <Video className="size-5" />
+                    ) : (
+                      <Phone className="size-5" />
+                    )}
+                    <span>Receive</span>
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center justify-center gap-6">
+                    <button
+                      type="button"
+                      onClick={() => setMicMuted((m) => !m)}
+                      aria-label={micMuted ? "Unmute microphone" : "Mute microphone"}
+                      className={cn(
+                        "grid size-14 place-items-center rounded-full transition hover:scale-105",
+                        micMuted ? "bg-white text-zinc-950" : "bg-white/15 backdrop-blur-md",
+                      )}
+                    >
+                      {micMuted ? <MicOff className="size-6" /> : <Mic className="size-6" />}
+                    </button>
+
+                    {isVideo && (
+                      <button
+                        type="button"
+                        onClick={() => setVideoOff((v) => !v)}
+                        aria-label={videoOff ? "Turn camera on" : "Turn camera off"}
+                        className={cn(
+                          "grid size-14 place-items-center rounded-full transition hover:scale-105",
+                          videoOff ? "bg-white text-zinc-950" : "bg-white/15 backdrop-blur-md",
+                        )}
+                      >
+                        {videoOff ? (
+                          <CameraOff className="size-6" />
+                        ) : (
+                          <Camera className="size-6" />
+                        )}
+                      </button>
+                    )}
+                  </div>
+
                   <button
                     type="button"
                     onClick={() =>
-                      respondToCall(outgoingCall.callId, outgoingCall.target.id, "ended")
+                      respondToCall(outgoingCall!.callId, outgoingCall!.target.id, "ended")
                     }
-                    className="mx-auto mt-6 inline-flex min-h-[48px] items-center justify-center gap-2 rounded-full bg-rose-600 px-6 text-sm font-bold text-white shadow-lg transition hover:bg-rose-500"
+                    className="mx-auto flex min-h-[56px] w-full max-w-xs items-center justify-center gap-2 rounded-full bg-rose-600 px-6 text-sm font-bold text-white shadow-[0_10px_30px_rgba(225,29,72,0.5)] transition hover:bg-rose-500"
                     aria-label="End call"
                   >
                     <PhoneOff className="size-5" />
                     <span>End Call</span>
                   </button>
                 </>
-              ) : null}
-            </motion.div>
+              )}
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
