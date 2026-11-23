@@ -1,18 +1,11 @@
 export type AppPermissionKind = "microphone" | "camera" | "notifications";
 
-const PERMISSION_EXPLANATIONS: Record<Exclude<AppPermissionKind, "notifications">, string> = {
-  microphone:
-    "Reading Corner needs microphone access to record a voice message or join an audio/video call. Allow access to continue?",
-  camera: "Reading Corner needs camera access to join a video call. Allow access to continue?",
-};
-
 /** Call directly from a user gesture immediately before using the protected feature. */
 export async function requestFeatureMediaPermission(
   kind: "microphone" | "camera",
 ): Promise<AppPermissionState> {
-  if (typeof window !== "undefined" && !window.confirm(PERMISSION_EXPLANATIONS[kind])) {
-    return "prompt";
-  }
+  // Let Android Chrome/PWA display its native permission prompt; window.confirm creates a
+  // second, confusing browser-owned alert that looks like an error and is not a permission.
   return requestSingleAppPermission(kind);
 }
 
