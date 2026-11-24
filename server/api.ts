@@ -3109,6 +3109,140 @@ export function createApiRouter() {
     res.json({ ok: true });
   });
 
+  // Save media shared with the current user as a private copy in their gallery.
+  router.post("/media/:id/save", async (req: AuthedRequest, res) => {
+    const fbUid = await resolveFirebaseUid(req);
+    const resolved = fbUid ? null : await lookupSessionUser(req);
+    if (!fbUid && !resolved) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    const mediaId = String(req.params["id"] ?? "").trim();
+    if (!mediaId) {
+      res.status(400).json({ error: "Media ID is required." });
+      return;
+    }
+
+    if (fbUid) {
+      const item = (await db
+        .prepare("SELECT * FROM firebase_media WHERE id = ? LIMIT 1")
+        .get(mediaId)) as
+        | {
+            id: string;
+            owner_uid: string;
+            recipient_uid: string | null;
+            kind: string;
+            mime_type: string;
+            original_name: string;
+            file_path: string;
+            size_bytes: number;
+          }
+        | undefined;
+      if (!item) {
+        res.status(404).json({ error: "Media not found." });
+        return;
+      }
+      if (item.owner_uid === fbUid) {
+        res.json({ ok: true, alreadySaved: true, id: item.id });
+        return;
+      }
+      const recipients = (item.recipient_uid ?? "").split(",").map((value) => value.trim());
+      if (!recipients.includes(fbUid)) {
+        res.status(403).json({ error: "You do not have permission to save this media." });
+        return;
+      }
+
+      const bytes = await downloadMediaStorage(item.file_path);
+      if (!bytes) {
+        res.status(404).json({ error: "Media file missing." });
+        return;
+      }
+      const savedId = `fbm_${crypto.randomUUID()}`;
+      const storageKey = `firebase/${fbUid}/${savedId}`;
+      const createdAt = new Date().toISOString();
+      await uploadMediaStorage(storageKey, bytes, item.mime_type);
+      await db
+        .prepare(
+          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          savedId,
+          fbUid,
+          item.kind,
+          item.mime_type,
+          item.original_name,
+          storageKey,
+          item.size_bytes,
+          createdAt,
+        );
+      res.status(201).json({ ok: true, alreadySaved: false, id: savedId });
+      return;
+    }
+
+    const me = resolved!.user;
+    const item = (await db
+      .prepare("SELECT * FROM media_objects WHERE id = ? LIMIT 1")
+      .get(mediaId)) as
+      | {
+          id: string;
+          owner_id: string;
+          recipient_id: string | null;
+          kind: string;
+          mime_type: string;
+          original_name: string;
+          file_path: string;
+          size_bytes: number;
+          is_public_avatar: number;
+        }
+      | undefined;
+    if (!item) {
+      res.status(404).json({ error: "Media not found." });
+      return;
+    }
+    if (item.owner_id === me.id) {
+      res.json({ ok: true, alreadySaved: true, id: item.id });
+      return;
+    }
+    const sharedInMessage = Boolean(
+      await db
+        .prepare(
+          "SELECT 1 FROM messages WHERE media_id = ? AND deleted_at IS NULL AND (sender_id = ? OR recipient_id = ?) LIMIT 1",
+        )
+        .get(item.id, me.id, me.id),
+    );
+    const allowed = item.is_public_avatar !== 1 && (item.recipient_id === me.id || sharedInMessage);
+    if (!allowed || (await isBlockedBetween(me.id, item.owner_id))) {
+      res.status(403).json({ error: "You do not have permission to save this media." });
+      return;
+    }
+
+    const bytes = await downloadMediaStorage(item.file_path);
+    if (!bytes) {
+      res.status(404).json({ error: "Media file missing." });
+      return;
+    }
+    const savedId = `med_${crypto.randomUUID()}`;
+    const storageKey = `users/${me.id}/${savedId}`;
+    const createdAt = new Date().toISOString();
+    await uploadMediaStorage(storageKey, bytes, item.mime_type);
+    await db
+      .prepare(
+        "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?)",
+      )
+      .run(
+        savedId,
+        me.id,
+        item.kind,
+        item.mime_type,
+        item.original_name,
+        storageKey,
+        item.size_bytes,
+        createdAt,
+      );
+    res.status(201).json({ ok: true, alreadySaved: false, id: savedId });
+  });
+
   // Delete an owned media file from the gallery & disk storage
   router.delete("/media/:id", async (req: AuthedRequest, res) => {
     const fbUid = await resolveFirebaseUid(req);

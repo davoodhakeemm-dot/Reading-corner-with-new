@@ -1999,6 +1999,13 @@ export async function fetchGallery(): Promise<GalleryItem[]> {
   }
 }
 
+export async function saveMediaToGallery(url: string): Promise<void> {
+  const mediaId = url.match(/\/api\/media\/([^/?#]+)/)?.[1];
+  if (!mediaId) throw new Error("This media cannot be saved to your gallery.");
+  await apiJson(`/api/media/${encodeURIComponent(mediaId)}/save`, { method: "POST" });
+  await fetchGallery();
+}
+
 export async function deleteGalleryMedia(mediaId: string): Promise<void> {
   await apiJson(`/api/media/${encodeURIComponent(mediaId)}`, { method: "DELETE" });
   uploadedMediaMeta.delete(mediaId);

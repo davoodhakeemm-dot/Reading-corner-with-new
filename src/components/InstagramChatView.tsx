@@ -44,6 +44,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Logo } from "@/components/Logo";
+import { MediaSaveOptionsDialog } from "@/components/MediaSaveOptionsDialog";
 import { ProtectedAudio, ProtectedImage, ProtectedVideo } from "@/components/ProtectedMedia";
 import { CopyPersonalLinkButton, GoToReadingButton } from "@/components/SecretPageActions";
 import { UserProfileModal } from "@/components/UserProfileModal";
@@ -64,6 +65,7 @@ import {
   reactToMessage,
   searchThreadMessages,
   searchUsers,
+  saveMediaToGallery,
   sendChatMessage,
   sendTyping,
   setSecretTheme,
@@ -163,6 +165,7 @@ export function MediaLightbox({
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [saveOptionsOpen, setSaveOptionsOpen] = useState(false);
 
   useEffect(() => {
     setConfirmDelete(false);
@@ -184,102 +187,108 @@ export function MediaLightbox({
   if (!media) return null;
 
   return (
-    <AnimatePresence>
-      <motion.div
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        onClick={onClose}
-        className="fixed inset-0 z-50 flex flex-col bg-black/95 text-white backdrop-blur-md"
-      >
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="flex items-center justify-between gap-3 px-4 py-3"
+    <>
+      <AnimatePresence>
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          onClick={onClose}
+          className="fixed inset-0 z-50 flex flex-col bg-black/95 text-white backdrop-blur-md"
         >
-          <p className="truncate text-sm font-semibold">{media.name}</p>
-          <div className="flex items-center gap-2">
-            {canDelete &&
-              onDelete &&
-              (confirmDelete ? (
-                <div className="flex items-center gap-1.5 rounded-full bg-rose-950/90 px-2 py-1 ring-1 ring-rose-500/60">
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="flex items-center justify-between gap-3 px-4 py-3"
+          >
+            <p className="truncate text-sm font-semibold">{media.name}</p>
+            <div className="flex items-center gap-2">
+              {canDelete &&
+                onDelete &&
+                (confirmDelete ? (
+                  <div className="flex items-center gap-1.5 rounded-full bg-rose-950/90 px-2 py-1 ring-1 ring-rose-500/60">
+                    <button
+                      type="button"
+                      disabled={deleting}
+                      onClick={async () => {
+                        setDeleting(true);
+                        try {
+                          await onDelete();
+                          onClose();
+                        } finally {
+                          setDeleting(false);
+                        }
+                      }}
+                      className="min-h-[32px] rounded-full bg-rose-600 px-3 text-xs font-bold text-white transition hover:bg-rose-500 disabled:opacity-50"
+                    >
+                      {deleting ? "Deleting…" : "Confirm Delete"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={deleting}
+                      onClick={() => setConfirmDelete(false)}
+                      className="min-h-[32px] rounded-full px-2.5 text-xs font-semibold text-white/80 hover:text-white"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
                   <button
                     type="button"
-                    disabled={deleting}
-                    onClick={async () => {
-                      setDeleting(true);
-                      try {
-                        await onDelete();
-                        onClose();
-                      } finally {
-                        setDeleting(false);
-                      }
-                    }}
-                    className="min-h-[32px] rounded-full bg-rose-600 px-3 text-xs font-bold text-white transition hover:bg-rose-500 disabled:opacity-50"
+                    onClick={() => setConfirmDelete(true)}
+                    aria-label="Delete media"
+                    className="inline-flex min-h-[40px] items-center gap-1.5 rounded-full bg-rose-600/85 px-3.5 py-2 text-xs font-bold text-white transition hover:bg-rose-600"
                   >
-                    {deleting ? "Deleting…" : "Confirm Delete"}
+                    <Trash2 className="size-4" /> Delete
                   </button>
-                  <button
-                    type="button"
-                    disabled={deleting}
-                    onClick={() => setConfirmDelete(false)}
-                    className="min-h-[32px] rounded-full px-2.5 text-xs font-semibold text-white/80 hover:text-white"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setConfirmDelete(true)}
-                  aria-label="Delete media"
-                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-full bg-rose-600/85 px-3.5 py-2 text-xs font-bold text-white transition hover:bg-rose-600"
-                >
-                  <Trash2 className="size-4" /> Delete
-                </button>
-              ))}
-            <button
-              type="button"
-              onClick={() =>
-                void downloadProtectedMedia(media.url, media.name).catch(() =>
-                  toast.error("Could not download media."),
-                )
-              }
-              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-full bg-white/15 px-3.5 py-2 text-xs font-bold text-white transition hover:bg-white/25"
-            >
-              <Download className="size-4" /> Download
-            </button>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close preview"
-              className="grid size-10 place-items-center rounded-full bg-white/15 text-white transition hover:bg-white/25"
-            >
-              <X className="size-5" />
-            </button>
+                ))}
+              <button
+                type="button"
+                onClick={() => setSaveOptionsOpen(true)}
+                className="inline-flex min-h-[40px] items-center gap-1.5 rounded-full bg-white/15 px-3.5 py-2 text-xs font-bold text-white transition hover:bg-white/25"
+              >
+                <Download className="size-4" /> Save
+              </button>
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close preview"
+                className="grid size-10 place-items-center rounded-full bg-white/15 text-white transition hover:bg-white/25"
+              >
+                <X className="size-5" />
+              </button>
+            </div>
           </div>
-        </div>
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="flex flex-1 items-center justify-center overflow-hidden p-4"
-        >
-          {media.kind === "image" ? (
-            <ProtectedImage
-              src={media.url}
-              alt={media.name}
-              className="max-h-full max-w-full rounded-2xl object-contain"
-            />
-          ) : (
-            <ProtectedVideo
-              src={media.url}
-              controls
-              autoPlay
-              playsInline
-              className="max-h-full max-w-full rounded-2xl"
-            />
-          )}
-        </div>
-      </motion.div>
-    </AnimatePresence>
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="flex flex-1 items-center justify-center overflow-hidden p-4"
+          >
+            {media.kind === "image" ? (
+              <ProtectedImage
+                src={media.url}
+                alt={media.name}
+                className="max-h-full max-w-full rounded-2xl object-contain"
+              />
+            ) : (
+              <ProtectedVideo
+                src={media.url}
+                controls
+                autoPlay
+                playsInline
+                className="max-h-full max-w-full rounded-2xl"
+              />
+            )}
+          </div>
+        </motion.div>
+      </AnimatePresence>
+      <MediaSaveOptionsDialog
+        open={saveOptionsOpen}
+        name={media.name}
+        saveable={media.kind === "image" || media.kind === "video"}
+        onOpenChange={setSaveOptionsOpen}
+        onSaveToGallery={() => saveMediaToGallery(media.url)}
+        onDownloadToPhone={() => downloadProtectedMedia(media.url, media.name)}
+      />
+    </>
   );
 }
 
@@ -341,6 +350,11 @@ export function InstagramChatView({
   const [lightbox, setLightbox] = useState<{
     url: string;
     kind: "image" | "video";
+    name: string;
+  } | null>(null);
+  const [saveOptions, setSaveOptions] = useState<{
+    url: string;
+    kind: MediaKind;
     name: string;
   } | null>(null);
 
@@ -1885,10 +1899,11 @@ export function InstagramChatView({
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    void downloadProtectedMedia(
-                                      m.mediaUrl!,
-                                      m.mediaName || "photo.jpg",
-                                    ).catch(() => toast.error("Could not download photo."))
+                                    setSaveOptions({
+                                      url: m.mediaUrl!,
+                                      kind: "image",
+                                      name: m.mediaName || "photo.jpg",
+                                    })
                                   }
                                   aria-label="Download photo"
                                   className="absolute bottom-2 right-2 grid size-9 place-items-center rounded-full bg-black/65 text-white backdrop-blur-sm transition hover:bg-black/85"
@@ -1923,10 +1938,11 @@ export function InstagramChatView({
                                   <button
                                     type="button"
                                     onClick={() =>
-                                      void downloadProtectedMedia(
-                                        m.mediaUrl!,
-                                        m.mediaName || "video.mp4",
-                                      ).catch(() => toast.error("Could not download video."))
+                                      setSaveOptions({
+                                        url: m.mediaUrl!,
+                                        kind: "video",
+                                        name: m.mediaName || "video.mp4",
+                                      })
                                     }
                                     className="inline-flex items-center gap-1 font-semibold"
                                   >
@@ -1946,10 +1962,11 @@ export function InstagramChatView({
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    void downloadProtectedMedia(
-                                      m.mediaUrl!,
-                                      m.mediaName || "voice.webm",
-                                    ).catch(() => toast.error("Could not save audio."))
+                                    setSaveOptions({
+                                      url: m.mediaUrl!,
+                                      kind: "audio",
+                                      name: m.mediaName || "voice.webm",
+                                    })
                                   }
                                   className="inline-flex items-center gap-1 text-[11px] font-semibold underline opacity-90"
                                 >
@@ -2533,6 +2550,16 @@ export function InstagramChatView({
       />
 
       <MediaLightbox media={lightbox} onClose={() => setLightbox(null)} />
+      <MediaSaveOptionsDialog
+        open={Boolean(saveOptions)}
+        name={saveOptions?.name ?? "media"}
+        saveable={saveOptions?.kind === "image" || saveOptions?.kind === "video"}
+        onOpenChange={(open) => !open && setSaveOptions(null)}
+        onSaveToGallery={() => saveMediaToGallery(saveOptions?.url ?? "")}
+        onDownloadToPhone={() =>
+          downloadProtectedMedia(saveOptions?.url ?? "", saveOptions?.name ?? "media")
+        }
+      />
     </div>
   );
 }
