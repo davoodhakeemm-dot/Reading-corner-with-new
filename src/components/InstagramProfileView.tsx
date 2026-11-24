@@ -1,5 +1,6 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import {
+  AlertTriangle,
   ArrowLeft,
   Ban,
   BookOpen,
@@ -7,7 +8,6 @@ import {
   Check,
   CheckCircle2,
   Compass,
-  Copy,
   Eye,
   EyeOff,
   Film,
@@ -20,10 +20,8 @@ import {
   Palette,
   Phone,
   Plus,
-  RefreshCw,
   Settings,
-  Share2,
-  ShieldAlert,
+  ShieldCheck,
   Trash2,
   Volume2,
   VolumeX,
@@ -35,20 +33,22 @@ import { toast } from "sonner";
 
 import { BookCover } from "@/components/BookCover";
 import { MediaLightbox } from "@/components/InstagramChatView";
+import { LinkedAccountsCard } from "@/components/LinkedAccountsCard";
+import { PersonalLinkCard } from "@/components/PersonalLinkCard";
 import { ProtectedImage, ProtectedVideo } from "@/components/ProtectedMedia";
 import { CopyPersonalLinkButton, GoToReadingButton } from "@/components/SecretPageActions";
 import { DevicePermissionsCard } from "@/components/StartupPermissionsPrompt";
 import { bookById } from "@/lib/books";
 import {
   changePassword,
+  deleteAccount,
   deleteGalleryMedia,
   fetchGallery,
   fetchNfcLink,
+  getFreshGoogleReauthToken,
   initialsOf,
   loadBlocks,
   logout,
-  regenerateNfcLink,
-  revokeNfcLink,
   sendOtp,
   setSecretTheme,
   setSoundEnabled,
@@ -78,7 +78,7 @@ export function InstagramProfileView({
   onOpenDiscover?: () => void;
 }) {
   const navigate = useNavigate();
-  const { me, nfc, gallery, blockedUsers, soundEnabled, otpConfigured } = useChat();
+  const { me, gallery, blockedUsers, soundEnabled, otpConfigured } = useChat();
   const { state: libraryState, syncing: librarySyncing } = useLibrary();
 
   const [section, setSection] = useState<ProfileSection>(initialSection);
@@ -87,10 +87,6 @@ export function InstagramProfileView({
   const [displayHandle, setDisplayHandle] = useState("");
   const [bio, setBio] = useState("");
   const [savingProfile, setSavingProfile] = useState(false);
-
-  const [revealNfcLink, setRevealNfcLink] = useState(false);
-  const [nfcBusy, setNfcBusy] = useState(false);
-  const [writingNfc, setWritingNfc] = useState(false);
 
   const [lightbox, setLightbox] = useState<{
     id: string;
@@ -105,7 +101,16 @@ export function InstagramProfileView({
 
   const [currentPwd, setCurrentPwd] = useState("");
   const [newPwd, setNewPwd] = useState("");
+  const [pwGoogleToken, setPwGoogleToken] = useState<string | null>(null);
   const [pwdBusy, setPwdBusy] = useState(false);
+
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [deletePassword, setDeletePassword] = useState("");
+  const [deleteGoogleToken, setDeleteGoogleToken] = useState<string | null>(null);
+  const [deleteSecurityKey, setDeleteSecurityKey] = useState("");
+  const [showDeleteKey, setShowDeleteKey] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const [deletingAccount, setDeletingAccount] = useState(false);
 
   const [verifyOtpCode, setVerifyOtpCode] = useState("");
   const [verifyOtpSent, setVerifyOtpSent] = useState(false);
@@ -141,9 +146,6 @@ export function InstagramProfileView({
   }, [libraryState.progress]);
 
   if (!me) return null;
-
-  const personalUrl =
-    typeof window !== "undefined" && nfc?.path ? `${window.location.origin}${nfc.path}` : null;
 
   async function handleAvatarChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -218,83 +220,6 @@ export function InstagramProfileView({
     }
   }
 
-  async function handleCopyLink() {
-    if (!personalUrl) return;
-    try {
-      await navigator.clipboard.writeText(personalUrl);
-      toast.success("Personal link copied to clipboard");
-    } catch {
-      toast.error("Could not copy automatically. Reveal the link to copy manually.");
-    }
-  }
-
-  async function handleShareLink() {
-    if (!personalUrl) return;
-    if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
-      try {
-        await navigator.share({
-          title: `${me?.fullName} — Reading Corner Card`,
-          text: "Open my Reading Corner personal card link",
-          url: personalUrl,
-        });
-        return;
-      } catch {
-        /* fallback to clipboard */
-      }
-    }
-    await handleCopyLink();
-  }
-
-  async function handleWriteNfcTag() {
-    if (!personalUrl) return;
-    const w = window as unknown as {
-      NDEFReader?: new () => {
-        write: (msg: { records: { recordType: string; data: string }[] }) => Promise<void>;
-      };
-    };
-    if (!w.NDEFReader) {
-      toast("Web NFC not available in this browser", {
-        description:
-          "Copy your NFC Card Link above and write it using NFC Tools on Android or iPhone.",
-      });
-      return;
-    }
-    setWritingNfc(true);
-    try {
-      const ndef = new w.NDEFReader();
-      await ndef.write({ records: [{ recordType: "url", data: personalUrl }] });
-      toast.success("NFC card written successfully");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "NFC write canceled or unsupported.");
-    } finally {
-      setWritingNfc(false);
-    }
-  }
-
-  async function handleRegenerateNfc() {
-    setNfcBusy(true);
-    try {
-      await regenerateNfcLink();
-      toast.success("New personal NFC link generated. Previous link invalidated.");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to regenerate link.");
-    } finally {
-      setNfcBusy(false);
-    }
-  }
-
-  async function handleRevokeNfc() {
-    setNfcBusy(true);
-    try {
-      await revokeNfcLink();
-      toast.success("Lost NFC card revoked. No one can access your account with the old card.");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to revoke card.");
-    } finally {
-      setNfcBusy(false);
-    }
-  }
-
   async function handleThemeSelect(id: SecretThemeId) {
     try {
       await setSecretTheme(id);
@@ -312,14 +237,42 @@ export function InstagramProfileView({
     }
     setPwdBusy(true);
     try {
-      await changePassword(currentPwd, newPwd);
+      await changePassword(currentPwd, newPwd, pwGoogleToken || undefined);
       setCurrentPwd("");
       setNewPwd("");
+      setPwGoogleToken(null);
       toast.success("Password updated");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not change password.");
     } finally {
       setPwdBusy(false);
+    }
+  }
+
+  async function handleDeleteAccountConfirm() {
+    setDeleteError("");
+    if (!deletePassword && !deleteGoogleToken) {
+      setDeleteError("Enter your current password or verify with Google first.");
+      return;
+    }
+    if (!deleteSecurityKey.trim()) {
+      setDeleteError("Enter the deletion security key.");
+      return;
+    }
+    setDeletingAccount(true);
+    try {
+      await deleteAccount({
+        ...(deletePassword ? { password: deletePassword } : {}),
+        ...(deleteGoogleToken ? { firebaseIdToken: deleteGoogleToken } : {}),
+        securityKey: deleteSecurityKey.trim(),
+      });
+      setShowDeleteModal(false);
+      toast.success("Account permanently deleted.");
+      navigate({ to: "/auth", replace: true });
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "Deletion failed.");
+    } finally {
+      setDeletingAccount(false);
     }
   }
 
@@ -371,6 +324,17 @@ export function InstagramProfileView({
 
           <div className="flex flex-wrap items-center gap-2">
             <CopyPersonalLinkButton theme={theme} size="sm" label="Copy Link" />
+            {me.isAdmin && (
+              <Link
+                to="/control"
+                className={cn(
+                  "glass-sheen inline-flex min-h-[42px] items-center gap-1.5 rounded-full border border-emerald-400/40 bg-emerald-500/15 px-4 text-xs font-bold text-emerald-500 transition hover:scale-[1.02]",
+                )}
+              >
+                <ShieldCheck className="size-4" />
+                <span>CONTROL</span>
+              </Link>
+            )}
             {onOpenDiscover ? (
               <button
                 type="button"
@@ -455,6 +419,9 @@ export function InstagramProfileView({
                 <h1 className="truncate font-display text-2xl font-extrabold">{me.fullName}</h1>
                 <span className={cn("text-xs font-semibold", theme.mutedText)}>
                   {me.displayHandle}
+                </span>
+                <span className={cn("font-mono text-[11px] opacity-75", theme.mutedText)}>
+                  ID: {me.id}
                 </span>
               </div>
 
@@ -850,136 +817,16 @@ export function InstagramProfileView({
           </motion.section>
         )}
 
-        {/* Section 2: Personal NFC Card & Secret Link Management */}
+        {/* Section 2: Personal NFC Card, QR Code & Linked Accounts */}
         {section === "nfc" && (
-          <motion.section
+          <motion.div
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
-            className={cn(
-              "space-y-4 rounded-3xl border p-5 backdrop-blur-xl",
-              theme.surfaceGlass,
-              theme.border,
-              theme.cardShadow,
-            )}
+            className="space-y-4"
           >
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h2 className="font-display text-lg font-bold">NFC Card & Personal Link</h2>
-                <p className={cn("mt-0.5 text-xs leading-relaxed", theme.mutedText)}>
-                  Tap your NFC card to open Reading Corner. Signed-in devices open directly; other
-                  devices must verify your phone number and password.
-                </p>
-              </div>
-              <span
-                className={cn(
-                  "shrink-0 text-xs font-bold",
-                  nfc?.revoked ? "text-rose-600" : "text-emerald-600",
-                )}
-              >
-                {nfc?.revoked ? "Revoked" : `Active · v${nfc?.version ?? 1}`}
-              </span>
-            </div>
-
-            {personalUrl && !nfc?.revoked ? (
-              <div
-                className={cn("space-y-3 rounded-2xl border p-4", theme.border, theme.surfaceMuted)}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-bold">My Personal Link</span>
-                  <button
-                    type="button"
-                    onClick={() => setRevealNfcLink((r) => !r)}
-                    className={cn(
-                      "inline-flex items-center gap-1 text-xs font-semibold",
-                      theme.accentText,
-                    )}
-                  >
-                    {revealNfcLink ? (
-                      <>
-                        <EyeOff className="size-3.5" /> Hide URL
-                      </>
-                    ) : (
-                      <>
-                        <Eye className="size-3.5" /> Reveal URL
-                      </>
-                    )}
-                  </button>
-                </div>
-
-                <p className="break-all rounded-xl bg-black/5 px-3 py-2.5 font-mono text-xs">
-                  {revealNfcLink
-                    ? personalUrl
-                    : `${window.location.origin}/nfc/••••••••••••••••••••`}
-                </p>
-
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                  <button
-                    type="button"
-                    onClick={() => void handleCopyLink()}
-                    className={cn(
-                      "inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl border px-3 text-xs font-bold",
-                      theme.surface,
-                      theme.border,
-                    )}
-                  >
-                    <Copy className="size-4" /> Copy Link
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleShareLink()}
-                    className={cn(
-                      "inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl border px-3 text-xs font-bold",
-                      theme.surface,
-                      theme.border,
-                    )}
-                  >
-                    <Share2 className="size-4" /> Share Link
-                  </button>
-                  <button
-                    type="button"
-                    disabled={writingNfc}
-                    onClick={() => void handleWriteNfcTag()}
-                    className={cn(
-                      "col-span-2 inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl px-3 text-xs font-bold sm:col-span-1",
-                      theme.accentBg,
-                    )}
-                  >
-                    <Nfc className="size-4" /> {writingNfc ? "Hold NFC Tag…" : "NFC Card Link"}
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-xs text-rose-900">
-                <p className="font-bold">Card Revoked</p>
-                <p className="mt-1">
-                  Your previous NFC card link has been permanently disabled. Generate a new link
-                  below when you have a replacement card.
-                </p>
-              </div>
-            )}
-
-            <div className="grid gap-2.5 sm:grid-cols-2">
-              <button
-                type="button"
-                disabled={nfcBusy}
-                onClick={() => void handleRegenerateNfc()}
-                className={cn(
-                  "inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl px-4 text-xs font-bold",
-                  theme.surfaceMuted,
-                )}
-              >
-                <RefreshCw className="size-4" /> Regenerate Link
-              </button>
-              <button
-                type="button"
-                disabled={nfcBusy || Boolean(nfc?.revoked)}
-                onClick={() => void handleRevokeNfc()}
-                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 text-xs font-bold text-white transition hover:bg-rose-700 disabled:opacity-50"
-              >
-                <ShieldAlert className="size-4" /> Revoke Lost Card
-              </button>
-            </div>
-          </motion.section>
+            <PersonalLinkCard variant="glass" theme={theme} />
+            <LinkedAccountsCard variant="glass" theme={theme} />
+          </motion.div>
         )}
 
         {/* Section 3: Three Secret-Page Themes */}
@@ -1212,6 +1059,10 @@ export function InstagramProfileView({
               </button>
             </div>
 
+            {/* Personal Link + QR & Linked Accounts visible inside Settings */}
+            <PersonalLinkCard variant="glass" theme={theme} />
+            <LinkedAccountsCard variant="glass" theme={theme} />
+
             {/* Device Permissions */}
             <DevicePermissionsCard theme={theme} />
 
@@ -1253,14 +1104,69 @@ export function InstagramProfileView({
                   )}
                 />
               </div>
-              <button
-                type="submit"
-                disabled={pwdBusy}
-                className={cn("min-h-[42px] rounded-xl px-4 text-xs font-bold", theme.accentBg)}
-              >
-                {pwdBusy ? "Updating…" : "Update Password"}
-              </button>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                {me.email && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const tok = await getFreshGoogleReauthToken();
+                        setPwGoogleToken(tok);
+                        toast.success("Google verified. Enter your new password and click Update.");
+                      } catch (err) {
+                        toast.error(
+                          err instanceof Error ? err.message : "Google verification failed.",
+                        );
+                      }
+                    }}
+                    className={cn("text-xs font-bold hover:underline", theme.accentText)}
+                  >
+                    {pwGoogleToken
+                      ? "✓ Google verified"
+                      : "Signed in with Google? Verify with Google"}
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  disabled={pwdBusy}
+                  className={cn("min-h-[42px] rounded-xl px-4 text-xs font-bold", theme.accentBg)}
+                >
+                  {pwdBusy ? "Updating…" : "Update Password"}
+                </button>
+              </div>
             </form>
+
+            {/* Permanent Single-Account Deletion */}
+            <div
+              className={cn(
+                "space-y-3 rounded-3xl border border-rose-500/35 p-5 backdrop-blur-xl",
+                theme.surfaceGlass,
+                theme.cardShadow,
+              )}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h2 className="font-display text-base font-bold text-rose-500">Delete Account</h2>
+                  <p className={cn("mt-0.5 text-xs", theme.mutedText)}>
+                    Permanently deletes ONLY this profile ({me.displayHandle}). Sibling accounts on
+                    your Gmail/phone stay intact.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeletePassword("");
+                    setDeleteGoogleToken(null);
+                    setDeleteSecurityKey("");
+                    setDeleteError("");
+                    setShowDeleteModal(true);
+                  }}
+                  className="shrink-0 rounded-xl bg-rose-600 px-3.5 py-2 text-xs font-bold text-white hover:bg-rose-500"
+                >
+                  Delete Account
+                </button>
+              </div>
+            </div>
 
             {/* Account Navigation & Sign Out */}
             <div className="grid gap-2.5 sm:grid-cols-2">
@@ -1280,6 +1186,131 @@ export function InstagramProfileView({
           </motion.section>
         )}
       </div>
+
+      {showDeleteModal && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/65 p-4 backdrop-blur-md">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirm Account Deletion"
+            className={cn(
+              "w-full max-w-md space-y-4 rounded-3xl border p-6 shadow-2xl",
+              theme.surfaceGlass,
+              theme.border,
+            )}
+          >
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="mt-0.5 size-6 shrink-0 text-rose-500" />
+              <div>
+                <h3 className="text-lg font-bold text-rose-500">Permanently Delete Account?</h3>
+                <p className={cn("mt-1 text-xs leading-relaxed", theme.mutedText)}>
+                  This permanently deletes ONLY {me.displayHandle} and its messages, gallery media,
+                  and personal link. Sibling accounts remain untouched.
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="mb-1 block text-xs font-semibold">
+                  1. Account Ownership (Password or Google)
+                </label>
+                <input
+                  type="password"
+                  value={deletePassword}
+                  onChange={(e) => setDeletePassword(e.target.value)}
+                  placeholder="Enter your account password"
+                  className={cn(
+                    "w-full rounded-xl border px-3.5 py-2 text-sm outline-none",
+                    theme.border,
+                    theme.surfaceMuted,
+                  )}
+                />
+                {me.email && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setDeleteError("");
+                      try {
+                        const tok = await getFreshGoogleReauthToken();
+                        setDeleteGoogleToken(tok);
+                        toast.success("Google verified.");
+                      } catch (err) {
+                        setDeleteError(
+                          err instanceof Error ? err.message : "Google verification failed.",
+                        );
+                      }
+                    }}
+                    className={cn("mt-1.5 text-xs font-bold hover:underline", theme.accentText)}
+                  >
+                    {deleteGoogleToken
+                      ? "✓ Google ownership verified"
+                      : "Signed in with Google? Verify with Google"}
+                  </button>
+                )}
+              </div>
+
+              <div>
+                <label className="mb-1 flex items-center gap-1.5 text-xs font-semibold">
+                  <KeyRound className="size-3.5" /> 2. Deletion Security Key
+                </label>
+                <div
+                  className={cn(
+                    "flex items-center rounded-xl border pr-2",
+                    theme.border,
+                    theme.surfaceMuted,
+                  )}
+                >
+                  <input
+                    type={showDeleteKey ? "text" : "password"}
+                    value={deleteSecurityKey}
+                    onChange={(e) => setDeleteSecurityKey(e.target.value)}
+                    placeholder="Enter security key"
+                    aria-label="Deletion security key"
+                    className="min-w-0 flex-1 bg-transparent px-3.5 py-2 text-sm outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowDeleteKey((s) => !s)}
+                    aria-label={showDeleteKey ? "Hide security key" : "Show security key"}
+                    className="grid size-8 place-items-center opacity-70 hover:opacity-100"
+                  >
+                    {showDeleteKey ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                  </button>
+                </div>
+              </div>
+
+              {deleteError && (
+                <p
+                  role="alert"
+                  className="rounded-xl bg-rose-500/15 px-3 py-2 text-xs font-semibold text-rose-500"
+                >
+                  {deleteError}
+                </p>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={deletingAccount}
+                onClick={() => setShowDeleteModal(false)}
+                className={cn("rounded-full px-4 py-2 text-xs font-bold", theme.surfaceMuted)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deletingAccount}
+                onClick={() => void handleDeleteAccountConfirm()}
+                className="rounded-full bg-rose-600 px-4 py-2 text-xs font-bold text-white disabled:opacity-50"
+              >
+                {deletingAccount ? "Deleting…" : "Confirm Permanent Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <MediaLightbox
         media={lightbox}

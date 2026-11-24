@@ -9,11 +9,13 @@ import {
   Library,
   Search,
   Settings,
+  ShieldCheck,
   User,
 } from "lucide-react";
 import { useEffect, useRef, type ReactNode } from "react";
 
 import { Logo } from "@/components/Logo";
+import { useChat } from "@/lib/chat-store";
 import { cn } from "@/lib/utils";
 
 const MOBILE_NAV = [
@@ -38,6 +40,7 @@ const DESKTOP_NAV = [
 
 export function AppShell({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
+  const { me } = useChat();
   const pathname = useRouterState({
     select: (s) => s.location.pathname,
   });
@@ -96,6 +99,21 @@ export function AppShell({ children }: { children: ReactNode }) {
               </Link>
             );
           })}
+
+          {me?.isAdmin && (
+            <Link
+              to="/control"
+              className={cn(
+                "flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-semibold transition-colors",
+                pathname === "/control"
+                  ? "bg-emerald-500/15 text-emerald-600"
+                  : "text-emerald-600/85 hover:bg-emerald-500/10 hover:text-emerald-600",
+              )}
+            >
+              <ShieldCheck className="size-[18px]" />
+              CONTROL
+            </Link>
+          )}
         </nav>
 
         <div className="mt-6 rounded-2xl bg-hero p-4">
@@ -121,6 +139,16 @@ export function AppShell({ children }: { children: ReactNode }) {
             </Link>
 
             <div className="flex shrink-0 items-center gap-1">
+              {me?.isAdmin && (
+                <Link
+                  to="/control"
+                  aria-label="CONTROL Admin Directory"
+                  className="press grid size-9 place-items-center rounded-full bg-emerald-500/15 text-emerald-600"
+                >
+                  <ShieldCheck className="size-[18px]" />
+                </Link>
+              )}
+
               <Link
                 to="/search"
                 aria-label="Search books"

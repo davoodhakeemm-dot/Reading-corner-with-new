@@ -11,6 +11,7 @@ const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "rc-api-test-"));
 process.env["DATA_DIR"] = testDataDir;
 
 const { createApiRouter } = await import("./api");
+const { db } = await import("./db");
 const { attachWebSocketServer } = await import("./ws");
 
 let server: http.Server;
@@ -664,11 +665,32 @@ test("Real-time user registration broadcast, live chat delivery, WebRTC call SDP
     });
     assert.equal(badFb.status, 401);
 
-    // 5. Account deletion removes user from directory & broadcasts user:deleted live
+    // 5. Account deletion validates password + securityKey, removes user & broadcasts user:deleted live
+    const badKeyDel = await api("/auth/account", {
+      method: "DELETE",
+      token: regC.data.token,
+      body: { password: "Password123!", securityKey: "wrong-key" },
+    });
+    assert.equal(badKeyDel.status, 403);
+
+    const badPwdDel = await api("/auth/account", {
+      method: "DELETE",
+      token: regC.data.token,
+      body: {
+        password: "WrongPassword!",
+        securityKey: process.env["ACCOUNT_DELETE_KEY"] || "2233",
+      },
+    });
+    assert.equal(badPwdDel.status, 401);
+
     const deletedEventPromise = clientA.waitForEvent("user:deleted");
     const delC = await api<{ ok: boolean; deletedUserId: string }>("/auth/account", {
       method: "DELETE",
       token: regC.data.token,
+      body: {
+        password: "Password123!",
+        securityKey: process.env["ACCOUNT_DELETE_KEY"] || "2233",
+      },
     });
     assert.equal(delC.status, 200);
     assert.equal(delC.data.ok, true);
@@ -688,4 +710,236 @@ test("Real-time user registration broadcast, live chat delivery, WebRTC call SDP
     clientA.ws.close();
     clientB.ws.close();
   }
+});
+
+test("Multi-account linking (max 3 per verified Gmail/phone), 3 login modes, single-account delete isolation & admin CONTROL search", async () => {
+  // 1. Register primary verified-contact test account (non-admin)
+  const primary = await api<{ token: string; user: { id: string; displayHandle: string } }>(
+    "/auth/register",
+    {
+      method: "POST",
+      body: {
+        fullName: "Zoya Primary",
+        username: "zoya_one",
+        email: "zoya.multi@example.com",
+        phone: "9988776655",
+        countryCode: "+91",
+        password: "SharedPassword1!",
+      },
+    },
+  );
+  assert.equal(primary.status, 201);
+
+  // Mark email & phone verified (simulating verified Firebase email + SMS OTP proof)
+  db.prepare("UPDATE users SET email_verified = 1, phone_verified = 1 WHERE id = ?").run(
+    primary.data.user.id,
+  );
+
+  // Save reading state for Account 1
+  await api("/reading-state", {
+    method: "PUT",
+    token: primary.data.token,
+    body: { state: { completed: ["the-alchemist"], streak: 4 } },
+  });
+
+  // 2. Create Account 2 and Account 3 linked to same verified Gmail & phone
+  const acc2 = await api<{ token: string; user: { id: string; displayHandle: string } }>(
+    "/auth/linked-accounts/create",
+    {
+      method: "POST",
+      token: primary.data.token,
+      body: {
+        fullName: "Zoya Study",
+        username: "zoya_two",
+        password: "SharedPassword1!",
+        linkBy: "both",
+        switchToNew: true,
+      },
+    },
+  );
+  assert.equal(acc2.status, 201);
+  assert.equal(acc2.data.user.displayHandle, "@zoya_two");
+
+  // Account 2 must have empty/isolated reading state
+  const state2 = await api<{ state: Record<string, unknown> | null }>("/reading-state", {
+    token: acc2.data.token,
+  });
+  assert.equal(state2.data.state, null);
+
+  const acc3 = await api<{ token: string; user: { id: string; displayHandle: string } }>(
+    "/auth/linked-accounts/create",
+    {
+      method: "POST",
+      token: acc2.data.token,
+      body: {
+        fullName: "Zoya Poetry",
+        username: "zoya_three",
+        password: "UniqueThirdPass1!",
+        linkBy: "both",
+        switchToNew: false,
+      },
+    },
+  );
+  assert.equal(acc3.status, 201);
+
+  // 4th account under same Gmail or phone must be rejected with 409
+  const acc4 = await api("/auth/linked-accounts/create", {
+    method: "POST",
+    token: primary.data.token,
+    body: {
+      fullName: "Zoya Fourth",
+      username: "zoya_four",
+      password: "Password123!",
+      linkBy: "both",
+    },
+  });
+  assert.equal(acc4.status, 409);
+
+  // Linked accounts endpoint lists all 3 siblings with cap 3/3
+  const linkedList = await api<{
+    maxAccounts: number;
+    emailAccountCount: number;
+    phoneAccountCount: number;
+    accounts: Array<{ id: string }>;
+  }>("/auth/linked-accounts", { token: primary.data.token });
+  assert.equal(linkedList.status, 200);
+  assert.equal(linkedList.data.maxAccounts, 3);
+  assert.equal(linkedList.data.emailAccountCount, 3);
+  assert.equal(linkedList.data.phoneAccountCount, 3);
+  assert.equal(linkedList.data.accounts.length, 3);
+
+  // 3. Explicit login modes: gmail, phone, username
+  // Gmail + SharedPassword1! matches 2 linked accounts -> requiresAccountChoice: true
+  const gmailChoice = await api<{
+    requiresAccountChoice?: boolean;
+    accounts?: Array<{ id: string; displayHandle: string }>;
+  }>("/auth/login", {
+    method: "POST",
+    body: { mode: "gmail", email: "zoya.multi@example.com", password: "SharedPassword1!" },
+  });
+  assert.equal(gmailChoice.status, 200);
+  assert.equal(gmailChoice.data.requiresAccountChoice, true);
+  assert.equal(gmailChoice.data.accounts?.length, 2);
+
+  // Targeting specific sibling resolves directly
+  const gmailTargeted = await api<{ token: string; user: { id: string } }>("/auth/login", {
+    method: "POST",
+    body: {
+      mode: "gmail",
+      email: "zoya.multi@example.com",
+      password: "SharedPassword1!",
+      targetUserId: acc2.data.user.id,
+    },
+  });
+  assert.equal(gmailTargeted.status, 200);
+  assert.equal(gmailTargeted.data.user.id, acc2.data.user.id);
+
+  // Phone + UniqueThirdPass1! logs directly into Account 3
+  const phoneLogin = await api<{ token: string; user: { id: string; displayHandle: string } }>(
+    "/auth/login",
+    {
+      method: "POST",
+      body: {
+        mode: "phone",
+        phone: "9988776655",
+        countryCode: "+91",
+        password: "UniqueThirdPass1!",
+      },
+    },
+  );
+  assert.equal(phoneLogin.status, 200);
+  assert.equal(phoneLogin.data.user.id, acc3.data.user.id);
+
+  // Username + Password logs into exact handle
+  const usernameLogin = await api<{ token: string; user: { id: string } }>("/auth/login", {
+    method: "POST",
+    body: { mode: "username", username: "@zoya_one", password: "SharedPassword1!" },
+  });
+  assert.equal(usernameLogin.status, 200);
+  assert.equal(usernameLogin.data.user.id, primary.data.user.id);
+
+  // 4. Switch account between siblings
+  const switched = await api<{ token: string; user: { id: string } }>("/auth/switch-account", {
+    method: "POST",
+    token: primary.data.token,
+    body: { targetUserId: acc3.data.user.id },
+  });
+  assert.equal(switched.status, 200);
+  assert.equal(switched.data.user.id, acc3.data.user.id);
+
+  // 5. Delete Account 2 only -> Account 1 & Account 3 must survive
+  const delAcc2 = await api<{ ok: boolean; deletedUserId: string }>("/auth/account", {
+    method: "DELETE",
+    token: acc2.data.token,
+    body: {
+      password: "SharedPassword1!",
+      securityKey: process.env["ACCOUNT_DELETE_KEY"] || "2233",
+    },
+  });
+  assert.equal(delAcc2.status, 200);
+  assert.equal(delAcc2.data.deletedUserId, acc2.data.user.id);
+
+  const checkAcc1StillAlive = await api<{ user: { id: string } }>("/auth/me", {
+    token: usernameLogin.data.token,
+  });
+  assert.equal(checkAcc1StillAlive.status, 200);
+  assert.equal(checkAcc1StillAlive.data.user.id, primary.data.user.id);
+
+  // Reading state on Account 1 remained intact
+  const state1After = await api<{ state: { completed?: string[] } }>("/reading-state", {
+    token: usernameLogin.data.token,
+  });
+  assert.deepEqual(state1After.data.state?.completed, ["the-alchemist"]);
+
+  // 6. Rate-limit lock after repeated wrong security keys on delete
+  for (let i = 0; i < 4; i += 1) {
+    const attempt = await api("/auth/account", {
+      method: "DELETE",
+      token: phoneLogin.data.token,
+      body: { password: "UniqueThirdPass1!", securityKey: "0000" },
+    });
+    assert.equal(attempt.status, 403);
+  }
+  const lockedAttempt = await api("/auth/account", {
+    method: "DELETE",
+    token: phoneLogin.data.token,
+    body: { password: "UniqueThirdPass1!", securityKey: "0000" },
+  });
+  assert.equal(lockedAttempt.status, 429);
+
+  // 7. CONTROL User Search — strictly denied (403) for non-admin, allowed (200) for verified admin with zero PII
+  const nonAdminControl = await api("/control/users?q=zoya", {
+    token: usernameLogin.data.token,
+  });
+  assert.equal(nonAdminControl.status, 403);
+
+  const adminReg = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Admin Account",
+      username: "admin_control_test",
+      email: "mohammadakeem22@gmail.com",
+      password: "AdminPassword123!",
+    },
+  });
+  assert.equal(adminReg.status, 201);
+  // Promote verified admin email
+  db.prepare("UPDATE users SET email_verified = 1, role = 'admin' WHERE id = ?").run(
+    adminReg.data.user.id,
+  );
+
+  const adminControl = await api<{ users: Array<Record<string, unknown>> }>(
+    "/control/users?q=zoya_one",
+    { token: adminReg.data.token },
+  );
+  assert.equal(adminControl.status, 200);
+  const foundZoya = adminControl.data.users.find((u) => u["id"] === primary.data.user.id);
+  assert.ok(foundZoya);
+  assert.equal(foundZoya["displayHandle"], "@zoya_one");
+  assert.match(String(foundZoya["personalLink"]), /^\/nfc\//);
+  // Zero sensitive PII returned by CONTROL search
+  assert.equal(foundZoya["email"], undefined);
+  assert.equal(foundZoya["phone_e164"], undefined);
+  assert.equal(foundZoya["phoneE164"], undefined);
+  assert.equal(foundZoya["password_hash"], undefined);
 });

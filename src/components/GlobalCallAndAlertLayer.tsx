@@ -7,14 +7,21 @@ import {
   MicOff,
   Phone,
   PhoneOff,
-  Volume2,
+  SwitchCamera,
   Video,
+  Volume2,
+  VolumeX,
   X,
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useState } from "react";
 
-import { CallMedia } from "@/components/CallMedia";
+import {
+  LocalCallPreview,
+  RemoteCallAudio,
+  RemoteCallVideo,
+  warmUpCallAudio,
+} from "@/components/CallMedia";
 import {
   buildIncomingCallAlertPayload,
   playIncomingRingtone,
@@ -27,6 +34,9 @@ import {
   initialsOf,
   openThread,
   respondToCall,
+  setCallCameraEnabled,
+  setCallMicMuted,
+  switchCallCamera,
   useChat,
 } from "@/lib/chat-store";
 import { getSecretTheme } from "@/lib/secret-themes";
@@ -37,27 +47,52 @@ export function GlobalCallAndAlertLayer() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const { me, incomingCall, outgoingCall, incomingMessageAlert, soundEnabled } = useChat();
 
-  const [micMuted, setMicMuted] = useState(false);
-  const [videoOff, setVideoOff] = useState(false);
   const [speakerOn, setSpeakerOn] = useState(true);
   const [seconds, setSeconds] = useState(0);
+  const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
+  const [switchingCamera, setSwitchingCamera] = useState(false);
 
   const isOnChatSurface = pathname.startsWith("/messages") || pathname.startsWith("/chat");
   const theme = getSecretTheme(me?.theme);
 
   const isConnected = outgoingCall?.status === "accepted";
+  const isCallActive = Boolean(incomingCall || outgoingCall);
+  const micMuted = outgoingCall?.micMuted ?? false;
+  const cameraEnabled = outgoingCall?.cameraEnabled ?? true;
+  const remoteMicMuted = outgoingCall?.remoteMicMuted ?? false;
+  const remoteCameraEnabled = outgoingCall?.remoteCameraEnabled ?? true;
+  const facingMode = outgoingCall?.facingMode ?? "user";
+  const canSwitchCamera = outgoingCall?.canSwitchCamera ?? false;
 
-  // Call duration timer
+  // Reset call UI states when call session ends or switches
   useEffect(() => {
-    if (!isConnected) {
+    if (!isCallActive) {
+      setSpeakerOn(true);
+      setHasRemoteVideo(false);
+      setSwitchingCamera(false);
+    }
+  }, [isCallActive]);
+
+  const outgoingCallId = outgoingCall?.callId;
+  const outgoingCallStatus = outgoingCall?.status;
+
+  // Call duration timer (starts on connected, preserves elapsed time during brief reconnects)
+  useEffect(() => {
+    if (!outgoingCallId) {
       setSeconds(0);
       return;
     }
+    if (outgoingCallStatus !== "accepted" && outgoingCallStatus !== "reconnecting") {
+      setSeconds(0);
+      return;
+    }
+    if (outgoingCallStatus !== "accepted") return;
+
     const timerId = window.setInterval(() => {
       setSeconds((s) => s + 1);
     }, 1000);
     return () => window.clearInterval(timerId);
-  }, [isConnected]);
+  }, [outgoingCallId, outgoingCallStatus]);
 
   const formatDuration = (sec: number) => {
     const mins = Math.floor(sec / 60);
@@ -104,13 +139,14 @@ export function GlobalCallAndAlertLayer() {
   }, [incomingCall, isOnChatSurface, navigate, soundEnabled]);
 
   // Auto-dismiss incoming message banner cleanly after 7.5s
+  const incomingAlertId = incomingMessageAlert?.id;
   useEffect(() => {
-    if (!incomingMessageAlert) return;
+    if (!incomingAlertId) return;
     const timerId = window.setTimeout(() => {
       dismissIncomingMessageAlert();
     }, 7500);
     return () => window.clearTimeout(timerId);
-  }, [incomingMessageAlert?.id]);
+  }, [incomingAlertId]);
 
   function handleReceiveMessage() {
     if (!incomingMessageAlert) return;
@@ -124,12 +160,23 @@ export function GlobalCallAndAlertLayer() {
 
   function handleReceiveCall() {
     if (!incomingCall) return;
+    warmUpCallAudio();
     stopVibration();
     const callerId = incomingCall.from.id;
     respondToCall(incomingCall.callId, callerId, "accepted");
     void openThread(callerId);
     if (!isOnChatSurface) {
       void navigate({ to: "/messages" });
+    }
+  }
+
+  async function handleSwitchCamera() {
+    if (switchingCamera) return;
+    setSwitchingCamera(true);
+    try {
+      await switchCallCamera();
+    } finally {
+      setSwitchingCamera(false);
     }
   }
 
@@ -143,6 +190,14 @@ export function GlobalCallAndAlertLayer() {
     : outgoingCall
       ? outgoingCall.callType === "video"
       : false;
+
+  const showFullScreenRemoteVideo = Boolean(
+    isVideo &&
+    outgoingCall?.stream &&
+    hasRemoteVideo &&
+    remoteCameraEnabled !== false &&
+    !incomingCall,
+  );
 
   return (
     <>
@@ -232,43 +287,108 @@ export function GlobalCallAndAlertLayer() {
             role="dialog"
             aria-modal="true"
             aria-label={incomingCall ? "Incoming call" : "Active call"}
-            className="fixed inset-0 z-[80] flex flex-col justify-between bg-zinc-950 p-6 text-white md:p-12"
+            className="fixed inset-0 z-[80] flex flex-col justify-between overflow-hidden bg-zinc-950 p-5 text-white md:p-10"
           >
-            {/* Top Bar: Call Type & Encryption / Status */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 rounded-full bg-white/10 px-4 py-1.5 text-xs font-semibold backdrop-blur-md">
-                <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
-                <span>
-                  {incomingCall
-                    ? `Incoming ${incomingCall.callType} call`
-                    : {
-                        accepted: `Encrypted call · ${formatDuration(seconds)}`,
-                        preparing: "Preparing your device…",
-                        connecting: "Connecting…",
-                        ringing: "Ringing…",
-                      }[outgoingCall!.status]}
-                </span>
+            {/* Dedicated Remote Audio Element for BOTH audio & video calls */}
+            {outgoingCall && (
+              <RemoteCallAudio
+                stream={outgoingCall.stream ?? null}
+                streamVersion={outgoingCall.streamVersion ?? 0}
+                speakerOn={speakerOn}
+              />
+            )}
+
+            {/* Full-Screen Remote Video Background when active */}
+            {isVideo && outgoingCall && (
+              <div className="absolute inset-0 z-0 bg-black">
+                <RemoteCallVideo
+                  stream={outgoingCall.stream ?? null}
+                  streamVersion={outgoingCall.streamVersion ?? 0}
+                  remoteCameraEnabled={remoteCameraEnabled}
+                  onHasVideoChange={setHasRemoteVideo}
+                />
+                {/* Scrims for legible overlay controls on top & bottom */}
+                <div className="pointer-events-none absolute inset-x-0 top-0 h-36 bg-gradient-to-b from-black/75 to-transparent" />
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 h-52 bg-gradient-to-t from-black/85 to-transparent" />
               </div>
-              <button
-                type="button"
-                onClick={() => setSpeakerOn((s) => !s)}
-                aria-label="Toggle speaker"
-                className={cn(
-                  "grid size-11 place-items-center rounded-full bg-white/10 backdrop-blur-md transition hover:bg-white/20",
-                  speakerOn ? "text-emerald-400" : "text-white/70",
+            )}
+
+            {/* Top Bar: Call Status + Speaker Toggle + Local PiP */}
+            <div className="relative z-20 flex items-start justify-between gap-3 pt-[env(safe-area-inset-top)]">
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-2 rounded-full bg-black/45 px-4 py-1.5 text-xs font-semibold backdrop-blur-md">
+                  <span
+                    className={cn(
+                      "size-2 rounded-full",
+                      outgoingCall?.status === "reconnecting"
+                        ? "animate-pulse bg-amber-400"
+                        : "animate-pulse bg-emerald-400",
+                    )}
+                  />
+                  <span>
+                    {incomingCall
+                      ? `Incoming ${incomingCall.callType} call`
+                      : {
+                          accepted: `Encrypted call · ${formatDuration(seconds)}`,
+                          preparing: "Preparing your device…",
+                          connecting: "Connecting…",
+                          ringing: "Ringing…",
+                          reconnecting: "Reconnecting…",
+                        }[outgoingCall!.status]}
+                  </span>
+                </div>
+
+                {showFullScreenRemoteVideo && (
+                  <div className="px-1 drop-shadow">
+                    <p className="font-display text-lg font-extrabold leading-tight">
+                      {activePeerData.fullName}
+                    </p>
+                    <p className="text-xs text-white/75">
+                      {activePeerData.displayHandle || "@reader"}
+                    </p>
+                  </div>
                 )}
-              >
-                <Volume2 className="size-5" />
-              </button>
+              </div>
+
+              <div className="flex flex-col items-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setSpeakerOn((s) => !s)}
+                  aria-label={speakerOn ? "Mute call speaker" : "Unmute call speaker"}
+                  className={cn(
+                    "grid size-11 place-items-center rounded-full bg-black/45 backdrop-blur-md transition hover:bg-black/65",
+                    speakerOn ? "text-emerald-400" : "text-rose-400",
+                  )}
+                >
+                  {speakerOn ? <Volume2 className="size-5" /> : <VolumeX className="size-5" />}
+                </button>
+
+                {/* Local Camera PiP Preview during Video Calls */}
+                {isVideo && outgoingCall && (
+                  <div className="relative h-36 w-24 overflow-hidden rounded-2xl border-2 border-white/25 bg-zinc-900 shadow-2xl sm:h-44 sm:w-32">
+                    {cameraEnabled && outgoingCall.localStream ? (
+                      <LocalCallPreview
+                        stream={outgoingCall.localStream}
+                        streamVersion={outgoingCall.streamVersion ?? 0}
+                        cameraEnabled={cameraEnabled}
+                        facingMode={facingMode}
+                      />
+                    ) : (
+                      <div className="grid size-full place-items-center bg-zinc-900 text-center text-[11px] font-semibold text-zinc-400">
+                        <div className="flex flex-col items-center gap-1">
+                          <CameraOff className="size-5" />
+                          <span>Camera off</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
 
-            {/* Center: Profile Avatar / Remote Video Stream */}
-            <div className="relative my-auto flex flex-col items-center justify-center text-center">
-              {isVideo && isConnected && outgoingCall?.stream ? (
-                <div className="absolute inset-0 overflow-hidden rounded-[32px] bg-black shadow-2xl">
-                  <CallMedia stream={outgoingCall.stream} video={true} />
-                </div>
-              ) : (
+            {/* Center: Profile Avatar & Name (shown on audio calls or until remote video frames appear) */}
+            {!showFullScreenRemoteVideo && (
+              <div className="relative z-10 my-auto flex flex-col items-center justify-center text-center">
                 <div className="relative mb-6">
                   {incomingCall && (
                     <span className="absolute -inset-4 animate-ping rounded-full bg-emerald-500/30" />
@@ -285,18 +405,37 @@ export function GlobalCallAndAlertLayer() {
                     )}
                   </div>
                 </div>
-              )}
 
-              <h2 className="font-display text-2xl font-extrabold md:text-3xl">
-                {activePeerData.fullName}
-              </h2>
-              <p className="mt-1 text-sm text-zinc-400">
-                {activePeerData.displayHandle || "@reader"}
-              </p>
-            </div>
+                <h2 className="font-display text-2xl font-extrabold md:text-3xl">
+                  {activePeerData.fullName}
+                </h2>
+                <p className="mt-1 text-sm text-zinc-400">
+                  {activePeerData.displayHandle || "@reader"}
+                </p>
+                {isConnected && (
+                  <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+                    {!isVideo && (
+                      <p className="rounded-full bg-white/10 px-3.5 py-1 text-xs font-semibold text-emerald-300">
+                        {micMuted ? "Microphone muted" : "Voice connected"}
+                      </p>
+                    )}
+                    {isVideo && remoteCameraEnabled === false && (
+                      <p className="rounded-full bg-white/10 px-3.5 py-1 text-xs font-semibold text-amber-200">
+                        Camera off
+                      </p>
+                    )}
+                    {remoteMicMuted && (
+                      <p className="rounded-full bg-white/10 px-3.5 py-1 text-xs font-semibold text-zinc-300">
+                        Remote muted
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Bottom Bar: Action Controls & End Call / Receive */}
-            <div className="mx-auto flex w-full max-w-md flex-col gap-6">
+            <div className="relative z-20 mx-auto mt-auto flex w-full max-w-md flex-col gap-5 pb-[env(safe-area-inset-bottom)]">
               {incomingCall ? (
                 <div className="grid grid-cols-2 gap-4">
                   <button
@@ -327,14 +466,16 @@ export function GlobalCallAndAlertLayer() {
                 </div>
               ) : (
                 <>
-                  <div className="flex items-center justify-center gap-6">
+                  <div className="flex items-center justify-center gap-5">
                     <button
                       type="button"
-                      onClick={() => setMicMuted((m) => !m)}
+                      onClick={() => setCallMicMuted(!micMuted)}
                       aria-label={micMuted ? "Unmute microphone" : "Mute microphone"}
                       className={cn(
                         "grid size-14 place-items-center rounded-full transition hover:scale-105",
-                        micMuted ? "bg-white text-zinc-950" : "bg-white/15 backdrop-blur-md",
+                        micMuted
+                          ? "bg-white text-zinc-950"
+                          : "bg-black/45 text-white backdrop-blur-md hover:bg-black/65",
                       )}
                     >
                       {micMuted ? <MicOff className="size-6" /> : <Mic className="size-6" />}
@@ -343,18 +484,32 @@ export function GlobalCallAndAlertLayer() {
                     {isVideo && (
                       <button
                         type="button"
-                        onClick={() => setVideoOff((v) => !v)}
-                        aria-label={videoOff ? "Turn camera on" : "Turn camera off"}
+                        onClick={() => setCallCameraEnabled(!cameraEnabled)}
+                        aria-label={cameraEnabled ? "Turn camera off" : "Turn camera on"}
                         className={cn(
                           "grid size-14 place-items-center rounded-full transition hover:scale-105",
-                          videoOff ? "bg-white text-zinc-950" : "bg-white/15 backdrop-blur-md",
+                          !cameraEnabled
+                            ? "bg-white text-zinc-950"
+                            : "bg-black/45 text-white backdrop-blur-md hover:bg-black/65",
                         )}
                       >
-                        {videoOff ? (
+                        {!cameraEnabled ? (
                           <CameraOff className="size-6" />
                         ) : (
                           <Camera className="size-6" />
                         )}
+                      </button>
+                    )}
+
+                    {isVideo && canSwitchCamera && (
+                      <button
+                        type="button"
+                        disabled={switchingCamera}
+                        onClick={() => void handleSwitchCamera()}
+                        aria-label="Switch front or rear camera"
+                        className="grid size-14 place-items-center rounded-full bg-black/45 text-white backdrop-blur-md transition hover:scale-105 hover:bg-black/65 disabled:opacity-50"
+                      >
+                        <SwitchCamera className="size-6" />
                       </button>
                     )}
                   </div>

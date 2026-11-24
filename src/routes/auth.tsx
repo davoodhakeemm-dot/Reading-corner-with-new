@@ -14,6 +14,7 @@ import {
   Lock,
   Mail,
   Moon,
+  Phone,
   ShieldCheck,
   Sparkles,
   Sun,
@@ -30,13 +31,19 @@ import { ReadingActions } from "@/components/ReadingActions";
 import { TripleTapExit } from "@/components/TripleTapExit";
 import { WaterGlowButton } from "@/components/WaterGlowButton";
 import {
+  AccountChoiceRequiredError,
+  confirmEmailPasswordReset,
   initialsOf,
   loginAccount,
   registerAccount,
+  resetPasswordWithOtp,
+  sendOtp,
   sendPasswordReset,
   setSoundEnabled,
   signInWithGoogle,
   useChat,
+  type AccountChoiceOption,
+  type LoginMode,
 } from "@/lib/chat-store";
 import { resolveWaterButtonVariant, type SecretThemeId } from "@/lib/secret-themes";
 import { cn } from "@/lib/utils";
@@ -51,7 +58,7 @@ export const Route = createFileRoute("/auth")({
       {
         name: "description",
         content:
-          "Sign in or create your Reading Corner account to sync your library, discover readers, and chat in real time.",
+          "Sign in or create your Reading Corner account using Gmail, Phone Number, or Username.",
       },
       { name: "robots", content: "noindex" },
     ],
@@ -60,6 +67,10 @@ export const Route = createFileRoute("/auth")({
 });
 
 type AuthMode = "login" | "register" | "forgot";
+type ExplicitLoginMethod = Exclude<LoginMode, "auto">;
+type ForgotChannel = "email" | "phone";
+
+const COUNTRY_CODES = ["+91", "+1", "+44", "+971", "+966", "+65", "+61"];
 
 function GoogleIcon() {
   return (
@@ -87,20 +98,36 @@ function GoogleIcon() {
 function AuthPage() {
   const navigate = useNavigate();
   const { next } = Route.useSearch();
-  const { ready, me, soundEnabled } = useChat();
+  const { ready, me, soundEnabled, otpConfigured } = useChat();
 
   const [mode, setMode] = useState<AuthMode>("login");
+  const [loginMethod, setLoginMethod] = useState<ExplicitLoginMethod>("gmail");
   const [backdropTheme, setBackdropTheme] = useState<SecretThemeId>("instagram");
 
-  // Fields (NO OTP for account creation)
+  // Credentials & profile fields
   const [email, setEmail] = useState("");
+  const [countryCode, setCountryCode] = useState("+91");
+  const [phone, setPhone] = useState("");
   const [username, setUsername] = useState("");
   const [fullName, setFullName] = useState("");
   const [bio, setBio] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
   const [dp, setDp] = useState<string | null>(null);
+
+  // Multi-account disambiguation when siblings share contact & password
+  const [accountChoices, setAccountChoices] = useState<AccountChoiceOption[] | null>(null);
+
+  // Forgot password states
+  const [forgotChannel, setForgotChannel] = useState<ForgotChannel>("email");
+  const [emailOtpSent, setEmailOtpSent] = useState(false);
+  const [smsOtpSent, setSmsOtpSent] = useState(false);
+  const [resetCode, setResetCode] = useState("");
+  const [resetNewPwd, setResetNewPwd] = useState("");
+  const [resetUsername, setResetUsername] = useState("");
+
   const [busy, setBusy] = useState(false);
   const [googleBusy, setGoogleBusy] = useState(false);
   const [error, setError] = useState("");
@@ -130,6 +157,19 @@ function AuthPage() {
     setInfo("");
     setPassword("");
     setConfirm("");
+    setAccountChoices(null);
+    setEmailOtpSent(false);
+    setSmsOtpSent(false);
+    setResetCode("");
+    setResetNewPwd("");
+  }
+
+  function switchLoginMethod(nextMethod: ExplicitLoginMethod) {
+    playWaterSound("pop", soundEnabled);
+    setLoginMethod(nextMethod);
+    setError("");
+    setInfo("");
+    setAccountChoices(null);
   }
 
   function pickDp(e: React.ChangeEvent<HTMLInputElement>) {
@@ -141,6 +181,16 @@ function AuthPage() {
     e.target.value = "";
   }
 
+  function goAfterLogin() {
+    if (next && next.startsWith("/nfc/")) {
+      window.location.assign(next);
+    } else if (next && next.startsWith("/")) {
+      navigate({ to: next as "/messages", replace: true });
+    } else {
+      navigate({ to: "/messages", replace: true });
+    }
+  }
+
   async function handleGoogleLogin() {
     setError("");
     setNeedsProviderHelp(false);
@@ -149,15 +199,63 @@ function AuthPage() {
     try {
       await signInWithGoogle();
       toast.success("Signed in with Google");
-      if (next && next.startsWith("/nfc/")) {
-        window.location.assign(next);
-      } else {
-        navigate({ to: "/messages", replace: true });
-      }
+      goAfterLogin();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not sign in with Google.");
     } finally {
       setGoogleBusy(false);
+    }
+  }
+
+  async function submitLoginWithTarget(targetUserId?: string) {
+    setError("");
+    setNeedsProviderHelp(false);
+    setInfo("");
+
+    if (!password) {
+      setError("Password is required.");
+      return;
+    }
+
+    if (loginMethod === "gmail" && !email.trim()) {
+      setError("Enter your Gmail or email address.");
+      return;
+    }
+    if (loginMethod === "phone" && !phone.trim()) {
+      setError("Enter your phone number.");
+      return;
+    }
+    if (loginMethod === "username" && !username.trim()) {
+      setError("Enter your username.");
+      return;
+    }
+
+    setBusy(true);
+    try {
+      await loginAccount({
+        mode: loginMethod,
+        ...(loginMethod === "gmail" ? { email: email.trim() } : {}),
+        ...(loginMethod === "phone" ? { phone: phone.trim() } : {}),
+        countryCode,
+        ...(loginMethod === "username" ? { username: username.trim() } : {}),
+        password,
+        ...(targetUserId ? { targetUserId } : {}),
+      });
+      setAccountChoices(null);
+      playWaterSound("ripple", soundEnabled);
+      toast.success("Welcome back");
+      goAfterLogin();
+    } catch (err) {
+      if (err instanceof AccountChoiceRequiredError) {
+        setAccountChoices(err.accounts);
+        setInfo("Multiple linked accounts match your credentials. Pick one to open:");
+      } else {
+        const eObj = err as Error & { needsProviderConfig?: boolean };
+        setError(eObj.message || "Invalid credentials.");
+        if (eObj.needsProviderConfig) setNeedsProviderHelp(true);
+      }
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -168,31 +266,7 @@ function AuthPage() {
     setInfo("");
 
     if (mode === "login") {
-      if (!email.trim()) {
-        setError("Enter your account email or @username.");
-        return;
-      }
-      if (!password) {
-        setError("Password is required.");
-        return;
-      }
-      setBusy(true);
-      try {
-        await loginAccount({ email: email.trim(), password });
-        playWaterSound("ripple", soundEnabled);
-        toast.success("Welcome back");
-        if (next && next.startsWith("/nfc/")) {
-          window.location.assign(next);
-        } else {
-          navigate({ to: "/messages", replace: true });
-        }
-      } catch (err) {
-        const eObj = err as Error & { needsProviderConfig?: boolean };
-        setError(eObj.message || "Invalid email or password.");
-        if (eObj.needsProviderConfig) setNeedsProviderHelp(true);
-      } finally {
-        setBusy(false);
-      }
+      await submitLoginWithTarget();
       return;
     }
 
@@ -202,8 +276,13 @@ function AuthPage() {
         return;
       }
       const cleanEmail = email.trim();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
-        setError("Enter a valid email address.");
+      const cleanPhone = phone.trim();
+      if (!cleanEmail && !cleanPhone) {
+        setError("Enter your Gmail / email address or phone number.");
+        return;
+      }
+      if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
+        setError("Enter a valid Gmail or email address.");
         return;
       }
       if (username.trim() && username.trim().replace(/^@+/, "").length < 2) {
@@ -223,7 +302,8 @@ function AuthPage() {
       try {
         await registerAccount({
           fullName: fullName.trim(),
-          email: cleanEmail,
+          ...(cleanEmail ? { email: cleanEmail } : {}),
+          ...(cleanPhone ? { phone: cleanPhone, countryCode } : {}),
           ...(username.trim() ? { username: username.trim() } : {}),
           password,
           bio: bio.trim(),
@@ -231,11 +311,7 @@ function AuthPage() {
         });
         playWaterSound("ripple", soundEnabled);
         toast.success("Account created and saved permanently");
-        if (next && next.startsWith("/nfc/")) {
-          window.location.assign(next);
-        } else {
-          navigate({ to: "/messages", replace: true });
-        }
+        goAfterLogin();
       } catch (err) {
         const eObj = err as Error & { needsProviderConfig?: boolean };
         setError(eObj.message || "Could not create account.");
@@ -247,19 +323,97 @@ function AuthPage() {
     }
 
     if (mode === "forgot") {
-      const cleanEmail = email.trim();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
-        setError("Enter your registered email address.");
+      if (forgotChannel === "email") {
+        const cleanEmail = email.trim();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
+          setError("Enter your registered Gmail or email address.");
+          return;
+        }
+
+        if (emailOtpSent) {
+          if (!resetCode.trim() || resetNewPwd.length < 8) {
+            setError("Enter the verification code and a new password (8+ chars).");
+            return;
+          }
+          setBusy(true);
+          try {
+            const res = await confirmEmailPasswordReset({
+              email: cleanEmail,
+              code: resetCode.trim(),
+              newPassword: resetNewPwd,
+              ...(resetUsername.trim() ? { username: resetUsername.trim() } : {}),
+            });
+            toast.success(
+              `Password updated${res.updatedHandle ? ` for ${res.updatedHandle}` : ""}. You can sign in now.`,
+            );
+            switchMode("login");
+          } catch (err) {
+            setError(err instanceof Error ? err.message : "Could not reset password.");
+          } finally {
+            setBusy(false);
+          }
+          return;
+        }
+
+        setBusy(true);
+        try {
+          const res = await sendPasswordReset(cleanEmail);
+          playWaterSound("ripple", soundEnabled);
+          if (res.mode === "email_otp") {
+            setEmailOtpSent(true);
+            setInfo(`6-digit reset code sent to ${cleanEmail}. Enter it below.`);
+            toast.success("Reset code sent");
+          } else {
+            setInfo(`Password reset link sent to ${cleanEmail}. Check your inbox.`);
+            toast.success("Password reset email sent");
+          }
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "Could not send password reset email.");
+        } finally {
+          setBusy(false);
+        }
+        return;
+      }
+
+      // Phone SMS OTP reset
+      if (!phone.trim()) {
+        setError("Enter your registered phone number.");
+        return;
+      }
+
+      if (!smsOtpSent) {
+        setBusy(true);
+        try {
+          await sendOtp({ phone: phone.trim(), countryCode, purpose: "reset_password" });
+          setSmsOtpSent(true);
+          setInfo("SMS verification code sent. Enter the code and choose a new password.");
+          toast.success("SMS OTP sent");
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "Could not send SMS OTP.");
+        } finally {
+          setBusy(false);
+        }
+        return;
+      }
+
+      if (!resetCode.trim() || resetNewPwd.length < 8) {
+        setError("Enter the SMS OTP code and a new password (8+ chars).");
         return;
       }
       setBusy(true);
       try {
-        await sendPasswordReset(cleanEmail);
-        playWaterSound("ripple", soundEnabled);
-        setInfo(`Password reset link sent to ${cleanEmail}. Check your inbox.`);
-        toast.success("Password reset email sent");
+        const res = await resetPasswordWithOtp({
+          phone: phone.trim(),
+          countryCode,
+          code: resetCode.trim(),
+          newPassword: resetNewPwd,
+        });
+        toast.success(
+          `Password updated${res.updatedHandle ? ` for ${res.updatedHandle}` : ""}. You can sign in now.`,
+        );
+        switchMode("login");
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Could not send password reset email.");
+        setError(err instanceof Error ? err.message : "OTP verification failed.");
       } finally {
         setBusy(false);
       }
@@ -336,23 +490,12 @@ function AuthPage() {
                 : "bg-gradient-to-tr from-[#38bdf8]/30 via-[#93c5fd]/32 to-[#e0f2fe]/55",
           )}
         />
-        {isLiquid && (
-          <motion.div
-            animate={{
-              x: [0, 18, -18, 0],
-              y: [0, -16, 14, 0],
-              scale: [0.96, 1.08, 0.98, 0.96],
-            }}
-            transition={{ duration: 16, repeat: Infinity, ease: "easeInOut" }}
-            className="absolute left-1/2 top-1/3 size-[22rem] -translate-x-1/2 rounded-full bg-gradient-to-tr from-[#fed7aa]/38 via-[#c4b5fd]/32 to-[#5eead4]/36 blur-3xl"
-          />
-        )}
       </div>
 
       <TripleTapExit />
       <ReadingActions themeId={backdropTheme} />
 
-      <div className="relative mx-auto flex min-h-[calc(100dvh-3.5rem)] w-full max-w-5xl flex-col justify-center lg:grid lg:grid-cols-[1fr_460px] lg:items-center lg:gap-12">
+      <div className="relative mx-auto flex min-h-[calc(100dvh-3.5rem)] w-full max-w-5xl flex-col justify-center lg:grid lg:grid-cols-[1fr_480px] lg:items-center lg:gap-12">
         {/* Left Info & Quick Header */}
         <div className="mb-6 lg:mb-0">
           <div className="flex flex-wrap items-center justify-between gap-2.5">
@@ -452,7 +595,8 @@ function AuthPage() {
                 >
                   <Mail className="size-4" />
                 </span>
-                Cloud-synced accounts that stay logged in across refreshes, restarts, and devices.
+                Sign in with Gmail, Phone Number, Username, or Google — link up to 3 accounts per
+                verified contact.
               </p>
               <p className="flex items-center gap-2.5">
                 <span
@@ -463,7 +607,8 @@ function AuthPage() {
                 >
                   <ShieldCheck className="size-4" />
                 </span>
-                See every registered reader right on the Chat page and send real-time DMs.
+                Real-time WebSocket chat, calls, and permanent personal QR &amp; NFC links synced
+                cleanly.
               </p>
               <p className="flex items-center gap-2.5">
                 <span
@@ -474,7 +619,8 @@ function AuthPage() {
                 >
                   <Lock className="size-4" />
                 </span>
-                Your email and password remain private and are never shown to other users.
+                Your email, phone number, and password remain private and are never shown to other
+                readers.
               </p>
             </div>
           </motion.div>
@@ -494,7 +640,7 @@ function AuthPage() {
                 : "neu-card-light border-white/95 text-[#1e293b]",
           )}
         >
-          {/* Raised 3D / Iridescent Liquid Glass Emblem Medallion */}
+          {/* Emblem Medallion */}
           <div className="flex flex-col items-center text-center">
             <motion.div
               animate={{ y: [0, -5, 0] }}
@@ -543,16 +689,16 @@ function AuthPage() {
                 </h2>
                 <p className={cn("mt-1 text-xs font-medium", mutedTextClass)}>
                   {mode === "login"
-                    ? "Sign in with Google or your registered email"
+                    ? "Choose Gmail, Phone Number, Username, or Google"
                     : mode === "register"
-                      ? "Create one permanent account — no OTP needed"
-                      : "We will email you a password reset link"}
+                      ? "Create a permanent account with your own handle & personal link"
+                      : "Recover access using your Gmail or registered phone"}
                 </p>
               </motion.div>
             </AnimatePresence>
           </div>
 
-          {/* Inset Mode Switcher */}
+          {/* Auth Primary Mode Switcher (Login | Create Account) */}
           <div className="mt-5">
             {mode !== "forgot" ? (
               <div
@@ -649,7 +795,7 @@ function AuthPage() {
                     isDark ? "text-slate-400" : isLiquid ? "text-[#585478]" : "text-[#64748b]",
                   )}
                 >
-                  or with email
+                  {mode === "login" ? "or sign in with" : "or register with"}
                 </span>
                 <span
                   className={cn(
@@ -661,20 +807,216 @@ function AuthPage() {
             </div>
           )}
 
+          {/* Explicit 3-Method Login Selector */}
+          {mode === "login" && (
+            <div
+              role="tablist"
+              aria-label="Login method"
+              className={cn(
+                "mb-3.5 grid grid-cols-3 gap-1 rounded-2xl p-1",
+                isDark
+                  ? "neu-inset-dark"
+                  : isLiquid
+                    ? "liquid-glass-inset border border-white/75"
+                    : "neu-inset-light",
+              )}
+            >
+              {(
+                [
+                  { id: "gmail", label: "Gmail", icon: Mail },
+                  { id: "phone", label: "Phone", icon: Phone },
+                  { id: "username", label: "Username", icon: AtSign },
+                ] as const
+              ).map(({ id, label, icon: Icon }) => {
+                const active = loginMethod === id;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => switchLoginMethod(id)}
+                    className={cn(
+                      "relative flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl px-2 text-xs font-bold transition",
+                      active
+                        ? "text-white"
+                        : isDark
+                          ? "text-slate-300 hover:text-white"
+                          : isLiquid
+                            ? "text-[#4e4970]"
+                            : "text-[#475569]",
+                    )}
+                  >
+                    {active && (
+                      <motion.span
+                        layoutId="loginMethodTab"
+                        transition={{ type: "spring", stiffness: 400, damping: 28 }}
+                        className={cn(
+                          "absolute inset-0 rounded-xl",
+                          isLiquid
+                            ? "bg-gradient-to-r from-[#8b5cf6] to-[#2dd4bf]"
+                            : "bg-gradient-to-r from-[#38bdf8] to-[#0284c7]",
+                        )}
+                      />
+                    )}
+                    <Icon className="relative z-10 size-3.5 shrink-0" />
+                    <span className="relative z-10">{label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Forgot Password Channel Selector */}
+          {mode === "forgot" && (
+            <div
+              className={cn(
+                "mt-4 mb-3.5 grid grid-cols-2 gap-1 rounded-2xl p-1",
+                isDark
+                  ? "neu-inset-dark"
+                  : isLiquid
+                    ? "liquid-glass-inset border border-white/75"
+                    : "neu-inset-light",
+              )}
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setForgotChannel("email");
+                  setError("");
+                  setInfo("");
+                }}
+                className={cn(
+                  "min-h-[38px] rounded-xl text-xs font-bold transition",
+                  forgotChannel === "email"
+                    ? "bg-gradient-to-r from-[#38bdf8] to-[#0284c7] text-white"
+                    : mutedTextClass,
+                )}
+              >
+                Reset via Gmail
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setForgotChannel("phone");
+                  setError("");
+                  setInfo("");
+                }}
+                className={cn(
+                  "min-h-[38px] rounded-xl text-xs font-bold transition",
+                  forgotChannel === "phone"
+                    ? "bg-gradient-to-r from-[#38bdf8] to-[#0284c7] text-white"
+                    : mutedTextClass,
+                )}
+              >
+                Reset via Phone OTP
+              </button>
+            </div>
+          )}
+
           <AnimatePresence mode="wait">
             <motion.div
-              key={mode}
+              key={`${mode}-${loginMethod}-${forgotChannel}`}
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.2 }}
-              className={mode === "forgot" ? "mt-4" : ""}
+              transition={{ duration: 0.18 }}
             >
               <form
                 onSubmit={handleSubmit}
                 noValidate
                 className={mode === "register" ? "space-y-3" : "space-y-3.5"}
               >
+                {/* LOGIN MODE FIELDS */}
+                {mode === "login" && loginMethod === "gmail" && (
+                  <div
+                    className={cn(
+                      "flex min-h-[52px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                      insetClass,
+                    )}
+                  >
+                    <Mail className={cn("size-4 shrink-0", iconTintClass)} />
+                    <input
+                      type="email"
+                      inputMode="email"
+                      value={email}
+                      onChange={(e) => {
+                        setEmail(e.target.value);
+                        setAccountChoices(null);
+                      }}
+                      placeholder="Gmail or email address *"
+                      aria-label="Gmail or email address"
+                      autoComplete="email"
+                      className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                    />
+                  </div>
+                )}
+
+                {mode === "login" && loginMethod === "phone" && (
+                  <div className="flex gap-2">
+                    <select
+                      value={countryCode}
+                      onChange={(e) => setCountryCode(e.target.value)}
+                      aria-label="Country code"
+                      className={cn(
+                        "min-h-[52px] rounded-full px-3 text-xs font-bold outline-none",
+                        insetClass,
+                      )}
+                    >
+                      {COUNTRY_CODES.map((c) => (
+                        <option key={c} value={c} className="text-slate-900">
+                          {c}
+                        </option>
+                      ))}
+                    </select>
+                    <div
+                      className={cn(
+                        "flex min-h-[52px] flex-1 items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                        insetClass,
+                      )}
+                    >
+                      <Phone className={cn("size-4 shrink-0", iconTintClass)} />
+                      <input
+                        type="tel"
+                        inputMode="tel"
+                        value={phone}
+                        onChange={(e) => {
+                          setPhone(e.target.value);
+                          setAccountChoices(null);
+                        }}
+                        placeholder="Phone number *"
+                        aria-label="Phone number"
+                        autoComplete="tel-national"
+                        className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {mode === "login" && loginMethod === "username" && (
+                  <div
+                    className={cn(
+                      "flex min-h-[52px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                      insetClass,
+                    )}
+                  >
+                    <AtSign className={cn("size-4 shrink-0", iconTintClass)} />
+                    <input
+                      type="text"
+                      value={username}
+                      onChange={(e) => {
+                        setUsername(e.target.value);
+                        setAccountChoices(null);
+                      }}
+                      placeholder="Username (e.g. @aanya.reads) *"
+                      aria-label="Username"
+                      autoComplete="username"
+                      className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                    />
+                  </div>
+                )}
+
+                {/* REGISTER MODE FIELDS */}
                 {mode === "register" && (
                   <>
                     <div className="flex items-center gap-3.5">
@@ -760,32 +1102,230 @@ function AuthPage() {
                         className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
                       />
                     </div>
+
+                    <div
+                      className={cn(
+                        "flex min-h-[50px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                        insetClass,
+                      )}
+                    >
+                      <Mail className={cn("size-4 shrink-0", iconTintClass)} />
+                      <input
+                        type="email"
+                        inputMode="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="Gmail or email address"
+                        aria-label="Gmail or email address"
+                        autoComplete="email"
+                        className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                      />
+                    </div>
+
+                    <div className="flex gap-2">
+                      <select
+                        value={countryCode}
+                        onChange={(e) => setCountryCode(e.target.value)}
+                        aria-label="Country code"
+                        className={cn(
+                          "min-h-[50px] rounded-full px-3 text-xs font-bold outline-none",
+                          insetClass,
+                        )}
+                      >
+                        {COUNTRY_CODES.map((c) => (
+                          <option key={c} value={c} className="text-slate-900">
+                            {c}
+                          </option>
+                        ))}
+                      </select>
+                      <div
+                        className={cn(
+                          "flex min-h-[50px] flex-1 items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                          insetClass,
+                        )}
+                      >
+                        <Phone className={cn("size-4 shrink-0", iconTintClass)} />
+                        <input
+                          type="tel"
+                          inputMode="tel"
+                          value={phone}
+                          onChange={(e) => setPhone(e.target.value)}
+                          placeholder="Phone number (optional if email provided)"
+                          aria-label="Phone number"
+                          autoComplete="tel-national"
+                          className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                        />
+                      </div>
+                    </div>
                   </>
                 )}
 
-                {/* Recessed Email / Login Identifier Input */}
-                <div
-                  className={cn(
-                    "flex min-h-[52px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
-                    insetClass,
-                  )}
-                >
-                  <Mail className={cn("size-4 shrink-0", iconTintClass)} />
-                  <input
-                    type={mode === "login" ? "text" : "email"}
-                    inputMode={mode === "login" ? "text" : "email"}
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder={
-                      mode === "login" ? "Email, @username, or Phone *" : "Email address *"
-                    }
-                    aria-label={mode === "login" ? "Email, @username, or Phone" : "Email address"}
-                    autoComplete={mode === "login" ? "username" : "email"}
-                    className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
-                  />
-                </div>
+                {/* FORGOT PASSWORD FIELDS */}
+                {mode === "forgot" && forgotChannel === "email" && (
+                  <>
+                    <div
+                      className={cn(
+                        "flex min-h-[52px] items-center gap-3 rounded-full px-4 transition focus-within:ring-2",
+                        insetClass,
+                      )}
+                    >
+                      <Mail className={cn("size-4 shrink-0", iconTintClass)} />
+                      <input
+                        type="email"
+                        inputMode="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="Registered Gmail or email *"
+                        aria-label="Registered Gmail or email"
+                        className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                      />
+                    </div>
 
-                {/* Recessed Password Input */}
+                    {emailOtpSent && (
+                      <>
+                        <div
+                          className={cn(
+                            "flex min-h-[50px] items-center gap-3 rounded-full px-4",
+                            insetClass,
+                          )}
+                        >
+                          <KeyRound className={cn("size-4 shrink-0", iconTintClass)} />
+                          <input
+                            type="text"
+                            value={resetCode}
+                            onChange={(e) => setResetCode(e.target.value)}
+                            placeholder="6-digit reset code *"
+                            className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                          />
+                        </div>
+                        <div
+                          className={cn(
+                            "flex min-h-[50px] items-center gap-3 rounded-full px-4",
+                            insetClass,
+                          )}
+                        >
+                          <AtSign className={cn("size-4 shrink-0", iconTintClass)} />
+                          <input
+                            type="text"
+                            value={resetUsername}
+                            onChange={(e) => setResetUsername(e.target.value)}
+                            placeholder="Target @username (if multiple accounts)"
+                            className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                          />
+                        </div>
+                        <div
+                          className={cn(
+                            "flex min-h-[50px] items-center gap-3 rounded-full px-4",
+                            insetClass,
+                          )}
+                        >
+                          <Lock className={cn("size-4 shrink-0", iconTintClass)} />
+                          <input
+                            type={showPassword ? "text" : "password"}
+                            value={resetNewPwd}
+                            onChange={(e) => setResetNewPwd(e.target.value)}
+                            placeholder="New password (8+ chars) *"
+                            className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowPassword((s) => !s)}
+                            aria-label={showPassword ? "Hide password" : "Show password"}
+                            className="grid size-8 shrink-0 place-items-center rounded-full opacity-70 hover:opacity-100"
+                          >
+                            {showPassword ? (
+                              <EyeOff className="size-4" />
+                            ) : (
+                              <Eye className="size-4" />
+                            )}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
+
+                {mode === "forgot" && forgotChannel === "phone" && (
+                  <>
+                    <div className="flex gap-2">
+                      <select
+                        value={countryCode}
+                        onChange={(e) => setCountryCode(e.target.value)}
+                        aria-label="Country code"
+                        className={cn(
+                          "min-h-[52px] rounded-full px-3 text-xs font-bold outline-none",
+                          insetClass,
+                        )}
+                      >
+                        {COUNTRY_CODES.map((c) => (
+                          <option key={c} value={c} className="text-slate-900">
+                            {c}
+                          </option>
+                        ))}
+                      </select>
+                      <div
+                        className={cn(
+                          "flex min-h-[52px] flex-1 items-center gap-3 rounded-full px-4",
+                          insetClass,
+                        )}
+                      >
+                        <Phone className={cn("size-4 shrink-0", iconTintClass)} />
+                        <input
+                          type="tel"
+                          inputMode="tel"
+                          value={phone}
+                          onChange={(e) => setPhone(e.target.value)}
+                          placeholder="Registered phone number *"
+                          className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                        />
+                      </div>
+                    </div>
+
+                    {!otpConfigured && (
+                      <p className={cn("text-xs", mutedTextClass)}>
+                        Note: Phone SMS OTP requires Twilio configuration on the server. Use Gmail
+                        reset if SMS OTP is not enabled.
+                      </p>
+                    )}
+
+                    {smsOtpSent && (
+                      <>
+                        <div
+                          className={cn(
+                            "flex min-h-[50px] items-center gap-3 rounded-full px-4",
+                            insetClass,
+                          )}
+                        >
+                          <KeyRound className={cn("size-4 shrink-0", iconTintClass)} />
+                          <input
+                            type="text"
+                            value={resetCode}
+                            onChange={(e) => setResetCode(e.target.value)}
+                            placeholder="SMS OTP code *"
+                            className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                          />
+                        </div>
+                        <div
+                          className={cn(
+                            "flex min-h-[50px] items-center gap-3 rounded-full px-4",
+                            insetClass,
+                          )}
+                        >
+                          <Lock className={cn("size-4 shrink-0", iconTintClass)} />
+                          <input
+                            type={showPassword ? "text" : "password"}
+                            value={resetNewPwd}
+                            onChange={(e) => setResetNewPwd(e.target.value)}
+                            placeholder="New password (8+ chars) *"
+                            className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
+                          />
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
+
+                {/* PASSWORD INPUT (Login + Register) */}
                 {mode !== "forgot" && (
                   <div
                     className={cn(
@@ -797,7 +1337,10 @@ function AuthPage() {
                     <input
                       type={showPassword ? "text" : "password"}
                       value={password}
-                      onChange={(e) => setPassword(e.target.value)}
+                      onChange={(e) => {
+                        setPassword(e.target.value);
+                        setAccountChoices(null);
+                      }}
                       placeholder={mode === "login" ? "Password *" : "Create password (8+ chars) *"}
                       aria-label="Password"
                       autoComplete={mode === "login" ? "current-password" : "new-password"}
@@ -814,6 +1357,7 @@ function AuthPage() {
                   </div>
                 )}
 
+                {/* CONFIRM PASSWORD & BIO (Register) */}
                 {mode === "register" && (
                   <>
                     <div
@@ -824,7 +1368,7 @@ function AuthPage() {
                     >
                       <Lock className={cn("size-4 shrink-0", iconTintClass)} />
                       <input
-                        type={showPassword ? "text" : "password"}
+                        type={showConfirm ? "text" : "password"}
                         value={confirm}
                         onChange={(e) => setConfirm(e.target.value)}
                         placeholder="Confirm password *"
@@ -832,6 +1376,14 @@ function AuthPage() {
                         autoComplete="new-password"
                         className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:opacity-65"
                       />
+                      <button
+                        type="button"
+                        onClick={() => setShowConfirm((s) => !s)}
+                        aria-label={showConfirm ? "Hide confirm password" : "Show confirm password"}
+                        className="grid size-8 shrink-0 place-items-center rounded-full opacity-70 transition hover:opacity-100"
+                      >
+                        {showConfirm ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                      </button>
                     </div>
 
                     <input
@@ -847,6 +1399,51 @@ function AuthPage() {
                       )}
                     />
                   </>
+                )}
+
+                {/* Multi-Account Disambiguation Picker */}
+                {accountChoices && accountChoices.length > 1 && (
+                  <div
+                    data-testid="account-choice-picker"
+                    className="space-y-2 rounded-2xl border border-sky-400/35 bg-sky-500/10 p-3"
+                  >
+                    <p className="text-xs font-bold">Choose which linked profile to open:</p>
+                    <div className="space-y-1.5">
+                      {accountChoices.map((acc) => (
+                        <button
+                          key={acc.id}
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void submitLoginWithTarget(acc.id)}
+                          className={cn(
+                            "flex w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left text-xs transition hover:scale-[1.01]",
+                            isDark
+                              ? "border-white/15 bg-white/10 hover:bg-white/15"
+                              : "border-slate-300/70 bg-white/80 hover:bg-white",
+                          )}
+                        >
+                          <span className="flex min-w-0 items-center gap-2.5">
+                            <span className="grid size-8 shrink-0 place-items-center overflow-hidden rounded-full bg-sky-500/20 font-bold">
+                              {acc.avatarUrl ? (
+                                <img
+                                  src={acc.avatarUrl}
+                                  alt={acc.fullName}
+                                  className="size-full object-cover"
+                                />
+                              ) : (
+                                initialsOf(acc.fullName)
+                              )}
+                            </span>
+                            <span className="min-w-0">
+                              <span className="block truncate font-bold">{acc.fullName}</span>
+                              <span className="block truncate opacity-75">{acc.displayHandle}</span>
+                            </span>
+                          </span>
+                          <ArrowRight className="size-4 shrink-0 opacity-75" />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 )}
 
                 {error && (
@@ -885,7 +1482,7 @@ function AuthPage() {
                   </motion.div>
                 )}
 
-                {/* Glowing 3D / Liquid Glass Water-Bounce Primary CTA */}
+                {/* Primary CTA */}
                 <WaterGlowButton
                   type="submit"
                   variant={resolveWaterButtonVariant(backdropTheme, "primary")}
@@ -902,7 +1499,13 @@ function AuthPage() {
                         ? "Login"
                         : mode === "register"
                           ? "Create Account"
-                          : "Send Reset Email"}
+                          : forgotChannel === "phone"
+                            ? smsOtpSent
+                              ? "Confirm OTP & Reset"
+                              : "Send SMS OTP"
+                            : emailOtpSent
+                              ? "Reset Password"
+                              : "Send Reset Link / Code"}
                   </span>
                   {!busy && <ArrowRight className="size-4" />}
                 </WaterGlowButton>

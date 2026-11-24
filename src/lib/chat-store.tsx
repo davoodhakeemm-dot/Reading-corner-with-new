@@ -1,67 +1,31 @@
 import {
   createUserWithEmailAndPassword,
-  deleteUser,
   onAuthStateChanged,
-  reauthenticateWithCredential,
-  EmailAuthProvider,
+  sendEmailVerification,
   sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
-  updatePassword,
   updateProfile,
   type User as FirebaseUser,
 } from "firebase/auth";
-import {
-  collection,
-  deleteDoc,
-  doc,
-  endBefore,
-  getDoc,
-  getDocs,
-  limitToLast,
-  increment,
-  onSnapshot,
-  orderBy,
-  query,
-  serverTimestamp,
-  setDoc,
-  Timestamp,
-  updateDoc,
-  where,
-  writeBatch,
-  type QueryDocumentSnapshot,
-  type Unsubscribe,
-} from "firebase/firestore";
-import { createCallClient } from "./call-client";
+import { useSyncExternalStore } from "react";
+import { toast } from "sonner";
+
 import {
   buildIncomingMessageAlertPayload,
   showSystemNotification,
   triggerVibration,
 } from "./alerts";
+import { warmUpCallAudio } from "@/components/CallMedia";
+import { createCallClient, type CallSignalMessage } from "./call-client";
 import { isActiveElementTextInput } from "./chat-viewport";
-import { useSyncExternalStore } from "react";
-import { toast } from "sonner";
-
-import {
-  compressAvatarDataUrl,
-  getFirebaseAuth,
-  getFirebaseDb,
-  googleProvider,
-  handleFirestoreError,
-  OperationType,
-  testFirestoreConnection,
-} from "@/lib/firebase";
+import { compressAvatarDataUrl, getFirebaseAuth, googleProvider } from "@/lib/firebase";
 import type { SecretThemeId } from "@/lib/secret-themes";
-import {
-  filterAndSortUsers,
-  makeHandleCandidates,
-  normalizeEmail,
-  normalizeHandle,
-  threadKeyFor,
-} from "@/lib/social-logic";
+import { filterAndSortUsers, normalizeEmail, threadKeyFor } from "@/lib/social-logic";
 
 export type MediaKind = "image" | "video" | "audio";
+export type LoginMode = "gmail" | "phone" | "username" | "auto";
 
 export type MessageReactionGroup = {
   emoji: string;
@@ -87,6 +51,8 @@ export type PublicAccount = {
   avatarUrl: string | null;
   theme: SecretThemeId;
   phoneVerified: boolean;
+  emailVerified?: boolean;
+  isAdmin?: boolean;
   lastActiveAt: string;
   online: boolean;
   email?: string | null | undefined;
@@ -98,6 +64,57 @@ export type PublicAccount = {
   followingCount?: number;
   isFollowing?: boolean;
   followsMe?: boolean;
+};
+
+export type AccountChoiceOption = {
+  id: string;
+  fullName: string;
+  displayHandle: string;
+  avatarUrl: string | null;
+};
+
+export class AccountChoiceRequiredError extends Error {
+  accounts: AccountChoiceOption[];
+  constructor(accounts: AccountChoiceOption[]) {
+    super("Multiple linked accounts matched. Choose which profile to open.");
+    this.name = "AccountChoiceRequiredError";
+    this.accounts = accounts;
+  }
+}
+
+export type LinkedAccountItem = {
+  id: string;
+  fullName: string;
+  displayHandle: string;
+  avatarUrl: string | null;
+  isCurrent: boolean;
+  emailVerified: boolean;
+  phoneVerified: boolean;
+};
+
+export type LinkedAccountsInfo = {
+  maxAccounts: number;
+  email: string | null;
+  emailVerified: boolean;
+  phoneMasked?: string;
+  phoneVerified: boolean;
+  emailAccountCount: number;
+  phoneAccountCount: number;
+  canCreateByEmail: boolean;
+  canCreateByPhone: boolean;
+  accounts: LinkedAccountItem[];
+};
+
+export type ControlUserRecord = {
+  id: string;
+  fullName: string;
+  displayHandle: string;
+  bio: string;
+  avatarUrl: string | null;
+  personalLink: string | null;
+  online: boolean;
+  lastActiveAt: string;
+  createdAt: string;
 };
 
 export type ChatMessage = {
@@ -170,8 +187,16 @@ export type OutgoingCall = {
   callId: string;
   callType: "audio" | "video";
   target: PublicAccount;
-  status: "preparing" | "connecting" | "ringing" | "accepted";
+  status: "preparing" | "connecting" | "ringing" | "accepted" | "reconnecting";
   stream?: MediaStream | null;
+  localStream?: MediaStream | null;
+  streamVersion?: number;
+  micMuted?: boolean;
+  cameraEnabled?: boolean;
+  remoteMicMuted?: boolean;
+  remoteCameraEnabled?: boolean;
+  facingMode?: "user" | "environment";
+  canSwitchCamera?: boolean;
 };
 
 export type IncomingMessageAlert = {
@@ -186,6 +211,7 @@ type ChatClientState = {
   me: PublicAccount | null;
   sessionToken: string | null;
   otpConfigured: boolean;
+  emailOtpConfigured: boolean;
   conversations: ConversationItem[];
   discoveredUsers: PublicAccount[];
   activePeerId: string | null;
@@ -204,76 +230,6 @@ type ChatClientState = {
   wsConnected: boolean;
 };
 
-type RawPublicUser = {
-  uid: string;
-  fullName: string;
-  displayHandle: string;
-  bio: string;
-  avatarUrl?: string | null;
-  theme: SecretThemeId;
-  online: boolean;
-  followerCount: number;
-  followingCount: number;
-  createdAt?: Timestamp | null;
-  updatedAt?: Timestamp | null;
-  lastActiveAt?: Timestamp | null;
-};
-
-type RawFollow = {
-  followerId: string;
-  followingId: string;
-  createdAt?: Timestamp | null;
-};
-
-type RawBlock = {
-  blockerId: string;
-  blockedId: string;
-  createdAt?: Timestamp | null;
-};
-
-type RawConversation = {
-  participantA: string;
-  participantB: string;
-  lastMessageText: string;
-  lastMessageFrom?: string | null;
-  lastMessageMediaKind?: MediaKind | null;
-  lastMessageDeleted: boolean;
-  lastMessageAt?: Timestamp | null;
-  lastMessageSeenAt?: Timestamp | null;
-  unreadA: number;
-  unreadB: number;
-  pinnedA: boolean;
-  pinnedB: boolean;
-  mutedA: boolean;
-  mutedB: boolean;
-  typingA: boolean;
-  typingB: boolean;
-  createdAt?: Timestamp | null;
-  updatedAt?: Timestamp | null;
-};
-
-type RawMessage = {
-  id: string;
-  threadKey: string;
-  senderId: string;
-  recipientId: string;
-  text: string;
-  mediaUrl?: string | null;
-  mediaId?: string | null;
-  mediaKind?: MediaKind | null;
-  mediaName?: string | null;
-  replyToId?: string | null;
-  replyTo?: ReplyPreview | null;
-  reactionA?: string | null;
-  reactionB?: string | null;
-  editedAt?: Timestamp | null;
-  deletedAt?: Timestamp | null;
-  deliveredAt?: Timestamp | null;
-  seenAt?: Timestamp | null;
-  createdAt?: Timestamp | null;
-  updatedAt?: Timestamp | null;
-};
-
 const SOUND_STORAGE_KEY = "reading-corner.chat-sound.v3";
 
 const INITIAL: ChatClientState = {
@@ -281,6 +237,7 @@ const INITIAL: ChatClientState = {
   me: null,
   sessionToken: null,
   otpConfigured: false,
+  emailOtpConfigured: false,
   conversations: [],
   discoveredUsers: [],
   activePeerId: null,
@@ -296,45 +253,32 @@ const INITIAL: ChatClientState = {
   outgoingCall: null,
   incomingMessageAlert: null,
   legacyAccounts: [],
-  wsConnected: true,
+  wsConnected: false,
 };
 
 let state: ChatClientState = INITIAL;
 const listeners = new Set<() => void>();
 let initialized = false;
-let currentUid: string | null = null;
-let activeListenerUid: string | null = null;
-let registrationInProgress = false;
-const inFlightProfileInit = new Map<string, Promise<PublicAccount>>();
-let profileUnsub: Unsubscribe | null = null;
-let privateUnsub: Unsubscribe | null = null;
-let usersUnsub: Unsubscribe | null = null;
-let followingUnsub: Unsubscribe | null = null;
-let followersUnsub: Unsubscribe | null = null;
-let blocksByMeUnsub: Unsubscribe | null = null;
-let blocksOnMeUnsub: Unsubscribe | null = null;
-let convsAUnsub: Unsubscribe | null = null;
-let convsBUnsub: Unsubscribe | null = null;
-let activeThreadUnsub: Unsubscribe | null = null;
-let activeThreadGeneration = 0;
-let presenceTimer: number | null = null;
-const THREAD_PAGE_SIZE = 50;
-const threadOldestDocs = new Map<string, QueryDocumentSnapshot>();
-const threadHasOlder = new Map<string, boolean>();
-const threadHistoryExhausted = new Set<string>();
-const olderMessagesByPeer = new Map<string, ChatMessage[]>();
+let suppressFirebaseSync = false;
 
-// Raw snapshot caches so derived state recomputes cleanly without extra Firestore reads
-let rawPublicUsers = new Map<string, RawPublicUser>();
-let myPrivateEmail: string | null = null;
-let followingIds = new Set<string>();
-let followerIds = new Set<string>();
-let blockedByMeMap = new Map<string, string>(); // targetUid -> blockedAt ISO
-let blockedMeIds = new Set<string>();
-let convDocsMap = new Map<string, RawConversation>(); // threadKey -> RawConversation
+let ws: WebSocket | null = null;
+let wsReconnectTimer: number | null = null;
+let wsPingTimer: number | null = null;
+let wsReconnectAttempt = 0;
+let callClient: ReturnType<typeof createCallClient> | undefined;
+
 const uploadedMediaMeta = new Map<string, { url: string; kind: MediaKind; name: string }>();
 const mediaBlobUrlCache = new Map<string, string>();
 const inFlightMediaFetches = new Map<string, Promise<string>>();
+
+function emit() {
+  listeners.forEach((l) => l());
+}
+
+function setState(patch: Partial<ChatClientState>) {
+  state = { ...state, ...patch };
+  emit();
+}
 
 export function primeMediaObjectUrl(url: string, blob: Blob): string {
   if (!url || typeof window === "undefined") return url;
@@ -371,6 +315,42 @@ export function getCachedMediaObjectUrl(url: string | null | undefined): string 
   return mediaBlobUrlCache.get(url) ?? null;
 }
 
+async function getBearerHeaders(extra?: Record<string, string>): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { ...(extra ?? {}) };
+  if (state.sessionToken && state.sessionToken.startsWith("rc_sess_")) {
+    headers["Authorization"] = `Bearer ${state.sessionToken}`;
+  } else if (typeof window !== "undefined") {
+    const fbUser = getFirebaseAuth().currentUser;
+    if (fbUser && !state.me) {
+      const idToken = await fbUser.getIdToken().catch(() => null);
+      if (idToken) headers["Authorization"] = `Bearer ${idToken}`;
+    }
+  }
+  return headers;
+}
+
+async function apiJson<T>(
+  url: string,
+  options: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
+): Promise<T> {
+  const headers = await getBearerHeaders(options.headers);
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+  const init: RequestInit = {
+    method: options.method ?? "GET",
+    headers,
+    credentials: "include",
+    ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+  };
+  const resp = await fetch(url, init);
+  const data = (await resp.json().catch(() => ({}))) as T & { error?: string };
+  if (!resp.ok) {
+    throw new Error(data.error || `Request failed (${resp.status})`);
+  }
+  return data;
+}
+
 export async function resolveAuthorizedMediaUrl(url: string): Promise<string> {
   if (!url || !url.startsWith("/api/media/")) return url;
   const cached = mediaBlobUrlCache.get(url);
@@ -380,20 +360,17 @@ export async function resolveAuthorizedMediaUrl(url: string): Promise<string> {
   if (inflight) return inflight;
 
   const promise = (async () => {
-    const fbUser = getFirebaseAuth().currentUser;
-    const headers: Record<string, string> = {};
-    if (fbUser) {
-      const idToken = await fbUser.getIdToken();
-      headers["Authorization"] = `Bearer ${idToken}`;
-    }
-
+    const headers = await getBearerHeaders();
     let resp = await fetch(url, { headers, credentials: "include" });
-    if (resp.status === 401 && fbUser) {
-      const freshToken = await fbUser.getIdToken(true);
-      resp = await fetch(url, {
-        headers: { Authorization: `Bearer ${freshToken}` },
-        credentials: "include",
-      });
+    if (resp.status === 401) {
+      const fbUser = getFirebaseAuth().currentUser;
+      if (fbUser) {
+        const freshToken = await fbUser.getIdToken(true);
+        resp = await fetch(url, {
+          headers: { Authorization: `Bearer ${freshToken}` },
+          credentials: "include",
+        });
+      }
     }
     if (!resp.ok) {
       throw new Error(`Could not load media (${resp.status})`);
@@ -418,221 +395,6 @@ export async function downloadProtectedMedia(url: string, filename: string) {
   a.remove();
 }
 
-function emit() {
-  listeners.forEach((l) => l());
-}
-
-function setState(patch: Partial<ChatClientState>) {
-  state = { ...state, ...patch };
-  emit();
-}
-
-function tsToIso(ts: Timestamp | Date | string | null | undefined): string {
-  if (!ts) return new Date().toISOString();
-  if (typeof ts === "string") return ts;
-  if (ts instanceof Date) return ts.toISOString();
-  if (typeof (ts as Timestamp).toDate === "function") {
-    return (ts as Timestamp).toDate().toISOString();
-  }
-  return new Date().toISOString();
-}
-
-function tsToIsoOrNull(ts: Timestamp | Date | string | null | undefined): string | null {
-  if (!ts) return null;
-  return tsToIso(ts);
-}
-
-function isUserEffectivelyOnline(raw: RawPublicUser): boolean {
-  if (!raw.online) return false;
-  const lastMs = Date.parse(tsToIso(raw.lastActiveAt));
-  if (Number.isNaN(lastMs)) return raw.online;
-  return Date.now() - lastMs < 150_000;
-}
-
-function toPublicAccountFromRaw(raw: RawPublicUser, viewerUid: string | null): PublicAccount {
-  const isSelf = viewerUid === raw.uid;
-  return {
-    id: raw.uid,
-    fullName: raw.fullName,
-    displayHandle: raw.displayHandle,
-    bio: raw.bio ?? "",
-    avatarUrl: raw.avatarUrl ?? null,
-    theme:
-      raw.theme === "emerald" || raw.theme === "dark" || raw.theme === "instagram"
-        ? raw.theme
-        : "instagram",
-    phoneVerified: false,
-    lastActiveAt: tsToIso(raw.lastActiveAt ?? raw.updatedAt ?? raw.createdAt),
-    online: isSelf ? true : isUserEffectivelyOnline(raw),
-    ...(isSelf && myPrivateEmail ? { email: myPrivateEmail } : {}),
-    blockedByMe: isSelf ? false : blockedByMeMap.has(raw.uid),
-    blockedMe: isSelf ? false : blockedMeIds.has(raw.uid),
-    followerCount: typeof raw.followerCount === "number" ? raw.followerCount : 0,
-    followingCount: typeof raw.followingCount === "number" ? raw.followingCount : 0,
-    isFollowing: isSelf ? false : followingIds.has(raw.uid),
-    followsMe: isSelf ? false : followerIds.has(raw.uid),
-  };
-}
-
-function buildReactionGroups(
-  reactionA: string | null | undefined,
-  reactionB: string | null | undefined,
-  participantA: string,
-  participantB: string,
-  viewerUid: string,
-): MessageReactionGroup[] {
-  const grouped = new Map<
-    string,
-    { emoji: string; count: number; reactedByMe: boolean; userIds: string[] }
-  >();
-  const pairs: [string | null | undefined, string][] = [
-    [reactionA, participantA],
-    [reactionB, participantB],
-  ];
-  for (const [emoji, uid] of pairs) {
-    if (!emoji) continue;
-    const entry = grouped.get(emoji) ?? {
-      emoji,
-      count: 0,
-      reactedByMe: false,
-      userIds: [],
-    };
-    entry.count += 1;
-    entry.userIds.push(uid);
-    if (uid === viewerUid) entry.reactedByMe = true;
-    grouped.set(emoji, entry);
-  }
-  return Array.from(grouped.values());
-}
-
-function serializeFirestoreMessage(
-  raw: RawMessage,
-  threadKey: string,
-  viewerUid: string,
-): ChatMessage {
-  const [participantA = "", participantB = ""] = threadKey.split("__");
-  const isDeleted = Boolean(raw.deletedAt);
-  return {
-    id: raw.id,
-    threadKey: raw.threadKey,
-    from: raw.senderId,
-    to: raw.recipientId,
-    text: isDeleted ? "Message deleted" : raw.text,
-    mediaUrl: isDeleted ? null : (raw.mediaUrl ?? null),
-    mediaId: isDeleted ? null : (raw.mediaId ?? null),
-    mediaKind: isDeleted ? null : (raw.mediaKind ?? null),
-    mediaName: isDeleted ? null : (raw.mediaName ?? null),
-    replyToId: raw.replyToId ?? null,
-    replyTo: raw.replyTo ?? null,
-    reactions: isDeleted
-      ? []
-      : buildReactionGroups(raw.reactionA, raw.reactionB, participantA, participantB, viewerUid),
-    editedAt: tsToIsoOrNull(raw.editedAt),
-    deletedAt: tsToIsoOrNull(raw.deletedAt),
-    deliveredAt: tsToIsoOrNull(raw.deliveredAt),
-    createdAt: tsToIso(raw.createdAt),
-    seenAt: tsToIsoOrNull(raw.seenAt),
-  };
-}
-
-function sortConversations(convs: ConversationItem[]) {
-  return [...convs].sort((a, b) => {
-    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-    const aTime = a.lastMessage?.createdAt ?? "";
-    const bTime = b.lastMessage?.createdAt ?? "";
-    return bTime.localeCompare(aTime);
-  });
-}
-
-function recomputeDerivedState() {
-  if (!currentUid) return;
-  const uid = currentUid;
-
-  const myRaw = rawPublicUsers.get(uid);
-  const nextMe = myRaw
-    ? toPublicAccountFromRaw(myRaw, uid)
-    : state.me
-      ? { ...state.me, email: myPrivateEmail ?? state.me.email ?? null }
-      : null;
-
-  const discovered: PublicAccount[] = [];
-  for (const [otherUid, raw] of rawPublicUsers.entries()) {
-    if (otherUid === uid) continue;
-    if (blockedMeIds.has(otherUid)) continue;
-    discovered.push(toPublicAccountFromRaw(raw, uid));
-  }
-  const sortedDiscovered = filterAndSortUsers(discovered, "", "all");
-
-  const nextBlockedUsers: BlockedUserItem[] = [];
-  for (const [blockedId, blockedAt] of blockedByMeMap.entries()) {
-    const raw = rawPublicUsers.get(blockedId);
-    if (raw) {
-      nextBlockedUsers.push({
-        ...toPublicAccountFromRaw(raw, uid),
-        blockedAt,
-      });
-    }
-  }
-
-  const nextTyping: Record<string, boolean> = {};
-  const nextConversations: ConversationItem[] = [];
-
-  for (const [key, conv] of convDocsMap.entries()) {
-    const isA = conv.participantA === uid;
-    const peerId = isA ? conv.participantB : conv.participantA;
-    const peerRaw = rawPublicUsers.get(peerId);
-    if (!peerRaw) continue;
-
-    nextTyping[peerId] = isA ? Boolean(conv.typingB) : Boolean(conv.typingA);
-    const pinned = isA ? Boolean(conv.pinnedA) : Boolean(conv.pinnedB);
-    const muted = isA ? Boolean(conv.mutedA) : Boolean(conv.mutedB);
-    const unreadCount = isA ? (conv.unreadA ?? 0) : (conv.unreadB ?? 0);
-
-    let lastMessage: ChatMessage | null = null;
-    if (conv.lastMessageAt) {
-      const lastFrom = conv.lastMessageFrom ?? peerId;
-      const lastTo = lastFrom === uid ? peerId : uid;
-      lastMessage = {
-        id: `preview_${key}`,
-        threadKey: key,
-        from: lastFrom,
-        to: lastTo,
-        text: conv.lastMessageDeleted ? "Message deleted" : conv.lastMessageText,
-        mediaUrl: null,
-        mediaId: null,
-        mediaKind: conv.lastMessageMediaKind ?? null,
-        mediaName: null,
-        replyToId: null,
-        replyTo: null,
-        reactions: [],
-        editedAt: null,
-        deletedAt: conv.lastMessageDeleted ? tsToIso(conv.lastMessageAt) : null,
-        deliveredAt: tsToIso(conv.lastMessageAt),
-        createdAt: tsToIso(conv.lastMessageAt),
-        seenAt: tsToIsoOrNull(conv.lastMessageSeenAt),
-      };
-    }
-
-    nextConversations.push({
-      peer: toPublicAccountFromRaw(peerRaw, uid),
-      blockedByMe: blockedByMeMap.has(peerId),
-      blockedMe: blockedMeIds.has(peerId),
-      pinned,
-      muted,
-      lastMessage,
-      unreadCount,
-    });
-  }
-
-  setState({
-    me: nextMe,
-    discoveredUsers: sortedDiscovered,
-    blockedUsers: nextBlockedUsers,
-    typingByPeer: nextTyping,
-    conversations: sortConversations(nextConversations),
-  });
-}
-
 function playNotificationTone() {
   if (!state.soundEnabled || typeof window === "undefined") return;
   void import("./water-sound")
@@ -642,558 +404,459 @@ function playNotificationTone() {
     .catch(() => {});
 }
 
-async function syncServerMediaCookie(fbUser: FirebaseUser) {
-  try {
-    const idToken = await fbUser.getIdToken();
-    await fetch("/api/auth/firebase-cookie", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${idToken}`,
-      },
-      credentials: "include",
-      body: JSON.stringify({ idToken }),
-    });
-  } catch {
-    /* non-fatal if offline; media upload will refresh token explicitly */
-  }
+function sendWs(event: string, payload: Record<string, unknown>): boolean {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify({ event, payload }));
+  return true;
 }
 
-function isPermissionDeniedError(err: unknown): boolean {
-  const code = (err as { code?: string })?.code ?? "";
-  const msg = err instanceof Error ? err.message : String(err);
-  return (
-    code === "permission-denied" ||
-    code.endsWith("/permission-denied") ||
-    msg.includes("Missing or insufficient permissions")
-  );
-}
-
-async function tryClaimHandle(uid: string, handle: string): Promise<"claimed" | "taken"> {
-  const db = getFirebaseDb();
-  const handleKey = handle.slice(1);
-  let snap;
-  try {
-    snap = await getDoc(doc(db, "handles", handleKey));
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, `handles/${handleKey}`);
+function disconnectRealtime() {
+  if (wsReconnectTimer) {
+    window.clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
   }
-  if (snap.exists()) {
-    return snap.data()["uid"] === uid ? "claimed" : "taken";
+  if (wsPingTimer) {
+    window.clearInterval(wsPingTimer);
+    wsPingTimer = null;
   }
-  try {
-    await setDoc(doc(db, "handles", handleKey), {
-      uid,
-      handle,
-      createdAt: serverTimestamp(),
-    });
-    return "claimed";
-  } catch (err) {
-    // Another account or concurrent call may have created handles/{handleKey} between getDoc and setDoc
-    if (isPermissionDeniedError(err)) {
-      const recheck = await getDoc(doc(db, "handles", handleKey)).catch(() => null);
-      if (recheck?.exists() && recheck.data()["uid"] === uid) {
-        return "claimed";
-      }
-      return "taken";
-    }
-    handleFirestoreError(err, OperationType.CREATE, `handles/${handleKey}`);
-  }
-}
-
-async function reserveAvailableHandle(
-  uid: string,
-  preferredHandle: string | null,
-  fullName: string,
-  email: string | null,
-): Promise<string> {
-  if (preferredHandle) {
-    const normalized = normalizeHandle(preferredHandle);
-    if (!normalized) {
-      throw new Error(
-        "Username must be at least 2 characters (letters, numbers, dots, underscores).",
-      );
-    }
-    const result = await tryClaimHandle(uid, normalized);
-    if (result === "taken") {
-      throw new Error("That username is already taken. Please choose another.");
-    }
-    return normalized;
-  }
-
-  const candidates = makeHandleCandidates(fullName, email, uid);
-  for (const candidate of candidates) {
-    const result = await tryClaimHandle(uid, candidate);
-    if (result === "claimed") {
-      return candidate;
-    }
-  }
-
-  const uidTail =
-    uid
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "")
-      .slice(-6) || "user";
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const rand = Math.random().toString(36).slice(2, 6);
-    const fallback = `@reader.${uidTail}.${rand}`.slice(0, 29);
-    const result = await tryClaimHandle(uid, fallback);
-    if (result === "claimed") {
-      return fallback;
-    }
-  }
-
-  throw new Error("Could not reserve a unique reader username. Please try again.");
-}
-
-async function ensureUserProfileDocsInternal(
-  fbUser: FirebaseUser,
-  overrides?: {
-    fullName?: string;
-    username?: string;
-    bio?: string;
-    avatarUrl?: string | null;
-  },
-): Promise<PublicAccount> {
-  const db = getFirebaseDb();
-  const uid = fbUser.uid;
-  const pubRef = doc(db, "users_public", uid);
-  const privRef = doc(db, "users_private", uid);
-
-  let pubSnap;
-  try {
-    pubSnap = await getDoc(pubRef);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, `users_public/${uid}`);
-  }
-
-  if (!pubSnap.exists()) {
-    const rawName = (
-      overrides?.fullName ||
-      fbUser.displayName ||
-      fbUser.email?.split("@")[0] ||
-      "Reader"
-    )
-      .trim()
-      .slice(0, 60);
-    const fullName = rawName.length >= 2 ? rawName : `${rawName} Reader`.slice(0, 60);
-    const displayHandle = await reserveAvailableHandle(
-      uid,
-      overrides?.username ?? null,
-      fullName,
-      fbUser.email ?? null,
-    );
-    const compressedAvatar =
-      overrides?.avatarUrl ?? (fbUser.photoURL ? fbUser.photoURL.slice(0, 300000) : null);
-    const bio = (overrides?.bio ?? "").trim().slice(0, 200);
-
-    try {
-      await setDoc(pubRef, {
-        uid,
-        fullName,
-        displayHandle,
-        bio,
-        avatarUrl: compressedAvatar,
-        theme: "instagram",
-        online: true,
-        followerCount: 0,
-        followingCount: 0,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-        lastActiveAt: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, `users_public/${uid}`);
-    }
-
-    try {
-      await setDoc(privRef, {
-        uid,
-        email: fbUser.email ?? null,
-        soundEnabled: true,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, `users_private/${uid}`);
-    }
-
-    let fresh;
-    try {
-      fresh = await getDoc(pubRef);
-    } catch (err) {
-      handleFirestoreError(err, OperationType.GET, `users_public/${uid}`);
-    }
-    const raw = fresh.data() as RawPublicUser | undefined;
-    if (raw) {
-      rawPublicUsers.set(uid, raw);
-      myPrivateEmail = fbUser.email ?? null;
-      return toPublicAccountFromRaw(raw, uid);
-    }
-    return {
-      id: uid,
-      fullName,
-      displayHandle,
-      bio,
-      avatarUrl: compressedAvatar,
-      theme: "instagram",
-      phoneVerified: false,
-      lastActiveAt: new Date().toISOString(),
-      online: true,
-      email: fbUser.email ?? null,
-      followerCount: 0,
-      followingCount: 0,
-    };
-  }
-
-  // Existing user: refresh presence and ensure private doc exists
-  try {
-    await updateDoc(pubRef, {
-      online: true,
-      lastActiveAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } catch {
-    /* ignore presence ping error if transient */
-  }
-
-  const privSnap = await getDoc(privRef).catch(() => null);
-  if (privSnap && !privSnap.exists()) {
-    await setDoc(privRef, {
-      uid,
-      email: fbUser.email ?? null,
-      soundEnabled: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    }).catch(() => {});
-  } else if (privSnap?.exists()) {
-    myPrivateEmail =
-      (privSnap.data()["email"] as string | null | undefined) ?? fbUser.email ?? null;
-  }
-
-  const raw = pubSnap.data() as RawPublicUser;
-  rawPublicUsers.set(uid, raw);
-  return toPublicAccountFromRaw(raw, uid);
-}
-
-async function ensureUserProfileDocs(
-  fbUser: FirebaseUser,
-  overrides?: {
-    fullName?: string;
-    username?: string;
-    bio?: string;
-    avatarUrl?: string | null;
-  },
-): Promise<PublicAccount> {
-  const uid = fbUser.uid;
-  const existing = inFlightProfileInit.get(uid);
-  if (existing) {
-    return existing;
-  }
-  const promise = ensureUserProfileDocsInternal(fbUser, overrides).finally(() => {
-    if (inFlightProfileInit.get(uid) === promise) {
-      inFlightProfileInit.delete(uid);
-    }
-  });
-  inFlightProfileInit.set(uid, promise);
-  return promise;
-}
-
-let callClient: ReturnType<typeof createCallClient> | undefined;
-function clearFirestoreListeners() {
   callClient?.dispose();
   callClient = undefined;
-  activeListenerUid = null;
-  profileUnsub?.();
-  privateUnsub?.();
-  usersUnsub?.();
-  followingUnsub?.();
-  followersUnsub?.();
-  blocksByMeUnsub?.();
-  blocksOnMeUnsub?.();
-  convsAUnsub?.();
-  convsBUnsub?.();
-  activeThreadUnsub?.();
-  activeThreadGeneration += 1;
-  threadOldestDocs.clear();
-  threadHasOlder.clear();
-  threadHistoryExhausted.clear();
-  olderMessagesByPeer.clear();
-  profileUnsub = null;
-  privateUnsub = null;
-  usersUnsub = null;
-  followingUnsub = null;
-  followersUnsub = null;
-  blocksByMeUnsub = null;
-  blocksOnMeUnsub = null;
-  convsAUnsub = null;
-  convsBUnsub = null;
-  activeThreadUnsub = null;
-
-  if (presenceTimer) {
-    window.clearInterval(presenceTimer);
-    presenceTimer = null;
+  if (ws) {
+    try {
+      ws.onclose = null;
+      ws.onmessage = null;
+      ws.close();
+    } catch {
+      /* ignore close errors */
+    }
+    ws = null;
   }
-
-  rawPublicUsers = new Map();
-  myPrivateEmail = null;
-  followingIds = new Set();
-  followerIds = new Set();
-  blockedByMeMap = new Map();
-  blockedMeIds = new Set();
-  convDocsMap = new Map();
+  setState({ wsConnected: false });
 }
 
-function startRealtimeListeners(uid: string) {
-  if (activeListenerUid === uid && usersUnsub) {
-    return;
+function ensureCallClient() {
+  if (!callClient) {
+    callClient = createCallClient(sendWs, fetchUserProfile, setState, (message) => toast(message));
   }
-  clearFirestoreListeners();
-  currentUid = uid;
-  activeListenerUid = uid;
-  const db = getFirebaseDb();
+  return callClient;
+}
 
-  callClient = createCallClient(db, uid, fetchUserProfile, setState, (message) => toast(message));
-
-  // 1. My own public profile
-  profileUnsub = onSnapshot(
-    doc(db, "users_public", uid),
-    (snap) => {
-      if (snap.exists()) {
-        rawPublicUsers.set(uid, snap.data() as RawPublicUser);
-        recomputeDerivedState();
-      }
-    },
-    (err) => {
-      if (currentUid !== uid) return;
-      try {
-        handleFirestoreError(err, OperationType.GET, `users_public/${uid}`);
-      } catch {
-        /* logged via handleFirestoreError */
-      }
-    },
+function upsertMessageIntoThread(peerId: string, incoming: ChatMessage) {
+  const existing = state.threads[peerId] ?? [];
+  const filtered = existing.filter(
+    (m) =>
+      m.id !== incoming.id &&
+      !(m.id.startsWith("temp_") && m.from === incoming.from && m.text === incoming.text),
   );
-
-  // 2. My private settings
-  privateUnsub = onSnapshot(
-    doc(db, "users_private", uid),
-    (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        myPrivateEmail = (data["email"] as string | null | undefined) ?? null;
-        if (typeof data["soundEnabled"] === "boolean") {
-          setState({ soundEnabled: data["soundEnabled"] });
-        }
-        recomputeDerivedState();
-      }
-    },
-    (err) => {
-      if (currentUid !== uid) return;
-      try {
-        handleFirestoreError(err, OperationType.GET, `users_private/${uid}`);
-      } catch {
-        /* logged via handleFirestoreError */
-      }
-    },
+  const next = [...filtered, incoming].sort(
+    (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
   );
+  setState({
+    threads: { ...state.threads, [peerId]: next },
+  });
+}
 
-  // 3. All registered users directory (live)
-  usersUnsub = onSnapshot(
-    collection(db, "users_public"),
-    (snap) => {
-      const next = new Map<string, RawPublicUser>();
-      for (const d of snap.docs) {
-        const data = d.data() as RawPublicUser;
-        if (data?.uid) next.set(data.uid, data);
-      }
-      rawPublicUsers = next;
-      recomputeDerivedState();
-    },
-    (err) => {
-      if (currentUid !== uid) return;
-      try {
-        handleFirestoreError(err, OperationType.LIST, "users_public");
-      } catch {
-        /* logged via handleFirestoreError */
-      }
-    },
-  );
+function handleIncomingMessageEvent(msg: ChatMessage, sender?: PublicAccount) {
+  const myId = state.me?.id;
+  if (!myId) return;
+  const peerId = msg.from === myId ? msg.to : msg.from;
 
-  // 4. Following & Followers
-  followingUnsub = onSnapshot(
-    query(collection(db, "follows"), where("followerId", "==", uid)),
-    (snap) => {
-      const next = new Set<string>();
-      for (const d of snap.docs) {
-        const data = d.data() as RawFollow;
-        if (data.followingId) next.add(data.followingId);
-      }
-      followingIds = next;
-      recomputeDerivedState();
-    },
-    (err) => console.error("follows(following) error:", err),
-  );
+  upsertMessageIntoThread(peerId, msg);
 
-  followersUnsub = onSnapshot(
-    query(collection(db, "follows"), where("followingId", "==", uid)),
-    (snap) => {
-      const next = new Set<string>();
-      for (const d of snap.docs) {
-        const data = d.data() as RawFollow;
-        if (data.followerId) next.add(data.followerId);
-      }
-      followerIds = next;
-      recomputeDerivedState();
-    },
-    (err) => console.error("follows(followers) error:", err),
-  );
+  // Update conversation preview smoothly
+  const existingConv = state.conversations.find((c) => c.peer.id === peerId);
+  const isIncoming = msg.from !== myId;
+  const isPageHidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+  const isViewingThread = state.activePeerId === peerId && !isPageHidden;
 
-  // 5. Blocks (both directions)
-  blocksByMeUnsub = onSnapshot(
-    query(collection(db, "blocks"), where("blockerId", "==", uid)),
-    (snap) => {
-      const next = new Map<string, string>();
-      for (const d of snap.docs) {
-        const data = d.data() as RawBlock;
-        if (data.blockedId) next.set(data.blockedId, tsToIso(data.createdAt));
-      }
-      blockedByMeMap = next;
-      recomputeDerivedState();
-    },
-    (err) => console.error("blocks(byMe) error:", err),
-  );
-
-  blocksOnMeUnsub = onSnapshot(
-    query(collection(db, "blocks"), where("blockedId", "==", uid)),
-    (snap) => {
-      const next = new Set<string>();
-      for (const d of snap.docs) {
-        const data = d.data() as RawBlock;
-        if (data.blockerId) next.add(data.blockerId);
-      }
-      blockedMeIds = next;
-      recomputeDerivedState();
-    },
-    (err) => console.error("blocks(onMe) error:", err),
-  );
-
-  // 6. Conversations where I am participantA or participantB
-  const handleConvSnapshot =
-    (slot: "A" | "B") => (snap: { docs: { id: string; data: () => unknown }[] }) => {
-      const incomingIds = new Set<string>();
-      for (const d of snap.docs) {
-        incomingIds.add(d.id);
-        const data = d.data() as RawConversation;
-        const prev = convDocsMap.get(d.id);
-        convDocsMap.set(d.id, data);
-
-        // Alert with vibration, sound, interactive receive banner, and OS notification
-        if (prev && data.lastMessageFrom && data.lastMessageFrom !== uid) {
-          const prevUnread = slot === "A" ? prev.unreadA : prev.unreadB;
-          const nextUnread = slot === "A" ? data.unreadA : data.unreadB;
-          const peerId = slot === "A" ? data.participantB : data.participantA;
-          const muted = slot === "A" ? data.mutedA : data.mutedB;
-          const isPageHidden =
-            typeof document !== "undefined" && document.visibilityState === "hidden";
-          const isViewingThisThread = state.activePeerId === peerId && !isPageHidden;
-          if (nextUnread > prevUnread && !muted && !isViewingThisThread) {
-            const peerRaw = rawPublicUsers.get(peerId);
-            const peerAccount: PublicAccount = peerRaw
-              ? toPublicAccountFromRaw(peerRaw, uid)
-              : {
-                  id: peerId,
-                  fullName: "Reader",
-                  displayHandle: "@reader",
-                  bio: "",
-                  avatarUrl: null,
-                  theme: "instagram",
-                  phoneVerified: false,
-                  lastActiveAt: new Date().toISOString(),
-                  online: true,
-                };
-            const payload = buildIncomingMessageAlertPayload({
-              senderName: peerAccount.fullName,
-              text: data.lastMessageText,
-              mediaKind: data.lastMessageMediaKind ?? null,
-            });
-            const onChatRoute =
-              typeof window !== "undefined" &&
-              (window.location.pathname.startsWith("/messages") ||
-                window.location.pathname.startsWith("/chat"));
-            const isTypingInChat =
-              typeof document !== "undefined" &&
-              onChatRoute &&
-              isActiveElementTextInput(document.activeElement);
-
-            if (!isTypingInChat) {
-              triggerVibration(payload.vibratePattern);
-            }
-            playNotificationTone();
-
-            if (state.activePeerId !== peerId) {
-              setState({
-                incomingMessageAlert: {
-                  id: `${peerId}-${Date.now()}`,
-                  peer: peerAccount,
-                  preview: payload.body,
-                  createdAt: new Date().toISOString(),
-                },
-              });
-            }
-
-            if (isPageHidden || !onChatRoute || state.activePeerId !== peerId) {
-              showSystemNotification({
-                title: payload.title,
-                body: payload.body,
-                tag: payload.tag,
-                onClick: () => {
-                  void openThread(peerId);
-                  if (
-                    typeof window !== "undefined" &&
-                    !window.location.pathname.startsWith("/messages") &&
-                    !window.location.pathname.startsWith("/chat")
-                  ) {
-                    window.location.assign(`/messages?peer=${encodeURIComponent(peerId)}`);
-                  }
-                },
-              });
-            }
-          }
-        }
-      }
-
-      // Remove stale convs belonging to this slot if deleted/disappeared
-      for (const [key, conv] of Array.from(convDocsMap.entries())) {
-        const belongs = slot === "A" ? conv.participantA === uid : conv.participantB === uid;
-        if (belongs && !incomingIds.has(key)) {
-          convDocsMap.delete(key);
-        }
-      }
-      recomputeDerivedState();
+  const peerAccount = existingConv?.peer ??
+    sender ??
+    state.discoveredUsers.find((u) => u.id === peerId) ?? {
+      id: peerId,
+      fullName: "Reader",
+      displayHandle: "@reader",
+      bio: "",
+      avatarUrl: null,
+      theme: "instagram" as SecretThemeId,
+      phoneVerified: false,
+      lastActiveAt: msg.createdAt,
+      online: true,
     };
 
-  convsAUnsub = onSnapshot(
-    query(collection(db, "conversations"), where("participantA", "==", uid)),
-    handleConvSnapshot("A"),
-    (err) => console.error("conversations(A) error:", err),
-  );
+  const nextConv: ConversationItem = existingConv
+    ? {
+        ...existingConv,
+        peer: sender ? { ...existingConv.peer, ...sender } : existingConv.peer,
+        lastMessage: msg,
+        unreadCount:
+          isIncoming && !isViewingThread ? existingConv.unreadCount + 1 : existingConv.unreadCount,
+      }
+    : {
+        peer: peerAccount,
+        blockedByMe: false,
+        blockedMe: false,
+        pinned: false,
+        muted: false,
+        lastMessage: msg,
+        unreadCount: isIncoming && !isViewingThread ? 1 : 0,
+      };
 
-  convsBUnsub = onSnapshot(
-    query(collection(db, "conversations"), where("participantB", "==", uid)),
-    handleConvSnapshot("B"),
-    (err) => console.error("conversations(B) error:", err),
-  );
+  const rest = state.conversations.filter((c) => c.peer.id !== peerId);
+  const sorted = [nextConv, ...rest].sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    return (b.lastMessage?.createdAt ?? "").localeCompare(a.lastMessage?.createdAt ?? "");
+  });
+  setState({ conversations: sorted });
 
-  // 7. Presence heartbeat every 45s while page is visible
-  const pingPresence = () => {
-    if (document.visibilityState === "hidden") return;
-    void updateDoc(doc(db, "users_public", uid), {
-      online: true,
-      lastActiveAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    }).catch(() => {});
+  if (isIncoming && isViewingThread) {
+    void markThreadSeen(peerId);
+    return;
+  }
+
+  if (isIncoming && !nextConv.muted) {
+    const payload = buildIncomingMessageAlertPayload({
+      senderName: peerAccount.fullName,
+      text: msg.text,
+      mediaKind: msg.mediaKind,
+    });
+    const onChatRoute =
+      typeof window !== "undefined" &&
+      (window.location.pathname.startsWith("/messages") ||
+        window.location.pathname.startsWith("/chat"));
+    const isTypingInChat =
+      typeof document !== "undefined" &&
+      onChatRoute &&
+      isActiveElementTextInput(document.activeElement);
+
+    if (!isTypingInChat) {
+      triggerVibration(payload.vibratePattern);
+    }
+    playNotificationTone();
+
+    if (state.activePeerId !== peerId) {
+      setState({
+        incomingMessageAlert: {
+          id: `${peerId}-${Date.now()}`,
+          peer: peerAccount,
+          preview: payload.body,
+          createdAt: msg.createdAt,
+        },
+      });
+    }
+
+    if (isPageHidden || !onChatRoute || state.activePeerId !== peerId) {
+      showSystemNotification({
+        title: payload.title,
+        body: payload.body,
+        tag: payload.tag,
+        onClick: () => {
+          void openThread(peerId);
+          if (
+            typeof window !== "undefined" &&
+            !window.location.pathname.startsWith("/messages") &&
+            !window.location.pathname.startsWith("/chat")
+          ) {
+            window.location.assign(`/messages?peer=${encodeURIComponent(peerId)}`);
+          }
+        },
+      });
+    }
+  }
+}
+
+function connectRealtime() {
+  if (typeof window === "undefined" || !state.me) return;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  ensureCallClient();
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const tokenQuery =
+    state.sessionToken && state.sessionToken.startsWith("rc_sess_")
+      ? `?token=${encodeURIComponent(state.sessionToken)}`
+      : "";
+  const socket = new WebSocket(`${proto}//${window.location.host}/ws${tokenQuery}`);
+  ws = socket;
+
+  socket.onopen = () => {
+    wsReconnectAttempt = 0;
+    setState({ wsConnected: true });
+    if (wsPingTimer) window.clearInterval(wsPingTimer);
+    wsPingTimer = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") {
+        sendWs("ping", {});
+      }
+    }, 35_000);
   };
-  presenceTimer = window.setInterval(pingPresence, 45_000);
+
+  socket.onmessage = (evt) => {
+    try {
+      const parsed = JSON.parse(String(evt.data)) as {
+        event?: string;
+        payload?: Record<string, unknown>;
+      };
+      const event = parsed.event;
+      const payload = parsed.payload ?? {};
+
+      if (event === "presence:update") {
+        const userId = String(payload["userId"] ?? "");
+        const online = Boolean(payload["online"]);
+        const lastActiveAt = String(payload["lastActiveAt"] ?? new Date().toISOString());
+        setState({
+          discoveredUsers: state.discoveredUsers.map((u) =>
+            u.id === userId ? { ...u, online, lastActiveAt } : u,
+          ),
+          conversations: state.conversations.map((c) =>
+            c.peer.id === userId ? { ...c, peer: { ...c.peer, online, lastActiveAt } } : c,
+          ),
+        });
+        return;
+      }
+
+      if (event === "user:registered") {
+        const incomingUser = payload["user"] as PublicAccount | undefined;
+        if (incomingUser && incomingUser.id !== state.me?.id) {
+          const rest = state.discoveredUsers.filter((u) => u.id !== incomingUser.id);
+          setState({ discoveredUsers: filterAndSortUsers([incomingUser, ...rest], "", "all") });
+        }
+        return;
+      }
+
+      if (event === "user:deleted") {
+        const deletedId = String(payload["userId"] ?? "");
+        setState({
+          discoveredUsers: state.discoveredUsers.filter((u) => u.id !== deletedId),
+          conversations: state.conversations.filter((c) => c.peer.id !== deletedId),
+        });
+        return;
+      }
+
+      if (event === "typing") {
+        const fromUserId = String(payload["fromUserId"] ?? "");
+        const active = Boolean(payload["active"]);
+        if (fromUserId) {
+          setState({
+            typingByPeer: { ...state.typingByPeer, [fromUserId]: active },
+          });
+        }
+        return;
+      }
+
+      if (event === "message:new") {
+        const msg = payload["message"] as ChatMessage | undefined;
+        const sender = payload["sender"] as PublicAccount | undefined;
+        if (msg) handleIncomingMessageEvent(msg, sender);
+        return;
+      }
+
+      if (event === "message:updated" || event === "message:deleted") {
+        const msg = payload["message"] as ChatMessage | undefined;
+        if (!msg || !state.me) return;
+        const peerId = msg.from === state.me.id ? msg.to : msg.from;
+        const thread = state.threads[peerId];
+        if (thread) {
+          setState({
+            threads: {
+              ...state.threads,
+              [peerId]: thread.map((m) => (m.id === msg.id ? msg : m)),
+            },
+          });
+        }
+        setState({
+          conversations: state.conversations.map((c) =>
+            c.peer.id === peerId && c.lastMessage?.id === msg.id ? { ...c, lastMessage: msg } : c,
+          ),
+        });
+        return;
+      }
+
+      if (event === "message:reaction") {
+        const messageId = String(payload["messageId"] ?? "");
+        const reactions = (payload["reactions"] as MessageReactionGroup[] | undefined) ?? [];
+        const nextThreads: Record<string, ChatMessage[]> = {};
+        let changed = false;
+        for (const [peerId, msgs] of Object.entries(state.threads)) {
+          if (msgs.some((m) => m.id === messageId)) {
+            changed = true;
+            nextThreads[peerId] = msgs.map((m) => (m.id === messageId ? { ...m, reactions } : m));
+          } else {
+            nextThreads[peerId] = msgs;
+          }
+        }
+        if (changed) setState({ threads: nextThreads });
+        return;
+      }
+
+      if (event === "messages:delivered") {
+        const peerId = String(payload["peerId"] ?? payload["byUserId"] ?? "");
+        const deliveredAt = String(payload["deliveredAt"] ?? new Date().toISOString());
+        const msgs = state.threads[peerId];
+        if (msgs && state.me) {
+          setState({
+            threads: {
+              ...state.threads,
+              [peerId]: msgs.map((m) =>
+                m.from === state.me!.id && !m.deliveredAt ? { ...m, deliveredAt } : m,
+              ),
+            },
+          });
+        }
+        return;
+      }
+
+      if (event === "messages:seen") {
+        const peerId = String(payload["peerId"] ?? payload["byUserId"] ?? "");
+        const seenAt = String(payload["seenAt"] ?? new Date().toISOString());
+        const msgs = state.threads[peerId];
+        if (msgs && state.me) {
+          setState({
+            threads: {
+              ...state.threads,
+              [peerId]: msgs.map((m) =>
+                m.from === state.me!.id && !m.seenAt
+                  ? { ...m, seenAt, deliveredAt: m.deliveredAt ?? seenAt }
+                  : m,
+              ),
+            },
+          });
+        }
+        setState({
+          conversations: state.conversations.map((c) =>
+            c.peer.id === peerId && c.lastMessage && !c.lastMessage.seenAt
+              ? { ...c, lastMessage: { ...c.lastMessage, seenAt } }
+              : c,
+          ),
+        });
+        return;
+      }
+
+      if (event === "follow:updated") {
+        const followerId = String(payload["followerId"] ?? "");
+        const followingId = String(payload["followingId"] ?? "");
+        const isFollowing = Boolean(payload["isFollowing"]);
+        const targetFollowerCount = payload["targetFollowerCount"];
+        const myFollowingCount = payload["myFollowingCount"];
+        setState({
+          me:
+            state.me && typeof myFollowingCount === "number"
+              ? { ...state.me, followingCount: myFollowingCount }
+              : state.me,
+          discoveredUsers: state.discoveredUsers.map((u) => {
+            if (u.id === followingId && followerId === state.me?.id) {
+              return {
+                ...u,
+                isFollowing,
+                ...(typeof targetFollowerCount === "number"
+                  ? { followerCount: targetFollowerCount }
+                  : {}),
+              };
+            }
+            if (u.id === followerId && followingId === state.me?.id) {
+              return { ...u, followsMe: isFollowing };
+            }
+            return u;
+          }),
+        });
+        return;
+      }
+
+      if (event === "block:updated") {
+        void loadConversations();
+        void discoverUsers();
+        void loadBlocks();
+        return;
+      }
+
+      if (event === "call:incoming") {
+        ensureCallClient().handleIncoming(
+          payload as unknown as {
+            callId: string;
+            callType: "audio" | "video";
+            from: PublicAccount;
+          },
+        );
+        return;
+      }
+
+      if (event === "call:ringing") {
+        ensureCallClient().handleRinging(
+          payload as unknown as {
+            callId: string;
+            targetId: string;
+            callType: "audio" | "video";
+            recipientOnline: boolean;
+          },
+        );
+        return;
+      }
+
+      if (event === "call:signal") {
+        void ensureCallClient().handleSignal(payload as unknown as CallSignalMessage);
+        return;
+      }
+
+      if (event === "call:error") {
+        ensureCallClient().handleCallError(payload as { error?: string });
+      }
+    } catch {
+      /* ignore malformed frame */
+    }
+  };
+
+  socket.onclose = () => {
+    if (ws === socket) {
+      ws = null;
+      setState({ wsConnected: false });
+      if (state.me) {
+        const delay = Math.min(10_000, 1500 * Math.pow(1.6, wsReconnectAttempt));
+        wsReconnectAttempt += 1;
+        wsReconnectTimer = window.setTimeout(() => {
+          if (state.me) connectRealtime();
+        }, delay);
+      }
+    }
+  };
+}
+
+async function hydrateAuthenticatedSession(user: PublicAccount, token?: string | null) {
+  const sessionToken = token ?? state.sessionToken ?? "__cookie__";
+  setState({
+    ready: true,
+    me: user,
+    sessionToken,
+  });
+  connectRealtime();
+  void Promise.allSettled([
+    loadConversations(),
+    discoverUsers(),
+    fetchNfcLink(),
+    fetchGallery(),
+    loadBlocks(),
+  ]);
+}
+
+function resetLocalSessionState() {
+  clearMediaBlobCache();
+  disconnectRealtime();
+  setState({
+    ready: true,
+    me: null,
+    sessionToken: null,
+    conversations: [],
+    discoveredUsers: [],
+    activePeerId: null,
+    threads: {},
+    hasOlderMessages: false,
+    loadingOlderMessages: false,
+    typingByPeer: {},
+    blockedUsers: [],
+    nfc: null,
+    gallery: [],
+    incomingCall: null,
+    outgoingCall: null,
+    incomingMessageAlert: null,
+  });
 }
 
 function bootstrap() {
@@ -1205,60 +868,75 @@ function bootstrap() {
     setState({ soundEnabled: false });
   }
 
-  void testFirestoreConnection();
+  let serverCheckResolved = false;
+
+  void (async () => {
+    try {
+      const [healthRes, sessionRes] = await Promise.all([
+        fetch("/api/health")
+          .then((r) => (r.ok ? r.json() : {}))
+          .catch(() => ({})),
+        fetch("/api/auth/session", { credentials: "include" })
+          .then((r) => r.json())
+          .catch(() => ({
+            authenticated: false,
+            user: null,
+          })),
+      ]);
+
+      const health = healthRes as { otpConfigured?: boolean; emailOtpConfigured?: boolean };
+      const sess = sessionRes as { authenticated?: boolean; user?: PublicAccount | null };
+
+      setState({
+        otpConfigured: Boolean(health.otpConfigured),
+        emailOtpConfigured: Boolean(health.emailOtpConfigured),
+      });
+
+      if (sess.authenticated && sess.user) {
+        serverCheckResolved = true;
+        await hydrateAuthenticatedSession(sess.user, state.sessionToken ?? "__cookie__");
+        return;
+      }
+    } catch {
+      /* ignore transient boot network error */
+    }
+    serverCheckResolved = true;
+    const fbUser = getFirebaseAuth().currentUser;
+    if (!fbUser && !state.me) {
+      setState({ ready: true });
+    }
+  })();
 
   const auth = getFirebaseAuth();
   onAuthStateChanged(auth, (fbUser) => {
+    if (suppressFirebaseSync) return;
     if (!fbUser) {
-      currentUid = null;
-      clearFirestoreListeners();
-      setState({
-        ready: true,
-        me: null,
-        sessionToken: null,
-        conversations: [],
-        discoveredUsers: [],
-        activePeerId: null,
-        threads: {},
-        typingByPeer: {},
-        blockedUsers: [],
-        gallery: [],
-        incomingMessageAlert: null,
-      });
+      if (serverCheckResolved && !state.me) {
+        setState({ ready: true });
+      }
       return;
     }
 
-    if (registrationInProgress) {
+    // Only auto-bridge Firebase user if there isn't already an active SQLite session
+    if (state.me && state.sessionToken) {
       return;
     }
 
     void (async () => {
       try {
-        await syncServerMediaCookie(fbUser);
-        const profile = await ensureUserProfileDocs(fbUser);
-        startRealtimeListeners(fbUser.uid);
-        setState({
-          ready: true,
-          me: profile,
-          sessionToken: fbUser.uid,
-        });
-        void fetchGallery();
-      } catch (err) {
-        console.error("Failed to initialize authenticated session:", err);
+        const idToken = await fbUser.getIdToken();
+        const data = await apiJson<{ token: string; user: PublicAccount }>(
+          "/api/auth/firebase-session",
+          {
+            method: "POST",
+            body: { idToken },
+          },
+        );
+        await hydrateAuthenticatedSession(data.user, data.token);
+      } catch {
         setState({ ready: true });
       }
     })();
-  });
-
-  window.addEventListener("beforeunload", () => {
-    const uid = getFirebaseAuth().currentUser?.uid;
-    if (uid) {
-      void updateDoc(doc(getFirebaseDb(), "users_public", uid), {
-        online: false,
-        lastActiveAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      }).catch(() => {});
-    }
   });
 }
 
@@ -1285,24 +963,17 @@ function mapFirebaseAuthError(err: unknown): Error & { needsProviderConfig?: boo
     return new Error("Enter a valid email address.");
   }
   if (code === "auth/weak-password") {
-    return new Error("Password must be at least 6 characters.");
+    return new Error("Password must be at least 8 characters.");
   }
   if (
     code === "auth/invalid-credential" ||
     code === "auth/wrong-password" ||
     code === "auth/user-not-found"
   ) {
-    return new Error("Invalid email or password.");
+    return new Error("Invalid credentials.");
   }
   if (code === "auth/too-many-requests") {
     return new Error("Too many attempts. Please wait a moment and try again.");
-  }
-  if (code === "auth/operation-not-allowed") {
-    const e = new Error(
-      "Email/Password sign-in is not yet enabled in Firebase Console (Authentication → Sign-in method). You can enable it in 10 seconds or use Continue with Google immediately.",
-    ) as Error & { needsProviderConfig?: boolean };
-    e.needsProviderConfig = true;
-    return e;
   }
   if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
     return new Error("Google sign-in was canceled.");
@@ -1317,17 +988,87 @@ function mapFirebaseAuthError(err: unknown): Error & { needsProviderConfig?: boo
 
 export async function signInWithGoogle(): Promise<PublicAccount> {
   const auth = getFirebaseAuth();
+  suppressFirebaseSync = true;
   try {
     const cred = await signInWithPopup(auth, googleProvider);
-    await syncServerMediaCookie(cred.user);
-    const profile = await ensureUserProfileDocs(cred.user);
-    startRealtimeListeners(cred.user.uid);
-    setState({ ready: true, me: profile, sessionToken: cred.user.uid });
-    void fetchGallery();
-    return profile;
+    const idToken = await cred.user.getIdToken();
+    const data = await apiJson<{ token: string; user: PublicAccount }>(
+      "/api/auth/firebase-session",
+      {
+        method: "POST",
+        body: { idToken },
+      },
+    );
+    await hydrateAuthenticatedSession(data.user, data.token);
+    return data.user;
   } catch (err) {
     throw mapFirebaseAuthError(err);
+  } finally {
+    suppressFirebaseSync = false;
   }
+}
+
+export async function getFreshGoogleReauthToken(): Promise<string> {
+  const auth = getFirebaseAuth();
+  const cred = await signInWithPopup(auth, googleProvider).catch((err) => {
+    throw mapFirebaseAuthError(err);
+  });
+  return cred.user.getIdToken(true);
+}
+
+export async function verifyEmailWithFirebase(password: string): Promise<PublicAccount> {
+  if (!state.me?.email) {
+    throw new Error("Add an email address first.");
+  }
+  const auth = getFirebaseAuth();
+  let fbUser = auth.currentUser;
+  if (!fbUser || fbUser.email?.toLowerCase() !== state.me.email.toLowerCase()) {
+    try {
+      const cred = await signInWithEmailAndPassword(auth, state.me.email, password);
+      fbUser = cred.user;
+    } catch {
+      const cred = await createUserWithEmailAndPassword(auth, state.me.email, password).catch(
+        (err) => {
+          throw mapFirebaseAuthError(err);
+        },
+      );
+      fbUser = cred.user;
+    }
+  }
+  await fbUser.reload();
+  if (fbUser.emailVerified) {
+    const idToken = await fbUser.getIdToken(true);
+    const res = await apiJson<{ ok: boolean; user: PublicAccount }>(
+      "/api/auth/verify-email-firebase",
+      {
+        method: "POST",
+        body: { idToken },
+      },
+    );
+    setState({ me: res.user });
+    return res.user;
+  }
+  await sendEmailVerification(fbUser);
+  throw new Error(
+    `Verification link sent to ${state.me.email}. Click the link in your inbox, then press "Check Verification" again.`,
+  );
+}
+
+export async function checkEmailVerificationStatus(): Promise<PublicAccount | null> {
+  const fbUser = getFirebaseAuth().currentUser;
+  if (!fbUser) return state.me;
+  await fbUser.reload();
+  if (!fbUser.emailVerified) return state.me;
+  const idToken = await fbUser.getIdToken(true);
+  const res = await apiJson<{ ok: boolean; user: PublicAccount }>(
+    "/api/auth/verify-email-firebase",
+    {
+      method: "POST",
+      body: { idToken },
+    },
+  );
+  setState({ me: res.user });
+  return res.user;
 }
 
 export async function registerAccount(input: {
@@ -1340,11 +1081,9 @@ export async function registerAccount(input: {
   bio?: string;
   otpCode?: string;
   avatarDataUrl?: string | null;
+  linkToExisting?: boolean;
+  existingAccountPassword?: string;
 }): Promise<PublicAccount> {
-  const cleanEmail = normalizeEmail(input.email ?? "");
-  if (!cleanEmail) {
-    throw new Error("Enter a valid email address.");
-  }
   const cleanName = input.fullName.trim();
   if (cleanName.length < 2 || cleanName.length > 60) {
     throw new Error("Full name is required (2–60 characters).");
@@ -1353,245 +1092,357 @@ export async function registerAccount(input: {
     throw new Error("Password must be at least 8 characters.");
   }
 
-  const auth = getFirebaseAuth();
-  registrationInProgress = true;
-  try {
-    let cred;
-    try {
-      cred = await createUserWithEmailAndPassword(auth, cleanEmail, input.password);
-    } catch (err) {
-      throw mapFirebaseAuthError(err);
-    }
-
-    await updateProfile(cred.user, { displayName: cleanName }).catch(() => {});
-    const compressedAvatar = input.avatarDataUrl
-      ? await compressAvatarDataUrl(input.avatarDataUrl)
-      : null;
-
-    await syncServerMediaCookie(cred.user);
-    const profile = await ensureUserProfileDocs(cred.user, {
-      fullName: cleanName,
-      ...(input.username ? { username: input.username } : {}),
-      ...(input.bio ? { bio: input.bio } : {}),
-      avatarUrl: compressedAvatar,
-    });
-    startRealtimeListeners(cred.user.uid);
-    setState({ ready: true, me: profile, sessionToken: cred.user.uid });
-    void fetchGallery();
-    return profile;
-  } finally {
-    registrationInProgress = false;
+  let avatarDataUrl: string | undefined;
+  if (input.avatarDataUrl) {
+    avatarDataUrl = (await compressAvatarDataUrl(input.avatarDataUrl)) ?? undefined;
   }
+
+  // Try Firebase email sync in parallel silently when possible so email verification & Google fallback also stay linked
+  let firebaseIdToken: string | undefined;
+  const cleanEmail = input.email ? normalizeEmail(input.email) : null;
+  if (cleanEmail && !input.linkToExisting) {
+    try {
+      const fbUser = getFirebaseAuth().currentUser;
+      if (fbUser && fbUser.email?.toLowerCase() === cleanEmail && fbUser.emailVerified) {
+        firebaseIdToken = await fbUser.getIdToken();
+      }
+    } catch {
+      /* optional */
+    }
+  }
+
+  const data = await apiJson<{ token: string; user: PublicAccount }>("/api/auth/register", {
+    method: "POST",
+    body: {
+      email: input.email?.trim() || undefined,
+      username: input.username?.trim() || undefined,
+      fullName: cleanName,
+      phone: input.phone?.trim() || undefined,
+      countryCode: input.countryCode ?? "+91",
+      password: input.password,
+      bio: input.bio ?? "",
+      avatarDataUrl,
+      linkToExisting: input.linkToExisting,
+      existingAccountPassword: input.existingAccountPassword,
+      phoneOtpCode: input.otpCode,
+      firebaseIdToken,
+    },
+  });
+
+  // Best-effort Firebase mirror for non-linked first email signup so Firebase Forgot Password works out of the box
+  if (cleanEmail && !input.linkToExisting) {
+    suppressFirebaseSync = true;
+    void createUserWithEmailAndPassword(getFirebaseAuth(), cleanEmail, input.password)
+      .then((cred) => updateProfile(cred.user, { displayName: cleanName }))
+      .catch(() => {})
+      .finally(() => {
+        suppressFirebaseSync = false;
+      });
+  }
+
+  await hydrateAuthenticatedSession(data.user, data.token);
+  return data.user;
 }
 
 export const registerWithPhone = registerAccount;
 
 export async function loginAccount(input: {
+  mode?: LoginMode;
   identifier?: string;
   email?: string;
   phone?: string;
+  username?: string;
   countryCode?: string;
   password: string;
+  targetUserId?: string;
 }): Promise<PublicAccount> {
-  const rawId = (input.email ?? input.identifier ?? input.phone ?? "").trim();
-  if (!rawId) {
+  const mode: LoginMode = input.mode ?? "auto";
+  const rawIdentifier = String(
+    mode === "phone"
+      ? (input.phone ?? input.identifier ?? "")
+      : mode === "gmail"
+        ? (input.email ?? input.identifier ?? "")
+        : mode === "username"
+          ? (input.username ?? input.identifier ?? "")
+          : (input.identifier ?? input.email ?? input.phone ?? input.username ?? ""),
+  ).trim();
+
+  if (!rawIdentifier) {
     throw new Error(
-      "Please enter your email, username, or phone number (or use Continue with Google).",
+      mode === "phone"
+        ? "Enter your phone number."
+        : mode === "gmail"
+          ? "Enter your Gmail or email address."
+          : mode === "username"
+            ? "Enter your username."
+            : "Please enter your email, username, or phone number.",
     );
   }
 
-  let targetEmail = rawId;
-  const db = getFirebaseDb();
+  suppressFirebaseSync = true;
+  try {
+    const resp = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({
+        mode,
+        identifier: rawIdentifier,
+        email: input.email,
+        phone: input.phone,
+        username: input.username,
+        countryCode: input.countryCode ?? "+91",
+        password: input.password,
+        targetUserId: input.targetUserId,
+      }),
+    });
 
-  if (!rawId.includes("@")) {
-    try {
-      const usersRef = collection(db, "users_public");
-      // 1. Try matching phone
-      const phoneSnap = await getDocs(query(usersRef, where("phone", "==", rawId)));
-      if (!phoneSnap.empty) {
-        const data = phoneSnap.docs[0]?.data() as { email?: string } | undefined;
-        if (data?.email) targetEmail = data.email;
-      } else {
-        // 2. Try matching username / displayHandle
-        const cleanHandle = rawId.replace(/^@+/, "").toLowerCase();
-        const handleSnap = await getDocs(
-          query(usersRef, where("displayHandle", "==", `@${cleanHandle}`)),
-        );
-        if (!handleSnap.empty) {
-          const data = handleSnap.docs[0]?.data() as { email?: string } | undefined;
-          if (data?.email) targetEmail = data.email;
-        } else {
-          const nameSnap = await getDocs(query(usersRef, where("username", "==", cleanHandle)));
-          if (!nameSnap.empty) {
-            const data = nameSnap.docs[0]?.data() as { email?: string } | undefined;
-            if (data?.email) targetEmail = data.email;
-          }
+    const data = (await resp.json().catch(() => ({}))) as {
+      token?: string;
+      user?: PublicAccount;
+      requiresAccountChoice?: boolean;
+      accounts?: AccountChoiceOption[];
+      error?: string;
+    };
+
+    if (resp.ok && data.requiresAccountChoice && Array.isArray(data.accounts)) {
+      throw new AccountChoiceRequiredError(data.accounts);
+    }
+
+    if (resp.ok && data.token && data.user) {
+      await hydrateAuthenticatedSession(data.user, data.token);
+      return data.user;
+    }
+
+    // Legacy Firebase email/password fallback when SQLite login returned 401 and identifier is an email
+    if (
+      resp.status === 401 &&
+      (mode === "gmail" || (mode === "auto" && rawIdentifier.includes("@")))
+    ) {
+      const cleanEmail = normalizeEmail(rawIdentifier);
+      if (cleanEmail) {
+        try {
+          const cred = await signInWithEmailAndPassword(
+            getFirebaseAuth(),
+            cleanEmail,
+            input.password,
+          );
+          const idToken = await cred.user.getIdToken();
+          const bridged = await apiJson<{ token: string; user: PublicAccount }>(
+            "/api/auth/firebase-session",
+            {
+              method: "POST",
+              body: { idToken, targetUserId: input.targetUserId },
+            },
+          );
+          await hydrateAuthenticatedSession(bridged.user, bridged.token);
+          return bridged.user;
+        } catch {
+          // Preserve server 401 message below
         }
       }
-    } catch {
-      // fallback to rawId as email
     }
-  }
 
-  const cleanEmail = normalizeEmail(targetEmail) ?? targetEmail;
-  const auth = getFirebaseAuth();
-  try {
-    const cred = await signInWithEmailAndPassword(auth, cleanEmail, input.password);
-    await syncServerMediaCookie(cred.user);
-    const profile = await ensureUserProfileDocs(cred.user);
-    startRealtimeListeners(cred.user.uid);
-    setState({ ready: true, me: profile, sessionToken: cred.user.uid });
-    void fetchGallery();
-    return profile;
-  } catch (err) {
-    throw mapFirebaseAuthError(err);
+    throw new Error(data.error || "Invalid credentials.");
+  } finally {
+    suppressFirebaseSync = false;
   }
 }
 
 export const loginWithPhone = loginAccount;
 
-export async function sendPasswordReset(email: string): Promise<void> {
+export async function fetchLinkedAccounts(): Promise<LinkedAccountsInfo> {
+  return apiJson<LinkedAccountsInfo>("/api/auth/linked-accounts");
+}
+
+export async function createLinkedAccount(input: {
+  fullName: string;
+  username?: string;
+  password: string;
+  bio?: string;
+  avatarDataUrl?: string | null;
+  linkBy?: "email" | "phone" | "both" | "auto";
+  switchToNew?: boolean;
+}): Promise<{ user: PublicAccount; switched: boolean }> {
+  let avatarDataUrl: string | undefined;
+  if (input.avatarDataUrl) {
+    avatarDataUrl = (await compressAvatarDataUrl(input.avatarDataUrl)) ?? undefined;
+  }
+  const data = await apiJson<{ token: string | null; switched: boolean; user: PublicAccount }>(
+    "/api/auth/linked-accounts/create",
+    {
+      method: "POST",
+      body: {
+        fullName: input.fullName.trim(),
+        username: input.username?.trim() || undefined,
+        password: input.password,
+        bio: input.bio ?? "",
+        avatarDataUrl,
+        linkBy: input.linkBy ?? "auto",
+        switchToNew: input.switchToNew ?? true,
+      },
+    },
+  );
+  if (data.switched && data.token) {
+    disconnectRealtime();
+    clearMediaBlobCache();
+    setState({
+      conversations: [],
+      threads: {},
+      activePeerId: null,
+      typingByPeer: {},
+      blockedUsers: [],
+      gallery: [],
+      nfc: null,
+      incomingMessageAlert: null,
+    });
+    await hydrateAuthenticatedSession(data.user, data.token);
+  }
+  return { user: data.user, switched: data.switched };
+}
+
+export async function switchLinkedAccount(targetUserId: string): Promise<PublicAccount> {
+  const data = await apiJson<{ token: string; user: PublicAccount }>("/api/auth/switch-account", {
+    method: "POST",
+    body: { targetUserId },
+  });
+  disconnectRealtime();
+  clearMediaBlobCache();
+  setState({
+    conversations: [],
+    threads: {},
+    activePeerId: null,
+    typingByPeer: {},
+    blockedUsers: [],
+    gallery: [],
+    nfc: null,
+    incomingMessageAlert: null,
+  });
+  await hydrateAuthenticatedSession(data.user, data.token);
+  return data.user;
+}
+
+export async function searchControlUsers(q = ""): Promise<ControlUserRecord[]> {
+  const data = await apiJson<{ users: ControlUserRecord[] }>(
+    `/api/control/users?q=${encodeURIComponent(q)}`,
+  );
+  return data.users ?? [];
+}
+
+export async function sendPasswordReset(
+  email: string,
+): Promise<{ mode: "firebase" | "email_otp" }> {
   const clean = normalizeEmail(email);
-  if (!clean) throw new Error("Enter a valid email address.");
+  if (!clean) throw new Error("Enter a valid Gmail or email address.");
+  const serverRes = await apiJson<{ ok: boolean; mode: "firebase" | "email_otp" }>(
+    "/api/auth/forgot-password/email/send",
+    {
+      method: "POST",
+      body: { email: clean },
+    },
+  );
+  if (serverRes.mode === "email_otp") {
+    return { mode: "email_otp" };
+  }
   try {
     await sendPasswordResetEmail(getFirebaseAuth(), clean);
+    return { mode: "firebase" };
   } catch (err) {
     throw mapFirebaseAuthError(err);
   }
 }
 
-export async function logout() {
-  const auth = getFirebaseAuth();
-  const uid = auth.currentUser?.uid;
-  if (uid) {
-    await updateDoc(doc(getFirebaseDb(), "users_public", uid), {
-      online: false,
-      lastActiveAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    }).catch(() => {});
-  }
-  await fetch("/api/auth/logout", { method: "POST", credentials: "include" }).catch(() => {});
-  clearMediaBlobCache();
-  clearFirestoreListeners();
-  currentUid = null;
-  await signOut(auth).catch(() => {});
-  setState({
-    me: null,
-    sessionToken: null,
-    conversations: [],
-    discoveredUsers: [],
-    activePeerId: null,
-    threads: {},
-    typingByPeer: {},
-    blockedUsers: [],
-    nfc: null,
-    gallery: [],
-    incomingCall: null,
-    outgoingCall: null,
-    incomingMessageAlert: null,
+export async function confirmEmailPasswordReset(input: {
+  email: string;
+  code: string;
+  newPassword: string;
+  username?: string;
+}): Promise<{ ok: boolean; updatedHandle?: string }> {
+  return apiJson("/api/auth/forgot-password/email/confirm", {
+    method: "POST",
+    body: input,
   });
 }
 
-export async function deleteAccount(password: string): Promise<void> {
-  const auth = getFirebaseAuth();
-  const user = auth.currentUser;
-  if (!user) throw new Error("No authenticated user.");
-  if (!user.email) throw new Error("Account email not found.");
-
+export async function logout() {
+  suppressFirebaseSync = true;
   try {
-    const cred = EmailAuthProvider.credential(user.email, password);
-    await reauthenticateWithCredential(user, cred);
-  } catch {
-    throw new Error(
-      "Incorrect password. Please enter your correct password to confirm account deletion.",
-    );
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      headers: await getBearerHeaders(),
+      credentials: "include",
+    }).catch(() => {});
+    await signOut(getFirebaseAuth()).catch(() => {});
+    resetLocalSessionState();
+  } finally {
+    suppressFirebaseSync = false;
   }
-
-  const db = getFirebaseDb();
-  const uid = user.uid;
-
-  await deleteDoc(doc(db, "users_public", uid)).catch(() => {});
-  await deleteDoc(doc(db, "users_private", uid)).catch(() => {});
-
-  await deleteUser(user);
-  await logout();
 }
 
-export async function removeAllUsersAndData(): Promise<void> {
-  const db = getFirebaseDb();
-  const collectionsToClean = [
-    "users_public",
-    "users_private",
-    "conversations",
-    "follows",
-    "blocks",
-    "handles",
-    "reports",
-    "reading_state",
-  ];
-
-  try {
-    for (const colName of collectionsToClean) {
-      const snap = await getDocs(collection(db, colName));
-      const batch = writeBatch(db);
-      let count = 0;
-      for (const d of snap.docs) {
-        batch.delete(d.ref);
-        count++;
-        if (count >= 400) {
-          await batch.commit();
-          count = 0;
-        }
-      }
-      if (count > 0) {
-        await batch.commit();
-      }
-    }
-  } catch (err) {
-    console.error("Error removing all users and data:", err);
-  }
-
-  await logout();
+export async function deleteAccount(input: {
+  password?: string;
+  firebaseIdToken?: string;
+  securityKey: string;
+}): Promise<void> {
+  await apiJson("/api/auth/account", {
+    method: "DELETE",
+    body: {
+      password: input.password,
+      firebaseIdToken: input.firebaseIdToken,
+      securityKey: input.securityKey,
+    },
+  });
+  await signOut(getFirebaseAuth()).catch(() => {});
+  resetLocalSessionState();
 }
 
-// Legacy OTP stubs kept for compatibility with profile/NFC components without breaking imports
-export async function sendOtp(_input: {
+export async function sendOtp(input: {
   phone: string;
   countryCode: string;
   purpose: "reset_password" | "verify_phone" | "register";
 }) {
-  throw new Error("SMS OTP is disabled. Use email password reset or Google sign-in.");
+  return apiJson<{ ok: boolean; phoneMasked?: string }>("/api/auth/otp/send", {
+    method: "POST",
+    body: input,
+  });
 }
 
-export async function resetPasswordWithOtp(_input: {
+export async function resetPasswordWithOtp(input: {
   phone: string;
   countryCode: string;
   code: string;
   newPassword: string;
+  targetUserId?: string;
 }) {
-  throw new Error("SMS OTP is disabled.");
+  return apiJson<{ ok: boolean; updatedHandle?: string }>("/api/auth/otp/reset-password", {
+    method: "POST",
+    body: input,
+  });
 }
 
-export async function verifyMyPhoneOtp(_code: string) {
-  return { ok: false, phoneVerified: false };
-}
-
-export async function changePassword(currentPassword: string, newPassword: string) {
-  const user = getFirebaseAuth().currentUser;
-  if (!user || !user.email) {
-    throw new Error("Password change is only available for email/password accounts.");
+export async function verifyMyPhoneOtp(code: string) {
+  const res = await apiJson<{ ok: boolean; phoneVerified: boolean }>("/api/auth/otp/verify-phone", {
+    method: "POST",
+    body: { code },
+  });
+  if (state.me && res.phoneVerified) {
+    setState({ me: { ...state.me, phoneVerified: true } });
   }
+  return res;
+}
+
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+  firebaseIdToken?: string,
+) {
   if (newPassword.length < 8) {
     throw new Error("New password must be at least 8 characters.");
   }
-  try {
-    const cred = EmailAuthProvider.credential(user.email, currentPassword);
-    await reauthenticateWithCredential(user, cred);
-    await updatePassword(user, newPassword);
-    return { ok: true };
-  } catch (err) {
-    throw mapFirebaseAuthError(err);
-  }
+  return apiJson<{ ok: boolean }>("/api/auth/change-password", {
+    method: "POST",
+    body: { currentPassword, newPassword, firebaseIdToken },
+  });
 }
 
 export async function updateMyProfile(patch: {
@@ -1599,324 +1450,179 @@ export async function updateMyProfile(patch: {
   bio?: string;
   displayHandle?: string;
 }): Promise<PublicAccount> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser || !state.me) throw new Error("Authentication required.");
-
-  const db = getFirebaseDb();
-  const uid = fbUser.uid;
-  const nextName = patch.fullName !== undefined ? patch.fullName.trim() : state.me.fullName;
-  if (nextName.length < 2 || nextName.length > 60) {
-    throw new Error("Full name must be 2–60 characters.");
-  }
-  const nextBio = patch.bio !== undefined ? patch.bio.trim().slice(0, 200) : state.me.bio;
-
-  let nextHandle = state.me.displayHandle;
-  if (patch.displayHandle !== undefined) {
-    const normalized = normalizeHandle(patch.displayHandle);
-    if (!normalized) {
-      throw new Error("Username must be at least 2 characters.");
-    }
-    if (normalized !== state.me.displayHandle) {
-      await reserveAvailableHandle(uid, normalized, nextName, fbUser.email ?? null);
-      const oldKey = state.me.displayHandle.replace(/^@+/, "").toLowerCase();
-      if (oldKey && oldKey !== normalized.slice(1)) {
-        await deleteDoc(doc(db, "handles", oldKey)).catch(() => {});
-      }
-      nextHandle = normalized;
-    }
-  }
-
-  try {
-    await updateDoc(doc(db, "users_public", uid), {
-      fullName: nextName,
-      displayHandle: nextHandle,
-      bio: nextBio,
-      lastActiveAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `users_public/${uid}`);
-  }
-
-  const updated: PublicAccount = {
-    ...state.me,
-    fullName: nextName,
-    displayHandle: nextHandle,
-    bio: nextBio,
-  };
-  setState({ me: updated });
-  return updated;
+  const data = await apiJson<{ user: PublicAccount }>("/api/profile", {
+    method: "PATCH",
+    body: patch,
+  });
+  setState({ me: data.user });
+  return data.user;
 }
 
 export async function uploadAvatar(file: File): Promise<PublicAccount> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser || !state.me) throw new Error("Authentication required.");
   if (!file.type.startsWith("image/")) {
     throw new Error("Avatar must be an image file.");
   }
-  const compressed = await compressAvatarDataUrl(file);
-  if (!compressed) {
-    throw new Error("Could not process avatar image.");
+  const form = new FormData();
+  form.append("file", file);
+  const headers = await getBearerHeaders();
+  const resp = await fetch("/api/profile/avatar", {
+    method: "POST",
+    headers,
+    credentials: "include",
+    body: form,
+  });
+  const data = (await resp.json().catch(() => ({}))) as { user?: PublicAccount; error?: string };
+  if (!resp.ok || !data.user) {
+    throw new Error(data.error || "Could not update avatar.");
   }
-  const db = getFirebaseDb();
-  try {
-    await updateDoc(doc(db, "users_public", fbUser.uid), {
-      avatarUrl: compressed,
-      lastActiveAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `users_public/${fbUser.uid}`);
-  }
-  const updated = { ...state.me, avatarUrl: compressed };
-  setState({ me: updated });
-  return updated;
+  setState({ me: data.user });
+  return data.user;
 }
 
 export async function setSecretTheme(theme: SecretThemeId) {
-  const fbUser = getFirebaseAuth().currentUser;
   if (state.me) {
     setState({ me: { ...state.me, theme } });
   }
-  if (!fbUser) return;
-  try {
-    await updateDoc(doc(getFirebaseDb(), "users_public", fbUser.uid), {
-      theme,
-      lastActiveAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `users_public/${fbUser.uid}`);
-  }
+  await apiJson("/api/profile/theme", {
+    method: "PATCH",
+    body: { theme },
+  }).catch(() => {});
 }
 
-export async function fetchNfcLink() {
-  const fallback: NfcLinkState = {
-    revoked: false,
-    version: 1,
-    updatedAt: new Date().toISOString(),
+export async function fetchNfcLink(): Promise<NfcLinkState> {
+  const data = await apiJson<NfcLinkState>("/api/nfc");
+  setState({ nfc: data });
+  return data;
+}
+
+export async function regenerateNfcLink(): Promise<NfcLinkState> {
+  const data = await apiJson<NfcLinkState>("/api/nfc/regenerate", { method: "POST" });
+  setState({ nfc: data });
+  return data;
+}
+
+export async function revokeNfcLink(): Promise<NfcLinkState> {
+  const data = await apiJson<{ revoked: boolean; token: null; path: null; updatedAt: string }>(
+    "/api/nfc/revoke",
+    { method: "POST" },
+  );
+  const next: NfcLinkState = {
+    revoked: data.revoked,
+    version: state.nfc?.version ?? 1,
+    updatedAt: data.updatedAt,
     token: null,
     path: null,
   };
-  return fallback;
-}
-
-export async function regenerateNfcLink() {
-  return fetchNfcLink();
-}
-
-export async function revokeNfcLink() {
-  return {
-    revoked: true,
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    token: null,
-    path: null,
-  };
+  setState({ nfc: next });
+  return next;
 }
 
 export async function resolveNfcToken(
-  _token: string,
+  token: string,
 ): Promise<
   | { status: "authorized"; owner?: PublicAccount }
   | { status: "login_required"; ownerHint?: string; signedInAsDifferentAccount?: boolean }
 > {
-  return { status: "login_required", ownerHint: "R***" };
+  const headers = await getBearerHeaders();
+  const resp = await fetch(`/api/nfc/resolve?token=${encodeURIComponent(token)}`, {
+    headers,
+    credentials: "include",
+  });
+  if (resp.status === 404) {
+    throw new Error("This link is invalid or was revoked.");
+  }
+  const data = (await resp.json().catch(() => ({}))) as {
+    status?: "authorized" | "login_required" | "invalid";
+    owner?: PublicAccount;
+    ownerHint?: string;
+    signedInAsDifferentAccount?: boolean;
+  };
+  if (data.status === "invalid" || !data.status) {
+    throw new Error("This link is invalid or was revoked.");
+  }
+  if (data.status === "authorized") {
+    return {
+      status: "authorized",
+      ...(data.owner !== undefined ? { owner: data.owner } : {}),
+    };
+  }
+  return {
+    status: "login_required",
+    ...(data.ownerHint !== undefined ? { ownerHint: data.ownerHint } : {}),
+    ...(data.signedInAsDifferentAccount !== undefined
+      ? { signedInAsDifferentAccount: data.signedInAsDifferentAccount }
+      : {}),
+  };
 }
 
 export async function discoverUsers(
   q = "",
   filter: "all" | "following" | "followers" = "all",
 ): Promise<PublicAccount[]> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) return [];
-  const db = getFirebaseDb();
-
-  if (rawPublicUsers.size <= 1) {
-    try {
-      const snap = await getDocs(collection(db, "users_public"));
-      const next = new Map<string, RawPublicUser>();
-      for (const d of snap.docs) {
-        const data = d.data() as RawPublicUser;
-        if (data?.uid) next.set(data.uid, data);
-      }
-      rawPublicUsers = next;
-      recomputeDerivedState();
-    } catch (err) {
-      handleFirestoreError(err, OperationType.LIST, "users_public");
-    }
+  if (!state.me) return [];
+  const data = await apiJson<{ users: PublicAccount[] }>(
+    `/api/users?q=${encodeURIComponent(q)}&filter=${encodeURIComponent(filter)}`,
+  );
+  if (!q && filter === "all") {
+    setState({ discoveredUsers: data.users });
   }
-
-  return filterAndSortUsers(state.discoveredUsers, q, filter);
+  return data.users;
 }
 
 export async function searchUsers(q: string): Promise<PublicAccount[]> {
-  return discoverUsers(q, "all");
+  if (!state.me) return [];
+  const data = await apiJson<{ users: PublicAccount[] }>(
+    `/api/users/search?q=${encodeURIComponent(q)}`,
+  );
+  return data.users;
 }
 
 export async function fetchUserProfile(userId: string): Promise<PublicAccount> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const db = getFirebaseDb();
-  let snap;
-  try {
-    snap = await getDoc(doc(db, "users_public", userId));
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, `users_public/${userId}`);
-  }
-  if (!snap.exists()) {
-    throw new Error("User not found.");
-  }
-  const raw = snap.data() as RawPublicUser;
-  rawPublicUsers.set(userId, raw);
-  return toPublicAccountFromRaw(raw, fbUser.uid);
+  const data = await apiJson<{ user: PublicAccount }>(`/api/users/${encodeURIComponent(userId)}`);
+  return data.user;
 }
 
 export async function followUser(userId: string) {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const uid = fbUser.uid;
-  if (!userId || userId === uid) throw new Error("Cannot follow yourself.");
-  if (blockedByMeMap.has(userId) || blockedMeIds.has(userId)) {
-    throw new Error("Cannot follow a blocked user.");
-  }
+  const data = await apiJson<{
+    ok: boolean;
+    isFollowing: boolean;
+    followerCount: number;
+    followingCount: number;
+    myFollowingCount: number;
+  }>(`/api/users/${encodeURIComponent(userId)}/follow`, { method: "POST" });
 
-  const db = getFirebaseDb();
-  const followId = `${uid}__${userId}`;
-  const followRef = doc(db, "follows", followId);
-  let existingFollow;
-  try {
-    existingFollow = await getDoc(followRef);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, `follows/${followId}`);
-  }
-
-  if (!existingFollow.exists()) {
-    const batch = writeBatch(db);
-    batch.set(followRef, {
-      followerId: uid,
-      followingId: userId,
-      createdAt: serverTimestamp(),
-    });
-    batch.update(doc(db, "users_public", uid), {
-      followingCount: increment(1),
-    });
-    batch.update(doc(db, "users_public", userId), {
-      followerCount: increment(1),
-    });
-    try {
-      await batch.commit();
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, `follows/${followId}`);
-    }
-  }
-
-  const targetFollowerCount =
-    (rawPublicUsers.get(userId)?.followerCount ?? 0) + (existingFollow.exists() ? 0 : 1);
-  const targetFollowingCount = rawPublicUsers.get(userId)?.followingCount ?? 0;
-  const myFollowingCount = (state.me?.followingCount ?? 0) + (existingFollow.exists() ? 0 : 1);
-
-  return {
-    ok: true,
-    isFollowing: true,
-    followerCount: targetFollowerCount,
-    followingCount: targetFollowingCount,
-    myFollowingCount,
-  };
+  setState({
+    me: state.me ? { ...state.me, followingCount: data.myFollowingCount } : state.me,
+    discoveredUsers: state.discoveredUsers.map((u) =>
+      u.id === userId ? { ...u, isFollowing: true, followerCount: data.followerCount } : u,
+    ),
+  });
+  return data;
 }
 
 export async function unfollowUser(userId: string) {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const uid = fbUser.uid;
-  const db = getFirebaseDb();
-  const followId = `${uid}__${userId}`;
-  const followRef = doc(db, "follows", followId);
-  let existingFollow;
-  try {
-    existingFollow = await getDoc(followRef);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, `follows/${followId}`);
-  }
+  const data = await apiJson<{
+    ok: boolean;
+    isFollowing: boolean;
+    followerCount: number;
+    followingCount: number;
+    myFollowingCount: number;
+  }>(`/api/users/${encodeURIComponent(userId)}/follow`, { method: "DELETE" });
 
-  if (existingFollow.exists()) {
-    const batch = writeBatch(db);
-    batch.delete(followRef);
-    batch.update(doc(db, "users_public", uid), {
-      followingCount: increment(-1),
-    });
-    batch.update(doc(db, "users_public", userId), {
-      followerCount: increment(-1),
-    });
-    try {
-      await batch.commit();
-    } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `follows/${followId}`);
-    }
-  }
-
-  const targetFollowerCount = Math.max(
-    0,
-    (rawPublicUsers.get(userId)?.followerCount ?? 1) - (existingFollow.exists() ? 1 : 0),
-  );
-  const targetFollowingCount = rawPublicUsers.get(userId)?.followingCount ?? 0;
-  const myFollowingCount = Math.max(
-    0,
-    (state.me?.followingCount ?? 1) - (existingFollow.exists() ? 1 : 0),
-  );
-
-  return {
-    ok: true,
-    isFollowing: false,
-    followerCount: targetFollowerCount,
-    followingCount: targetFollowingCount,
-    myFollowingCount,
-  };
-}
-
-async function ensureConversationDoc(myUid: string, peerId: string): Promise<string> {
-  const key = threadKeyFor(myUid, peerId);
-  if (convDocsMap.has(key)) return key;
-  const db = getFirebaseDb();
-  const convRef = doc(db, "conversations", key);
-  let snap;
-  try {
-    snap = await getDoc(convRef);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, `conversations/${key}`);
-  }
-  if (!snap.exists()) {
-    const [participantA, participantB] = [myUid, peerId].sort();
-    try {
-      await setDoc(convRef, {
-        participantA,
-        participantB,
-        lastMessageText: "",
-        lastMessageFrom: null,
-        lastMessageMediaKind: null,
-        lastMessageDeleted: false,
-        lastMessageAt: null,
-        lastMessageSeenAt: null,
-        unreadA: 0,
-        unreadB: 0,
-        pinnedA: false,
-        pinnedB: false,
-        mutedA: false,
-        mutedB: false,
-        typingA: false,
-        typingB: false,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, `conversations/${key}`);
-    }
-  }
-  return key;
+  setState({
+    me: state.me ? { ...state.me, followingCount: data.myFollowingCount } : state.me,
+    discoveredUsers: state.discoveredUsers.map((u) =>
+      u.id === userId ? { ...u, isFollowing: false, followerCount: data.followerCount } : u,
+    ),
+  });
+  return data;
 }
 
 export async function loadConversations(): Promise<ConversationItem[]> {
-  return state.conversations;
+  if (!state.me) return [];
+  const data = await apiJson<{ conversations: ConversationItem[] }>("/api/conversations");
+  setState({ conversations: data.conversations });
+  return data.conversations;
 }
 
 export function dismissIncomingMessageAlert() {
@@ -1926,200 +1632,92 @@ export function dismissIncomingMessageAlert() {
 }
 
 export async function openThread(peerId: string | null) {
-  const generation = ++activeThreadGeneration;
-  activeThreadUnsub?.();
-  activeThreadUnsub = null;
   setState({
     activePeerId: peerId,
-    hasOlderMessages: peerId ? (threadHasOlder.get(peerId) ?? false) : false,
+    hasOlderMessages: false,
     loadingOlderMessages: false,
     ...(peerId && state.incomingMessageAlert?.peer.id === peerId
       ? { incomingMessageAlert: null }
       : {}),
   });
-  if (!peerId) return;
+  if (!peerId || !state.me) return;
 
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) return;
-  const uid = fbUser.uid;
-  const db = getFirebaseDb();
+  const data = await apiJson<{
+    peer: PublicAccount;
+    blockedByMe: boolean;
+    blockedMe: boolean;
+    pinned: boolean;
+    muted: boolean;
+    messages: ChatMessage[];
+  }>(`/api/messages/${encodeURIComponent(peerId)}`);
 
-  if (!rawPublicUsers.has(peerId)) {
-    await fetchUserProfile(peerId).catch(() => null);
-  }
-  if (generation !== activeThreadGeneration || state.activePeerId !== peerId) return;
-
-  const key = await ensureConversationDoc(uid, peerId);
-  if (generation !== activeThreadGeneration || state.activePeerId !== peerId) return;
-  const msgsRef = collection(db, "conversations", key, "messages");
-
-  activeThreadUnsub = onSnapshot(
-    query(msgsRef, orderBy("createdAt", "asc"), limitToLast(THREAD_PAGE_SIZE + 1)),
-    (snap) => {
-      if (generation !== activeThreadGeneration) return;
-      if (snap.docs[0] && !threadOldestDocs.has(peerId)) {
-        threadOldestDocs.set(peerId, snap.docs[0]);
-      }
-      const hasOlderMessages =
-        !threadHistoryExhausted.has(peerId) && snap.docs.length > THREAD_PAGE_SIZE;
-      threadHasOlder.set(peerId, hasOlderMessages);
-      const recent = snap.docs.map((d) =>
-        serializeFirestoreMessage(d.data() as RawMessage, key, uid),
-      );
-      const merged = new Map(
-        [...(olderMessagesByPeer.get(peerId) ?? []), ...recent].map((message) => [
-          message.id,
-          message,
-        ]),
-      );
-      const messages = Array.from(merged.values()).sort(
-        (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
-      );
-      setState({
-        threads: { ...state.threads, [peerId]: messages },
-        hasOlderMessages,
-      });
-
-      const unseenIncoming = snap.docs.filter((d) => {
-        const data = d.data() as RawMessage;
-        return data.recipientId === uid && !data.seenAt;
-      });
-      if (unseenIncoming.length > 0) {
-        const batch = writeBatch(db);
-        for (const d of unseenIncoming) {
-          const data = d.data() as RawMessage;
-          batch.update(d.ref, {
-            deliveredAt: data.deliveredAt ?? serverTimestamp(),
-            seenAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        }
-        const [participantA] = key.split("__");
-        const isA = participantA === uid;
-        batch.update(doc(db, "conversations", key), {
-          ...(isA ? { unreadA: 0 } : { unreadB: 0 }),
-          lastMessageSeenAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-        void batch.commit().catch(() => {});
-      }
-    },
-    (err) => {
-      if (generation === activeThreadGeneration) {
-        console.error("Thread listener error:", err);
-      }
-    },
-  );
+  setState({
+    threads: { ...state.threads, [peerId]: data.messages },
+    conversations: state.conversations.some((c) => c.peer.id === peerId)
+      ? state.conversations.map((c) =>
+          c.peer.id === peerId
+            ? {
+                ...c,
+                peer: data.peer,
+                blockedByMe: data.blockedByMe,
+                blockedMe: data.blockedMe,
+                pinned: data.pinned,
+                muted: data.muted,
+                unreadCount: 0,
+              }
+            : c,
+        )
+      : [
+          ...state.conversations,
+          {
+            peer: data.peer,
+            blockedByMe: data.blockedByMe,
+            blockedMe: data.blockedMe,
+            pinned: data.pinned,
+            muted: data.muted,
+            lastMessage: data.messages[data.messages.length - 1] ?? null,
+            unreadCount: 0,
+          },
+        ],
+  });
 
   await markThreadSeen(peerId);
 }
 
-export async function loadOlderMessages(peerId: string): Promise<void> {
-  const cursor = threadOldestDocs.get(peerId);
-  if (!cursor || !threadHasOlder.get(peerId) || state.loadingOlderMessages) return;
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) return;
-
-  setState({ loadingOlderMessages: true });
-  try {
-    const key = threadKeyFor(fbUser.uid, peerId);
-    const page = await getDocs(
-      query(
-        collection(getFirebaseDb(), "conversations", key, "messages"),
-        orderBy("createdAt", "asc"),
-        endBefore(cursor),
-        limitToLast(THREAD_PAGE_SIZE),
-      ),
-    );
-    const older = page.docs.map((d) =>
-      serializeFirestoreMessage(d.data() as RawMessage, key, fbUser.uid),
-    );
-    const unseen = page.docs.filter((messageDoc) => {
-      const message = messageDoc.data() as RawMessage;
-      return message.recipientId === fbUser.uid && !message.seenAt;
-    });
-    if (unseen.length > 0) {
-      const batch = writeBatch(getFirebaseDb());
-      for (const messageDoc of unseen) {
-        const message = messageDoc.data() as RawMessage;
-        batch.update(messageDoc.ref, {
-          deliveredAt: message.deliveredAt ?? serverTimestamp(),
-          seenAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-      batch.update(doc(getFirebaseDb(), "conversations", key), {
-        lastMessageSeenAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-      void batch.commit().catch(() => {});
-    }
-    const cached = olderMessagesByPeer.get(peerId) ?? [];
-    const merged = new Map([...cached, ...older].map((message) => [message.id, message]));
-    const messages = Array.from(merged.values()).sort(
-      (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
-    );
-    if (page.docs[0]) {
-      threadOldestDocs.set(peerId, page.docs[0]);
-    }
-    const hasOlderMessages = page.docs.length === THREAD_PAGE_SIZE;
-    if (page.docs.length < THREAD_PAGE_SIZE) {
-      threadHistoryExhausted.add(peerId);
-    }
-    threadHasOlder.set(peerId, hasOlderMessages);
-    olderMessagesByPeer.set(peerId, messages);
-    setState({
-      threads: { ...state.threads, [peerId]: messages },
-      ...(state.activePeerId === peerId ? { hasOlderMessages } : {}),
-    });
-  } catch (err) {
-    console.error("Could not load older messages:", err);
-    toast.error("Could not load older messages.");
-  } finally {
-    setState({ loadingOlderMessages: false });
-  }
+export async function loadOlderMessages(_peerId: string): Promise<void> {
+  // Up to 300 most recent messages are loaded directly via /api/messages/:peerId
+  setState({ hasOlderMessages: false, loadingOlderMessages: false });
 }
 
 export async function searchThreadMessages(peerId: string, q: string): Promise<ChatMessage[]> {
-  const existing = state.threads[peerId] ?? [];
-  const clean = q.trim().toLowerCase();
-  if (!clean) return existing;
-  return existing.filter((m) => !m.deletedAt && m.text.toLowerCase().includes(clean));
+  const data = await apiJson<{ messages: ChatMessage[] }>(
+    `/api/messages/${encodeURIComponent(peerId)}?q=${encodeURIComponent(q)}`,
+  );
+  return data.messages;
 }
 
 export async function markThreadSeen(peerId: string) {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) return;
-  const uid = fbUser.uid;
-  const key = threadKeyFor(uid, peerId);
-  const [participantA] = key.split("__");
-  const isA = participantA === uid;
-  const db = getFirebaseDb();
-  const convRef = doc(db, "conversations", key);
-  const snap = await getDoc(convRef).catch(() => null);
-  if (!snap?.exists()) return;
-
-  const currentUnread = isA ? snap.data()["unreadA"] : snap.data()["unreadB"];
-  if (currentUnread > 0) {
-    await updateDoc(convRef, {
-      ...(isA ? { unreadA: 0 } : { unreadB: 0 }),
-      lastMessageSeenAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    }).catch(() => {});
-  }
+  if (!state.me) return;
+  await apiJson(`/api/messages/${encodeURIComponent(peerId)}/seen`, { method: "POST" }).catch(
+    () => {},
+  );
+  setState({
+    conversations: state.conversations.map((c) =>
+      c.peer.id === peerId ? { ...c, unreadCount: 0 } : c,
+    ),
+  });
 }
 
 export async function uploadChatMedia(file: File, recipientId?: string) {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const idToken = await fbUser.getIdToken();
+  if (!state.me) throw new Error("Authentication required.");
   const form = new FormData();
   form.append("file", file);
   if (recipientId) form.append("recipientId", recipientId);
 
+  const headers = await getBearerHeaders();
   const resp = await fetch("/api/media", {
     method: "POST",
-    headers: { Authorization: `Bearer ${idToken}` },
+    headers,
     credentials: "include",
     body: form,
   });
@@ -2168,30 +1766,11 @@ export async function sendChatMessage(
   mediaId?: string | null,
   replyToId?: string | null,
 ): Promise<ChatMessage> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser || !state.me) throw new Error("Authentication required.");
-  const uid = fbUser.uid;
-  if (blockedByMeMap.has(peerId) || blockedMeIds.has(peerId)) {
-    throw new Error("Messaging is blocked between you and this user.");
-  }
+  if (!state.me) throw new Error("Authentication required.");
 
-  const key = await ensureConversationDoc(uid, peerId);
-  const db = getFirebaseDb();
-  const mediaMeta = mediaId ? (uploadedMediaMeta.get(mediaId) ?? null) : null;
-  if (mediaId && mediaId.startsWith("fbm_")) {
-    const idToken = await fbUser.getIdToken();
-    await fetch(`/api/media/${encodeURIComponent(mediaId)}/share`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${idToken}`,
-      },
-      credentials: "include",
-      body: JSON.stringify({ recipientId: peerId }),
-    }).catch(() => {});
-  }
   const cleanText = text.trim().slice(0, 4000);
-  const displayText =
+  const mediaMeta = mediaId ? (uploadedMediaMeta.get(mediaId) ?? null) : null;
+  const optimisticText =
     cleanText ||
     (mediaMeta?.kind === "video"
       ? "Sent a video"
@@ -2201,91 +1780,23 @@ export async function sendChatMessage(
           ? "Sent a photo"
           : "");
 
-  if (!displayText && !mediaMeta) {
+  if (!optimisticText && !mediaId) {
     throw new Error("Message text or media is required.");
   }
 
-  let replyTo: ReplyPreview | null = null;
-  if (replyToId) {
-    const parent = (state.threads[peerId] ?? []).find((m) => m.id === replyToId);
-    if (parent) {
-      const senderName =
-        parent.from === uid
-          ? state.me.fullName
-          : (rawPublicUsers.get(parent.from)?.fullName ?? "Reader");
-      replyTo = {
-        id: parent.id,
-        senderId: parent.from,
-        senderName: senderName.slice(0, 60),
-        text: (parent.deletedAt ? "Message deleted" : parent.text).slice(0, 400),
-        mediaKind: parent.deletedAt ? null : parent.mediaKind,
-        deleted: Boolean(parent.deletedAt),
-      };
-    }
-  }
-
-  const msgId = `msg_${crypto.randomUUID().replace(/-/g, "")}`;
-  const msgRef = doc(db, "conversations", key, "messages", msgId);
-  const [participantA] = key.split("__");
-  const isMeA = participantA === uid;
-
-  try {
-    await setDoc(msgRef, {
-      id: msgId,
-      threadKey: key,
-      senderId: uid,
-      recipientId: peerId,
-      text: displayText,
-      mediaUrl: mediaMeta?.url ?? null,
-      mediaId: mediaId ?? null,
-      mediaKind: mediaMeta?.kind ?? null,
-      mediaName: mediaMeta?.name ? mediaMeta.name.slice(0, 255) : null,
-      replyToId: replyTo?.id ?? null,
-      replyTo,
-      reactionA: null,
-      reactionB: null,
-      editedAt: null,
-      deletedAt: null,
-      deliveredAt: null,
-      seenAt: null,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, `conversations/${key}/messages/${msgId}`);
-  }
-
-  try {
-    await updateDoc(doc(db, "conversations", key), {
-      lastMessageText: displayText,
-      lastMessageFrom: uid,
-      lastMessageMediaKind: mediaMeta?.kind ?? null,
-      lastMessageDeleted: false,
-      lastMessageAt: serverTimestamp(),
-      lastMessageSeenAt: null,
-      ...(isMeA
-        ? { unreadB: increment(1), typingA: false }
-        : { unreadA: increment(1), typingB: false }),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `conversations/${key}`);
-  }
-
-  if (mediaId) void fetchGallery();
-
-  return {
-    id: msgId,
-    threadKey: key,
-    from: uid,
+  const tempId = `temp_${crypto.randomUUID()}`;
+  const optimistic: ChatMessage = {
+    id: tempId,
+    threadKey: threadKeyFor(state.me.id, peerId),
+    from: state.me.id,
     to: peerId,
-    text: displayText,
+    text: optimisticText,
     mediaUrl: mediaMeta?.url ?? null,
     mediaId: mediaId ?? null,
     mediaKind: mediaMeta?.kind ?? null,
     mediaName: mediaMeta?.name ?? null,
-    replyToId: replyTo?.id ?? null,
-    replyTo,
+    replyToId: replyToId ?? null,
+    replyTo: null,
     reactions: [],
     editedAt: null,
     deletedAt: null,
@@ -2293,204 +1804,112 @@ export async function sendChatMessage(
     createdAt: new Date().toISOString(),
     seenAt: null,
   };
-}
+  upsertMessageIntoThread(peerId, optimistic);
 
-function findMessageContext(messageId: string): { peerId: string; msg: ChatMessage } | null {
-  for (const [peerId, msgs] of Object.entries(state.threads)) {
-    const found = msgs.find((m) => m.id === messageId);
-    if (found) return { peerId, msg: found };
+  try {
+    const res = await apiJson<{ message: ChatMessage; sender: PublicAccount }>("/api/messages", {
+      method: "POST",
+      body: { peerId, text: cleanText, mediaId: mediaId ?? null, replyToId: replyToId ?? null },
+    });
+    const existing = (state.threads[peerId] ?? []).filter((m) => m.id !== tempId);
+    setState({ threads: { ...state.threads, [peerId]: existing } });
+    handleIncomingMessageEvent(res.message, res.sender);
+    return res.message;
+  } catch (err) {
+    const cleaned = (state.threads[peerId] ?? []).filter((m) => m.id !== tempId);
+    setState({ threads: { ...state.threads, [peerId]: cleaned } });
+    throw err;
   }
-  return null;
 }
 
 export async function editChatMessage(messageId: string, text: string): Promise<ChatMessage> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const ctx = findMessageContext(messageId);
-  if (!ctx) throw new Error("Message not found.");
-
-  const cleanText = text.trim().slice(0, 4000);
-  if (!cleanText) throw new Error("Message text cannot be empty.");
-
-  const db = getFirebaseDb();
-  const msgRef = doc(db, "conversations", ctx.msg.threadKey, "messages", messageId);
-  try {
-    await updateDoc(msgRef, {
-      text: cleanText,
-      editedAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(
-      err,
-      OperationType.UPDATE,
-      `conversations/${ctx.msg.threadKey}/messages/${messageId}`,
-    );
+  const res = await apiJson<{ message: ChatMessage }>(
+    `/api/messages/${encodeURIComponent(messageId)}`,
+    {
+      method: "PATCH",
+      body: { text },
+    },
+  );
+  if (state.me) {
+    const peerId = res.message.from === state.me.id ? res.message.to : res.message.from;
+    const msgs = state.threads[peerId];
+    if (msgs) {
+      setState({
+        threads: {
+          ...state.threads,
+          [peerId]: msgs.map((m) => (m.id === messageId ? res.message : m)),
+        },
+      });
+    }
   }
-
-  // Update conversation preview if this was the latest message
-  const threadMsgs = state.threads[ctx.peerId] ?? [];
-  if (threadMsgs[threadMsgs.length - 1]?.id === messageId) {
-    await updateDoc(doc(db, "conversations", ctx.msg.threadKey), {
-      lastMessageText: cleanText,
-      updatedAt: serverTimestamp(),
-    }).catch(() => {});
-  }
-
-  return {
-    ...ctx.msg,
-    text: cleanText,
-    editedAt: new Date().toISOString(),
-  };
+  return res.message;
 }
 
 export async function deleteChatMessage(messageId: string): Promise<ChatMessage> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const ctx = findMessageContext(messageId);
-  if (!ctx) throw new Error("Message not found.");
-
-  const db = getFirebaseDb();
-  const msgRef = doc(db, "conversations", ctx.msg.threadKey, "messages", messageId);
-  try {
-    await updateDoc(msgRef, {
-      text: "",
-      mediaUrl: null,
-      mediaId: null,
-      mediaKind: null,
-      mediaName: null,
-      deletedAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(
-      err,
-      OperationType.UPDATE,
-      `conversations/${ctx.msg.threadKey}/messages/${messageId}`,
-    );
+  const res = await apiJson<{ ok: boolean; message: ChatMessage }>(
+    `/api/messages/${encodeURIComponent(messageId)}`,
+    { method: "DELETE" },
+  );
+  if (state.me) {
+    const peerId = res.message.from === state.me.id ? res.message.to : res.message.from;
+    const msgs = state.threads[peerId];
+    if (msgs) {
+      setState({
+        threads: {
+          ...state.threads,
+          [peerId]: msgs.map((m) => (m.id === messageId ? res.message : m)),
+        },
+      });
+    }
   }
-
-  const threadMsgs = state.threads[ctx.peerId] ?? [];
-  if (threadMsgs[threadMsgs.length - 1]?.id === messageId) {
-    await updateDoc(doc(db, "conversations", ctx.msg.threadKey), {
-      lastMessageText: "Message deleted",
-      lastMessageDeleted: true,
-      lastMessageMediaKind: null,
-      updatedAt: serverTimestamp(),
-    }).catch(() => {});
-  }
-
-  return {
-    ...ctx.msg,
-    text: "Message deleted",
-    mediaUrl: null,
-    mediaId: null,
-    mediaKind: null,
-    mediaName: null,
-    deletedAt: new Date().toISOString(),
-  };
+  return res.message;
 }
 
 export async function reactToMessage(
   messageId: string,
   emoji: string,
 ): Promise<MessageReactionGroup[]> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const uid = fbUser.uid;
-  const ctx = findMessageContext(messageId);
-  if (!ctx) throw new Error("Message not found.");
-
-  const [participantA = "", participantB = ""] = ctx.msg.threadKey.split("__");
-  const isMeA = participantA === uid;
-  const cleanEmoji = emoji.trim().slice(0, 12);
-
-  const alreadyReactedSame = ctx.msg.reactions.some((g) => g.emoji === cleanEmoji && g.reactedByMe);
-  const nextVal = !cleanEmoji || alreadyReactedSame ? null : cleanEmoji;
-
-  const db = getFirebaseDb();
-  const msgRef = doc(db, "conversations", ctx.msg.threadKey, "messages", messageId);
-  try {
-    await updateDoc(msgRef, {
-      ...(isMeA ? { reactionA: nextVal } : { reactionB: nextVal }),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(
-      err,
-      OperationType.UPDATE,
-      `conversations/${ctx.msg.threadKey}/messages/${messageId}`,
-    );
-  }
-
-  const otherGroup = ctx.msg.reactions.find((g) =>
-    g.userIds.includes(isMeA ? participantB : participantA),
+  const res = await apiJson<{ ok: boolean; reactions: MessageReactionGroup[] }>(
+    `/api/messages/${encodeURIComponent(messageId)}/reactions`,
+    {
+      method: "POST",
+      body: { emoji },
+    },
   );
-  return buildReactionGroups(
-    isMeA ? nextVal : (otherGroup?.emoji ?? null),
-    isMeA ? (otherGroup?.emoji ?? null) : nextVal,
-    participantA,
-    participantB,
-    uid,
-  );
+  return res.reactions;
 }
 
 export async function updateConversationSettings(
   peerId: string,
   patch: { pinned?: boolean; muted?: boolean },
 ) {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const uid = fbUser.uid;
-  const key = await ensureConversationDoc(uid, peerId);
-  const [participantA] = key.split("__");
-  const isMeA = participantA === uid;
-  const existing = convDocsMap.get(key);
-  const pinned =
-    patch.pinned !== undefined
-      ? patch.pinned
-      : Boolean(isMeA ? existing?.pinnedA : existing?.pinnedB);
-  const muted =
-    patch.muted !== undefined ? patch.muted : Boolean(isMeA ? existing?.mutedA : existing?.mutedB);
-
-  const db = getFirebaseDb();
-  try {
-    await updateDoc(doc(db, "conversations", key), {
-      ...(isMeA ? { pinnedA: pinned, mutedA: muted } : { pinnedB: pinned, mutedB: muted }),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `conversations/${key}`);
-  }
-
-  return { ok: true, pinned, muted };
+  const res = await apiJson<{ ok: boolean; pinned: boolean; muted: boolean }>(
+    `/api/conversations/${encodeURIComponent(peerId)}`,
+    {
+      method: "PATCH",
+      body: patch,
+    },
+  );
+  setState({
+    conversations: state.conversations
+      .map((c) => (c.peer.id === peerId ? { ...c, pinned: res.pinned, muted: res.muted } : c))
+      .sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        return (b.lastMessage?.createdAt ?? "").localeCompare(a.lastMessage?.createdAt ?? "");
+      }),
+  });
+  return res;
 }
 
 export function sendTyping(peerId: string, active: boolean) {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser || !peerId) return;
-  const uid = fbUser.uid;
-  const key = threadKeyFor(uid, peerId);
-  if (!convDocsMap.has(key)) return;
-  const [participantA] = key.split("__");
-  const isMeA = participantA === uid;
-  void updateDoc(doc(getFirebaseDb(), "conversations", key), {
-    ...(isMeA ? { typingA: active } : { typingB: active }),
-    updatedAt: serverTimestamp(),
-  }).catch(() => {});
+  if (!state.me || !peerId) return;
+  sendWs("typing", { peerId, active });
 }
 
 export async function fetchGallery(): Promise<GalleryItem[]> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) return [];
+  if (!state.me) return [];
   try {
-    const idToken = await fbUser.getIdToken();
-    const resp = await fetch("/api/gallery", {
-      headers: { Authorization: `Bearer ${idToken}` },
-      credentials: "include",
-    });
-    if (!resp.ok) return state.gallery;
-    const data = (await resp.json()) as { items?: GalleryItem[] };
+    const data = await apiJson<{ items?: GalleryItem[] }>("/api/gallery");
     const items = Array.isArray(data.items) ? data.items : [];
     for (const item of items) {
       uploadedMediaMeta.set(item.id, {
@@ -2507,18 +1926,7 @@ export async function fetchGallery(): Promise<GalleryItem[]> {
 }
 
 export async function deleteGalleryMedia(mediaId: string): Promise<void> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const idToken = await fbUser.getIdToken();
-  const resp = await fetch(`/api/media/${encodeURIComponent(mediaId)}`, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${idToken}` },
-    credentials: "include",
-  });
-  const data = (await resp.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-  if (!resp.ok) {
-    throw new Error(data.error || "Could not delete media.");
-  }
+  await apiJson(`/api/media/${encodeURIComponent(mediaId)}`, { method: "DELETE" });
   uploadedMediaMeta.delete(mediaId);
   evictMediaObjectUrl(`/api/media/${mediaId}`);
   setState({
@@ -2527,65 +1935,42 @@ export async function deleteGalleryMedia(mediaId: string): Promise<void> {
 }
 
 export async function loadBlocks() {
-  return state.blockedUsers;
+  if (!state.me) return [];
+  const data = await apiJson<{ blockedUsers: BlockedUserItem[] }>("/api/blocks");
+  setState({ blockedUsers: data.blockedUsers });
+  return data.blockedUsers;
 }
 
 export async function blockUser(targetUserId: string) {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const uid = fbUser.uid;
-  const blockId = `${uid}__${targetUserId}`;
-  const db = getFirebaseDb();
-  try {
-    await setDoc(doc(db, "blocks", blockId), {
-      blockerId: uid,
-      blockedId: targetUserId,
-      createdAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, `blocks/${blockId}`);
-  }
+  await apiJson("/api/blocks", {
+    method: "POST",
+    body: { targetUserId },
+  });
+  await Promise.allSettled([loadBlocks(), loadConversations(), discoverUsers()]);
 }
 
 export async function unblockUser(targetUserId: string) {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const uid = fbUser.uid;
-  const blockId = `${uid}__${targetUserId}`;
-  const db = getFirebaseDb();
-  try {
-    await deleteDoc(doc(db, "blocks", blockId));
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `blocks/${blockId}`);
-  }
+  await apiJson(`/api/blocks/${encodeURIComponent(targetUserId)}`, {
+    method: "DELETE",
+  });
+  await Promise.allSettled([loadBlocks(), loadConversations(), discoverUsers()]);
 }
 
 export async function reportUser(reportedUserId: string, reason: string, details = "") {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const cleanReason = reason.trim().slice(0, 120);
-  if (cleanReason.length < 2) throw new Error("Please select a reason for this report.");
-  const reportId = `rep_${crypto.randomUUID().replace(/-/g, "")}`;
-  const db = getFirebaseDb();
-  try {
-    await setDoc(doc(db, "reports", reportId), {
-      reporterId: fbUser.uid,
-      reportedUserId,
-      reason: cleanReason,
-      details: details.trim().slice(0, 500),
-      createdAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, `reports/${reportId}`);
-  }
-  return { ok: true, reportId };
+  return apiJson<{ ok: boolean; reportId: string }>("/api/reports", {
+    method: "POST",
+    body: { reportedUserId, reason, details },
+  });
 }
 
 export async function initiateCall(target: PublicAccount, kind: "audio" | "video") {
-  if (!callClient) throw new Error("Sign in to place a call.");
-  if (blockedByMeMap.has(target.id) || blockedMeIds.has(target.id))
-    throw new Error("Calling is blocked.");
-  await callClient.dial(target, kind);
+  warmUpCallAudio();
+  const client = ensureCallClient();
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    connectRealtime();
+    await new Promise((r) => setTimeout(r, 350));
+  }
+  await client.dial(target, kind);
 }
 
 export function respondToCall(
@@ -2593,7 +1978,22 @@ export function respondToCall(
   _targetId: string,
   action: "accepted" | "declined" | "ended",
 ) {
+  if (action === "accepted") {
+    warmUpCallAudio();
+  }
   void callClient?.respond(id, action);
+}
+
+export function setCallMicMuted(muted: boolean) {
+  callClient?.setMicMuted(muted);
+}
+
+export function setCallCameraEnabled(enabled: boolean) {
+  callClient?.setCameraEnabled(enabled);
+}
+
+export async function switchCallCamera() {
+  await callClient?.switchCamera();
 }
 
 export function setSoundEnabled(enabled: boolean) {
@@ -2601,13 +2001,6 @@ export function setSoundEnabled(enabled: boolean) {
     localStorage.setItem(SOUND_STORAGE_KEY, String(enabled));
   }
   setState({ soundEnabled: enabled });
-  const fbUser = getFirebaseAuth().currentUser;
-  if (fbUser) {
-    void updateDoc(doc(getFirebaseDb(), "users_private", fbUser.uid), {
-      soundEnabled: enabled,
-      updatedAt: serverTimestamp(),
-    }).catch(() => {});
-  }
 }
 
 export function initialsOf(name: string) {
@@ -2637,88 +2030,16 @@ export async function fetchReadingState(): Promise<{
   state: Record<string, unknown> | null;
   updatedAt: string | null;
 }> {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) return { state: null, updatedAt: null };
-  const db = getFirebaseDb();
-  let snap;
-  try {
-    snap = await getDoc(doc(db, "reading_state", fbUser.uid));
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, `reading_state/${fbUser.uid}`);
-  }
-  if (!snap.exists()) return { state: null, updatedAt: null };
-  const data = snap.data() as Record<string, unknown>;
-  return {
-    state: data,
-    updatedAt: tsToIsoOrNull(data["updatedAt"] as Timestamp | undefined),
-  };
+  if (!state.me) return { state: null, updatedAt: null };
+  return apiJson<{ state: Record<string, unknown> | null; updatedAt: string | null }>(
+    "/api/reading-state",
+  );
 }
 
 export async function saveReadingState(readingState: Record<string, unknown>) {
-  const fbUser = getFirebaseAuth().currentUser;
-  if (!fbUser) throw new Error("Authentication required.");
-  const db = getFirebaseDb();
-  const uid = fbUser.uid;
-  const rawProfile =
-    typeof readingState["profile"] === "object" && readingState["profile"] !== null
-      ? (readingState["profile"] as Record<string, unknown>)
-      : {};
-
-  const sanitized = {
-    uid,
-    onboarded: Boolean(readingState["onboarded"]),
-    languages: Array.isArray(readingState["languages"])
-      ? readingState["languages"].slice(0, 20)
-      : [],
-    categories: Array.isArray(readingState["categories"])
-      ? readingState["categories"].slice(0, 30)
-      : [],
-    appTheme:
-      readingState["appTheme"] === "light" ||
-      readingState["appTheme"] === "dark" ||
-      readingState["appTheme"] === "system"
-        ? readingState["appTheme"]
-        : "system",
-    reader:
-      typeof readingState["reader"] === "object" && readingState["reader"] !== null
-        ? readingState["reader"]
-        : {},
-    notifications:
-      typeof readingState["notifications"] === "object" && readingState["notifications"] !== null
-        ? readingState["notifications"]
-        : { reminders: true, newBooks: true },
-    profile: {
-      name: String(rawProfile["name"] ?? state.me?.fullName ?? "Reader").slice(0, 80),
-      email: String(rawProfile["email"] ?? fbUser.email ?? "reader@readingcorner.app").slice(
-        0,
-        254,
-      ),
-    },
-    progress:
-      typeof readingState["progress"] === "object" && readingState["progress"] !== null
-        ? readingState["progress"]
-        : {},
-    favorites: Array.isArray(readingState["favorites"])
-      ? readingState["favorites"].slice(0, 500)
-      : [],
-    bookmarks: Array.isArray(readingState["bookmarks"])
-      ? readingState["bookmarks"].slice(0, 500)
-      : [],
-    completed: Array.isArray(readingState["completed"])
-      ? readingState["completed"].slice(0, 500)
-      : [],
-    history: Array.isArray(readingState["history"]) ? readingState["history"].slice(0, 100) : [],
-    streak:
-      typeof readingState["streak"] === "number" && Number.isInteger(readingState["streak"])
-        ? Math.max(0, readingState["streak"])
-        : 1,
-    updatedAt: serverTimestamp(),
-  };
-
-  try {
-    await setDoc(doc(db, "reading_state", uid), sanitized);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `reading_state/${uid}`);
-  }
-  return { ok: true, updatedAt: new Date().toISOString() };
+  if (!state.me) throw new Error("Authentication required.");
+  return apiJson<{ ok: boolean; updatedAt: string }>("/api/reading-state", {
+    method: "PUT",
+    body: { state: readingState },
+  });
 }

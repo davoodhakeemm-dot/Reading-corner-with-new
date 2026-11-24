@@ -44,3 +44,13 @@ test("catalog lookups resolve categories and languages", () => {
   assert.equal(categoryBySlug("mystery")?.name, "Mystery");
   assert.equal(languageByCode("ml")?.name, "Malayalam");
 });
+
+test("all BOOKS entries have unique ids", () => {
+  const seen = new Set<string>();
+  const duplicates: string[] = [];
+  for (const b of BOOKS) {
+    if (seen.has(b.id)) duplicates.push(b.id);
+    seen.add(b.id);
+  }
+  assert.deepEqual(duplicates, []);
+});

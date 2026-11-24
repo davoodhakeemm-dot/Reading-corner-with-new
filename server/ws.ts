@@ -235,6 +235,18 @@ export function attachWebSocketServer(httpServer: HttpServer) {
               : `call_${crypto.randomUUID()}`;
           const recipientOnline = isUserConnected(targetId);
 
+          const existingTargetCall = activeCallPeers.get(targetId);
+          if (existingTargetCall && existingTargetCall.callId !== callId) {
+            sendToUser(userId, "call:signal", {
+              fromUserId: targetId,
+              callId,
+              action: "busy",
+              sdp: null,
+              candidate: null,
+            });
+            return;
+          }
+
           activeCallPeers.set(userId, { callId, peerId: targetId });
           if (recipientOnline) {
             sendToUser(targetId, "call:incoming", {
@@ -274,6 +286,10 @@ export function attachWebSocketServer(httpServer: HttpServer) {
             action,
             sdp: payload["sdp"] ?? null,
             candidate: payload["candidate"] ?? null,
+            cameraEnabled:
+              typeof payload["cameraEnabled"] === "boolean" ? payload["cameraEnabled"] : undefined,
+            micMuted: typeof payload["micMuted"] === "boolean" ? payload["micMuted"] : undefined,
+            reason: typeof payload["reason"] === "string" ? payload["reason"] : undefined,
           });
         }
       } catch {

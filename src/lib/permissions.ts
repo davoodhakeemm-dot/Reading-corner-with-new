@@ -4,6 +4,8 @@ export type AppPermissionKind = "microphone" | "camera" | "notifications";
 export async function requestFeatureMediaPermission(
   kind: "microphone" | "camera",
 ): Promise<AppPermissionState> {
+  const existing = await queryBrowserMediaPermission(kind);
+  if (existing === "granted") return "granted";
   // Let Android Chrome/PWA display its native permission prompt; window.confirm creates a
   // second, confusing browser-owned alert that looks like an error and is not a permission.
   return requestSingleAppPermission(kind);

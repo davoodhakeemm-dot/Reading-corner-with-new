@@ -7,18 +7,27 @@ import { getAuth } from "firebase-admin/auth";
 import multer from "multer";
 
 import {
+  MAX_ACCOUNTS_PER_CONTACT,
+  checkRateLimit,
+  clearRateLimit,
+  countAccountsByEmail,
+  countAccountsByPhone,
   createFirebaseNfcToken,
   createNfcTokenForUser,
   db,
   decryptToken,
   didUserBlock,
+  getAdminEmailSet,
   getFollowStats,
+  getLinkedSiblingAccounts,
   hashPassword,
+  isAdminUser,
   isBlockedBetween,
   mediaDir,
   normalizeEmail,
   normalizeHandle,
   normalizePhoneE164,
+  recordRateLimitFailure,
   sha256,
   signCookieToken,
   threadKeyFor,
@@ -31,6 +40,20 @@ import {
 import { broadcastEvent, isUserConnected, sendToUser } from "./ws";
 
 type AuthedRequest = Request & { authUser?: DbUser; authToken?: string; firebaseUid?: string };
+
+function timingSafeEqualStrings(a: string, b: string): boolean {
+  const ha = crypto.createHash("sha256").update(a, "utf8").digest();
+  const hb = crypto.createHash("sha256").update(b, "utf8").digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function getClientIp(req: Request): string {
+  const fwd = req.headers["x-forwarded-for"];
+  if (typeof fwd === "string" && fwd.trim()) {
+    return fwd.split(",")[0]?.trim() || "unknown";
+  }
+  return req.ip || req.socket?.remoteAddress || "unknown";
+}
 
 let cachedProjectId: string | null = null;
 function getFirebaseAdminAuth() {
@@ -236,6 +259,14 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   next();
 }
 
+function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
+  if (!req.authUser || !isAdminUser(req.authUser)) {
+    res.status(403).json({ error: "Administrator access required." });
+    return;
+  }
+  next();
+}
+
 function issueSession(userId: string, req: Request, res: Response): string {
   const token = `rc_sess_${crypto.randomBytes(32).toString("base64url")}`;
   const now = new Date();
@@ -289,8 +320,10 @@ function toSelfUser(user: DbUser) {
   return {
     ...toPublicUser(user, true, user.id),
     email: user.email,
+    emailVerified: user.email_verified === 1,
     phoneMasked: maskPhone(user.phone_e164),
     phoneE164: user.phone_e164,
+    isAdmin: isAdminUser(user),
   };
 }
 
@@ -419,12 +452,108 @@ function findUserByIdentifier(rawIdentifier: string, countryCode = "+91"): DbUse
   return undefined;
 }
 
+function findCandidatesByMode(
+  mode: "phone" | "gmail" | "username" | "auto",
+  rawIdentifier: string,
+  countryCode = "+91",
+): { error?: string; candidates: DbUser[] } {
+  const trimmed = rawIdentifier.trim();
+  if (!trimmed) {
+    return { error: "Enter your login identifier.", candidates: [] };
+  }
+
+  if (mode === "phone") {
+    const asPhone = normalizePhoneE164(trimmed, countryCode);
+    if (!asPhone) {
+      return { error: "Enter a valid phone number with country code.", candidates: [] };
+    }
+    const candidates = db
+      .prepare("SELECT * FROM users WHERE phone_e164 = ? ORDER BY created_at ASC")
+      .all(asPhone) as DbUser[];
+    return { candidates };
+  }
+
+  if (mode === "gmail") {
+    const asEmail = normalizeEmail(trimmed);
+    if (!asEmail) {
+      return { error: "Enter a valid Gmail or email address.", candidates: [] };
+    }
+    const candidates = db
+      .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?) ORDER BY created_at ASC")
+      .all(asEmail) as DbUser[];
+    return { candidates };
+  }
+
+  if (mode === "username") {
+    const asHandle = normalizeHandle(trimmed);
+    if (!asHandle) {
+      return { error: "Enter a valid username (at least 2 characters).", candidates: [] };
+    }
+    const candidates = db
+      .prepare("SELECT * FROM users WHERE LOWER(display_handle) = LOWER(?) LIMIT 1")
+      .all(asHandle) as DbUser[];
+    return { candidates };
+  }
+
+  // auto mode
+  const found = new Map<string, DbUser>();
+  const asEmail = normalizeEmail(trimmed);
+  if (asEmail) {
+    const rows = db
+      .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?) ORDER BY created_at ASC")
+      .all(asEmail) as DbUser[];
+    for (const r of rows) found.set(r.id, r);
+  }
+  const cleanHandle = trimmed.replace(/^@+/, "").toLowerCase();
+  if (cleanHandle && !cleanHandle.includes("@")) {
+    const rows = db
+      .prepare("SELECT * FROM users WHERE LOWER(display_handle) = ? LIMIT 1")
+      .all(`@${cleanHandle}`) as DbUser[];
+    for (const r of rows) found.set(r.id, r);
+  }
+  const asPhone = normalizePhoneE164(trimmed, countryCode);
+  if (asPhone) {
+    const rows = db
+      .prepare("SELECT * FROM users WHERE phone_e164 = ? ORDER BY created_at ASC")
+      .all(asPhone) as DbUser[];
+    for (const r of rows) found.set(r.id, r);
+  }
+  return { candidates: Array.from(found.values()) };
+}
+
+function saveAvatarDataUrl(userId: string, avatarDataUrl?: string): string | null {
+  if (!avatarDataUrl || !avatarDataUrl.startsWith("data:image/")) return null;
+  const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(avatarDataUrl);
+  if (!match || !match[1] || !match[2]) return null;
+  const buf = Buffer.from(match[2], "base64");
+  if (buf.byteLength > 4 * 1024 * 1024) return null;
+  const ext = match[1].split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "jpg";
+  const fileName = `avatar_${userId}.${ext}`;
+  const now = new Date().toISOString();
+  fs.writeFileSync(path.join(mediaDir, fileName), buf);
+  const avatarMediaId = `med_${crypto.randomUUID()}`;
+  db.prepare(
+    "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, NULL, 'image', ?, ?, ?, ?, 1, ?)",
+  ).run(avatarMediaId, userId, match[1], fileName, fileName, buf.byteLength, now);
+  return avatarMediaId;
+}
+
+function getResendConfig() {
+  const apiKey = process.env["RESEND_API_KEY"]?.trim() ?? "";
+  const from = process.env["RESEND_FROM"]?.trim() || "Reading Corner <onboarding@resend.dev>";
+  return { configured: Boolean(apiKey), apiKey, from };
+}
+
 export function createApiRouter() {
   const router = express.Router();
   router.use(express.json({ limit: "4mb" }));
 
   router.get("/health", (_req, res) => {
-    res.json({ ok: true, otpConfigured: getTwilioConfig().configured });
+    res.json({
+      ok: true,
+      otpConfigured: getTwilioConfig().configured,
+      emailOtpConfigured: getResendConfig().configured,
+    });
   });
 
   router.get("/auth/otp-status", (_req, res) => {
@@ -435,7 +564,8 @@ export function createApiRouter() {
     });
   });
 
-  // Register using email (and/or phone), username, password, and profile details
+  // Register using email (and/or phone), username, password, and profile details.
+  // Supports up to MAX_ACCOUNTS_PER_CONTACT (3) accounts when contact ownership is verified.
   router.post("/auth/register", async (req, res) => {
     try {
       const {
@@ -448,6 +578,10 @@ export function createApiRouter() {
         fullName,
         bio = "",
         avatarDataUrl,
+        linkToExisting = false,
+        existingAccountPassword,
+        firebaseIdToken,
+        phoneOtpCode,
       } = req.body as {
         email?: string;
         username?: string;
@@ -458,6 +592,10 @@ export function createApiRouter() {
         fullName?: string;
         bio?: string;
         avatarDataUrl?: string;
+        linkToExisting?: boolean;
+        existingAccountPassword?: string;
+        firebaseIdToken?: string;
+        phoneOtpCode?: string;
       };
 
       const cleanEmail = email && email.trim() ? normalizeEmail(email) : null;
@@ -492,29 +630,102 @@ export function createApiRouter() {
         return;
       }
 
-      if (cleanEmail) {
-        const existingEmail = db
-          .prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1")
-          .get(cleanEmail);
-        if (existingEmail) {
-          res.status(409).json({
-            error: "An account is already registered with this email. Please sign in instead.",
-          });
-          return;
+      let emailVerified = 0;
+      let phoneVerified = 0;
+      const callerSession = lookupSessionUser(req);
+
+      if (firebaseIdToken && cleanEmail) {
+        try {
+          const decoded = await getFirebaseAdminAuth().verifyIdToken(firebaseIdToken);
+          const fbEmail = decoded.email ? normalizeEmail(decoded.email) : null;
+          if (fbEmail && fbEmail === cleanEmail && decoded.email_verified) {
+            emailVerified = 1;
+          }
+        } catch {
+          /* ignore invalid token; treated as unverified */
         }
       }
 
-      if (phoneE164) {
-        const existingPhone = db
-          .prepare("SELECT id FROM users WHERE phone_e164 = ? LIMIT 1")
-          .get(phoneE164);
-        if (existingPhone) {
+      if (phoneOtpCode && phoneE164) {
+        const otpRes = await verifyTwilioOtp(phoneE164, phoneOtpCode);
+        if (!otpRes.ok) {
+          res.status(400).json({ error: otpRes.error ?? "Phone OTP verification failed." });
+          return;
+        }
+        phoneVerified = 1;
+      }
+
+      const existingEmailCount = cleanEmail ? countAccountsByEmail(cleanEmail) : 0;
+      const existingPhoneCount = phoneE164 ? countAccountsByPhone(phoneE164) : 0;
+
+      if (existingEmailCount > 0 && cleanEmail) {
+        if (existingEmailCount >= MAX_ACCOUNTS_PER_CONTACT) {
           res.status(409).json({
-            error:
-              "An account is already registered with this phone number. Please sign in instead.",
+            error: `Maximum limit of ${MAX_ACCOUNTS_PER_CONTACT} accounts reached for ${cleanEmail}.`,
           });
           return;
         }
+        const sessionOwnsEmail = Boolean(
+          callerSession &&
+          callerSession.user.email?.toLowerCase() === cleanEmail &&
+          callerSession.user.email_verified === 1,
+        );
+        const existingEmailRows = db
+          .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?)")
+          .all(cleanEmail) as DbUser[];
+        const anyVerifiedEmailRow = existingEmailRows.some((u) => u.email_verified === 1);
+        const passwordMatchesExisting = Boolean(
+          linkToExisting &&
+          existingAccountPassword &&
+          existingEmailRows.some((u) => verifyPassword(existingAccountPassword, u.password_hash)),
+        );
+        const verifiedProof =
+          emailVerified === 1 ||
+          sessionOwnsEmail ||
+          (anyVerifiedEmailRow && passwordMatchesExisting);
+        if (!verifiedProof) {
+          res.status(409).json({
+            error:
+              "An account is already registered with this email. Sign in with this verified Gmail to create up to 3 linked accounts.",
+          });
+          return;
+        }
+        emailVerified = 1;
+      }
+
+      if (existingPhoneCount > 0 && phoneE164) {
+        if (existingPhoneCount >= MAX_ACCOUNTS_PER_CONTACT) {
+          res.status(409).json({
+            error: `Maximum limit of ${MAX_ACCOUNTS_PER_CONTACT} accounts reached for this phone number.`,
+          });
+          return;
+        }
+        const sessionOwnsPhone = Boolean(
+          callerSession &&
+          callerSession.user.phone_e164 === phoneE164 &&
+          callerSession.user.phone_verified === 1,
+        );
+        const existingPhoneRows = db
+          .prepare("SELECT * FROM users WHERE phone_e164 = ?")
+          .all(phoneE164) as DbUser[];
+        const anyVerifiedPhoneRow = existingPhoneRows.some((u) => u.phone_verified === 1);
+        const passwordMatchesExisting = Boolean(
+          linkToExisting &&
+          existingAccountPassword &&
+          existingPhoneRows.some((u) => verifyPassword(existingAccountPassword, u.password_hash)),
+        );
+        const verifiedProof =
+          phoneVerified === 1 ||
+          sessionOwnsPhone ||
+          (anyVerifiedPhoneRow && passwordMatchesExisting);
+        if (!verifiedProof) {
+          res.status(409).json({
+            error:
+              "An account is already registered with this phone number. Sign in with this verified phone to create up to 3 linked accounts.",
+          });
+          return;
+        }
+        phoneVerified = 1;
       }
 
       const requestedUsername = (username ?? displayHandle ?? "").trim();
@@ -541,36 +752,22 @@ export function createApiRouter() {
         finalHandle = makeUniqueHandle(name);
       }
 
-      const phoneVerified = 0;
-
       const userId = `u_${crypto.randomUUID()}`;
       const now = new Date().toISOString();
-      let avatarMediaId: string | null = null;
-
-      if (avatarDataUrl && avatarDataUrl.startsWith("data:image/")) {
-        const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(avatarDataUrl);
-        if (match && match[1] && match[2]) {
-          const buf = Buffer.from(match[2], "base64");
-          if (buf.byteLength <= 4 * 1024 * 1024) {
-            const ext = match[1].split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "jpg";
-            const fileName = `avatar_${userId}.${ext}`;
-            fs.writeFileSync(path.join(mediaDir, fileName), buf);
-            avatarMediaId = `med_${crypto.randomUUID()}`;
-            db.prepare(
-              "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, NULL, 'image', ?, ?, ?, ?, 1, ?)",
-            ).run(avatarMediaId, userId, match[1], fileName, fileName, buf.byteLength, now);
-          }
-        }
-      }
+      const avatarMediaId = saveAvatarDataUrl(userId, avatarDataUrl);
+      const role =
+        emailVerified === 1 && cleanEmail && getAdminEmailSet().has(cleanEmail) ? "admin" : "user";
 
       db.prepare(
-        `INSERT INTO users (id, email, phone_e164, phone_verified, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'instagram', ?, ?)`,
+        `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'instagram', ?, ?)`,
       ).run(
         userId,
         cleanEmail,
+        emailVerified,
         phoneE164,
         phoneVerified,
+        role,
         name,
         finalHandle,
         String(bio).trim().slice(0, 200),
@@ -596,28 +793,112 @@ export function createApiRouter() {
     }
   });
 
-  // Login using email, username, or phone number + password
+  // Login using explicit mode: phone | gmail | username | auto + password
   router.post("/auth/login", (req, res) => {
-    const { identifier, email, phone, countryCode, password } = req.body as {
+    const {
+      mode = "auto",
+      identifier,
+      email,
+      phone,
+      username,
+      countryCode,
+      password,
+      targetUserId,
+    } = req.body as {
+      mode?: "phone" | "gmail" | "username" | "auto";
       identifier?: string;
       email?: string;
       phone?: string;
+      username?: string;
       countryCode?: string;
       password?: string;
+      targetUserId?: string;
     };
 
-    const rawIdentifier = String(identifier ?? email ?? phone ?? "").trim();
+    const chosenMode: "phone" | "gmail" | "username" | "auto" =
+      mode === "phone" || mode === "gmail" || mode === "username" ? mode : "auto";
+
+    const rawIdentifier = String(
+      chosenMode === "phone"
+        ? (phone ?? identifier ?? "")
+        : chosenMode === "gmail"
+          ? (email ?? identifier ?? "")
+          : chosenMode === "username"
+            ? (username ?? identifier ?? "")
+            : (identifier ?? email ?? phone ?? username ?? ""),
+    ).trim();
+
     if (!rawIdentifier) {
-      res.status(400).json({ error: "Enter your email, username, or phone number." });
+      res.status(400).json({
+        error:
+          chosenMode === "phone"
+            ? "Enter your phone number."
+            : chosenMode === "gmail"
+              ? "Enter your Gmail or email address."
+              : chosenMode === "username"
+                ? "Enter your username."
+                : "Enter your email, username, or phone number.",
+      });
       return;
     }
 
-    const user = findUserByIdentifier(rawIdentifier, countryCode ?? "+91");
-    if (!user || !verifyPassword(String(password ?? ""), user.password_hash)) {
-      res.status(401).json({ error: "Invalid email, username, phone number, or password." });
+    const rateKey = `login:${getClientIp(req)}:${chosenMode}:${rawIdentifier.toLowerCase()}`;
+    const limit = checkRateLimit(rateKey);
+    if (!limit.allowed) {
+      res.status(429).json({
+        error: `Too many failed sign-in attempts. Please wait ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s).`,
+      });
       return;
     }
 
+    const { error: formatError, candidates } = findCandidatesByMode(
+      chosenMode,
+      rawIdentifier,
+      countryCode ?? "+91",
+    );
+    if (formatError) {
+      res.status(400).json({ error: formatError });
+      return;
+    }
+
+    const scopedCandidates = targetUserId
+      ? candidates.filter((u) => u.id === targetUserId)
+      : candidates;
+
+    const pwd = String(password ?? "");
+    const matched = scopedCandidates.filter((u) => verifyPassword(pwd, u.password_hash));
+
+    if (matched.length === 0) {
+      const failRes = recordRateLimitFailure(rateKey, 10, 15 * 60 * 1000, 15 * 60 * 1000);
+      if (failRes.locked) {
+        res.status(429).json({
+          error: "Too many failed sign-in attempts. Please wait 15 minutes and try again.",
+        });
+        return;
+      }
+      res.status(401).json({ error: "Invalid credentials. Check your details and password." });
+      return;
+    }
+
+    clearRateLimit(rateKey);
+
+    // If multiple sibling accounts share the same verified contact AND password, ask caller which handle to open
+    if (matched.length > 1) {
+      res.json({
+        requiresAccountChoice: true,
+        accounts: matched.map((u) => ({
+          id: u.id,
+          fullName: u.full_name,
+          displayHandle: u.display_handle,
+          avatarUrl: u.avatar_media_id
+            ? `/api/media/${u.avatar_media_id}`
+            : (u.avatar_external_url ?? null),
+        })),
+      });
+      return;
+    }
+
+    const user = matched[0]!;
     const existingNfc = db
       .prepare("SELECT id FROM nfc_links WHERE user_id = ? LIMIT 1")
       .get(user.id);
@@ -635,6 +916,244 @@ export function createApiRouter() {
     });
   });
 
+  // List linked accounts sharing the signed-in user's verified email or verified phone (max 3 per contact)
+  router.get("/auth/linked-accounts", requireAuth, (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const siblings = getLinkedSiblingAccounts(me);
+    const emailCount = me.email && me.email_verified === 1 ? countAccountsByEmail(me.email) : 0;
+    const phoneCount =
+      me.phone_e164 && me.phone_verified === 1 ? countAccountsByPhone(me.phone_e164) : 0;
+
+    res.json({
+      maxAccounts: MAX_ACCOUNTS_PER_CONTACT,
+      email: me.email,
+      emailVerified: me.email_verified === 1,
+      phoneMasked: maskPhone(me.phone_e164),
+      phoneVerified: me.phone_verified === 1,
+      emailAccountCount: emailCount,
+      phoneAccountCount: phoneCount,
+      canCreateByEmail: Boolean(
+        me.email && me.email_verified === 1 && emailCount < MAX_ACCOUNTS_PER_CONTACT,
+      ),
+      canCreateByPhone: Boolean(
+        me.phone_e164 && me.phone_verified === 1 && phoneCount < MAX_ACCOUNTS_PER_CONTACT,
+      ),
+      accounts: siblings.map((u) => ({
+        id: u.id,
+        fullName: u.full_name,
+        displayHandle: u.display_handle,
+        avatarUrl: u.avatar_media_id
+          ? `/api/media/${u.avatar_media_id}`
+          : (u.avatar_external_url ?? null),
+        isCurrent: u.id === me.id,
+        emailVerified: u.email_verified === 1,
+        phoneVerified: u.phone_verified === 1,
+      })),
+    });
+  });
+
+  // Create an additional linked account sharing the signed-in user's verified Gmail or verified phone (max 3)
+  router.post("/auth/linked-accounts/create", requireAuth, (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const {
+      fullName,
+      username,
+      password,
+      bio = "",
+      avatarDataUrl,
+      linkBy = "auto",
+      switchToNew = true,
+    } = req.body as {
+      fullName?: string;
+      username?: string;
+      password?: string;
+      bio?: string;
+      avatarDataUrl?: string;
+      linkBy?: "email" | "phone" | "both" | "auto";
+      switchToNew?: boolean;
+    };
+
+    const hasVerifiedEmail = Boolean(me.email && me.email_verified === 1);
+    const hasVerifiedPhone = Boolean(me.phone_e164 && me.phone_verified === 1);
+    if (!hasVerifiedEmail && !hasVerifiedPhone) {
+      res.status(403).json({
+        error: "Verify your Gmail or phone number before creating linked accounts.",
+      });
+      return;
+    }
+
+    let attachEmail: string | null = null;
+    let attachPhone: string | null = null;
+
+    if (linkBy === "email") {
+      if (!hasVerifiedEmail || !me.email) {
+        res.status(400).json({ error: "Your Gmail address is not verified yet." });
+        return;
+      }
+      attachEmail = me.email;
+    } else if (linkBy === "phone") {
+      if (!hasVerifiedPhone || !me.phone_e164) {
+        res.status(400).json({ error: "Your phone number is not verified yet." });
+        return;
+      }
+      attachPhone = me.phone_e164;
+    } else {
+      if (hasVerifiedEmail && me.email) attachEmail = me.email;
+      if (hasVerifiedPhone && me.phone_e164) attachPhone = me.phone_e164;
+    }
+
+    if (attachEmail && countAccountsByEmail(attachEmail) >= MAX_ACCOUNTS_PER_CONTACT) {
+      res.status(409).json({
+        error: `Maximum limit of ${MAX_ACCOUNTS_PER_CONTACT} accounts reached for ${attachEmail}.`,
+      });
+      return;
+    }
+    if (attachPhone && countAccountsByPhone(attachPhone) >= MAX_ACCOUNTS_PER_CONTACT) {
+      res.status(409).json({
+        error: `Maximum limit of ${MAX_ACCOUNTS_PER_CONTACT} accounts reached for your verified phone number.`,
+      });
+      return;
+    }
+
+    const name = String(fullName ?? "").trim();
+    if (name.length < 2 || name.length > 60) {
+      res.status(400).json({ error: "Full name is required (2–60 characters)." });
+      return;
+    }
+
+    const pwd = String(password ?? "");
+    if (pwd.length < 8) {
+      res.status(400).json({ error: "Password must be at least 8 characters." });
+      return;
+    }
+
+    let finalHandle: string;
+    const requestedUsername = String(username ?? "").trim();
+    if (requestedUsername) {
+      const normalized = normalizeHandle(requestedUsername);
+      if (!normalized) {
+        res.status(400).json({
+          error: "Username must be at least 2 characters (letters, numbers, dots, underscores).",
+        });
+        return;
+      }
+      const conflict = db
+        .prepare("SELECT id FROM users WHERE LOWER(display_handle) = LOWER(?) LIMIT 1")
+        .get(normalized);
+      if (conflict) {
+        res.status(409).json({ error: "That username is already taken. Please choose another." });
+        return;
+      }
+      finalHandle = normalized;
+    } else {
+      finalHandle = makeUniqueHandle(name);
+    }
+
+    const userId = `u_${crypto.randomUUID()}`;
+    const now = new Date().toISOString();
+    const avatarMediaId = saveAvatarDataUrl(userId, avatarDataUrl);
+    const emailVerified = attachEmail ? 1 : 0;
+    const phoneVerified = attachPhone ? 1 : 0;
+    const role =
+      emailVerified === 1 && attachEmail && getAdminEmailSet().has(attachEmail.toLowerCase())
+        ? "admin"
+        : "user";
+
+    db.prepare(
+      `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'instagram', ?, ?)`,
+    ).run(
+      userId,
+      attachEmail,
+      emailVerified,
+      attachPhone,
+      phoneVerified,
+      role,
+      name,
+      finalHandle,
+      String(bio).trim().slice(0, 200),
+      avatarMediaId,
+      hashPassword(pwd),
+      now,
+      now,
+    );
+
+    createNfcTokenForUser(userId);
+    const createdUser = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as DbUser;
+    broadcastEvent("user:registered", { user: toPublicUser(createdUser, true) }, createdUser.id);
+
+    const token = switchToNew ? issueSession(createdUser.id, req, res) : null;
+    res.status(201).json({
+      token,
+      switched: Boolean(switchToNew),
+      user: toSelfUser(createdUser),
+    });
+  });
+
+  // Switch instantaneously between linked sibling accounts sharing a verified email or phone
+  router.post("/auth/switch-account", requireAuth, (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const targetUserId = String((req.body as { targetUserId?: string })?.targetUserId ?? "").trim();
+    if (!targetUserId) {
+      res.status(400).json({ error: "Target account ID is required." });
+      return;
+    }
+    const siblings = getLinkedSiblingAccounts(me);
+    const target = siblings.find((u) => u.id === targetUserId);
+    if (!target) {
+      res
+        .status(403)
+        .json({ error: "You can only switch to an account sharing your verified email or phone." });
+      return;
+    }
+
+    const existingNfc = db
+      .prepare("SELECT id FROM nfc_links WHERE user_id = ? LIMIT 1")
+      .get(target.id);
+    if (!existingNfc) {
+      createNfcTokenForUser(target.id);
+    }
+
+    const now = new Date().toISOString();
+    db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, target.id);
+    const token = issueSession(target.id, req, res);
+
+    res.json({
+      token,
+      user: toSelfUser({ ...target, last_active_at: now }),
+    });
+  });
+
+  // Sync Firebase verified email state onto the current SQLite account
+  router.post("/auth/verify-email-firebase", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const idToken = String((req.body as { idToken?: string })?.idToken ?? "").trim();
+    if (!idToken) {
+      res.status(400).json({ error: "Firebase ID token is required." });
+      return;
+    }
+    try {
+      const decoded = await getFirebaseAdminAuth().verifyIdToken(idToken);
+      const decodedEmail = decoded.email ? normalizeEmail(decoded.email) : null;
+      if (!decoded.email_verified || !decodedEmail) {
+        res.status(400).json({ error: "Email address is not verified yet." });
+        return;
+      }
+      if (me.email && me.email.toLowerCase() !== decodedEmail) {
+        res.status(403).json({ error: "Verified email does not match this account." });
+        return;
+      }
+      const nextRole = isAdminUser(me) || getAdminEmailSet().has(decodedEmail) ? "admin" : me.role;
+      db.prepare(
+        "UPDATE users SET email = COALESCE(email, ?), email_verified = 1, role = ? WHERE id = ?",
+      ).run(decodedEmail, nextRole, me.id);
+      const updated = db.prepare("SELECT * FROM users WHERE id = ?").get(me.id) as DbUser;
+      res.json({ ok: true, user: toSelfUser(updated) });
+    } catch {
+      res.status(401).json({ error: "Invalid Firebase verification token." });
+    }
+  });
+
   // Bridge verified Firebase (Google) accounts into the unified SQLite & WebSocket directory
   router.post("/auth/firebase-session", async (req, res) => {
     const authHeader = req.headers.authorization;
@@ -644,6 +1163,7 @@ export function createApiRouter() {
       username?: string;
       bio?: string;
       avatarUrl?: string;
+      targetUserId?: string;
     };
     const rawToken =
       (authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : "") ||
@@ -658,6 +1178,7 @@ export function createApiRouter() {
       const decoded = await getFirebaseAdminAuth().verifyIdToken(rawToken);
       const fbUid = decoded.uid;
       const decodedEmail = decoded.email ? normalizeEmail(decoded.email) : null;
+      const fbEmailVerified = Boolean(decoded.email_verified && decodedEmail);
       const now = new Date().toISOString();
 
       const rawPic =
@@ -670,12 +1191,24 @@ export function createApiRouter() {
       const externalAvatar = rawPic ? rawPic.slice(0, 1024) : null;
 
       const fbUserId = `fb_${fbUid}`;
-      let user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(fbUserId) as
-        DbUser | undefined;
+      let user: DbUser | undefined;
+
+      if (body.targetUserId && decodedEmail && fbEmailVerified) {
+        user = db
+          .prepare("SELECT * FROM users WHERE id = ? AND LOWER(email) = LOWER(?) LIMIT 1")
+          .get(body.targetUserId, decodedEmail) as DbUser | undefined;
+      }
+
+      if (!user) {
+        user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(fbUserId) as
+          DbUser | undefined;
+      }
 
       if (!user && decodedEmail) {
         user = db
-          .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1")
+          .prepare(
+            "SELECT * FROM users WHERE LOWER(email) = LOWER(?) ORDER BY created_at ASC LIMIT 1",
+          )
           .get(decodedEmail) as DbUser | undefined;
       }
 
@@ -710,12 +1243,19 @@ export function createApiRouter() {
           .trim()
           .slice(0, 200);
 
+        const role =
+          fbEmailVerified && decodedEmail && getAdminEmailSet().has(decodedEmail)
+            ? "admin"
+            : "user";
+
         db.prepare(
-          `INSERT INTO users (id, email, phone_e164, phone_verified, full_name, display_handle, bio, avatar_media_id, avatar_external_url, password_hash, theme, created_at, last_active_at)
-           VALUES (?, ?, NULL, 0, ?, ?, ?, NULL, ?, ?, 'instagram', ?, ?)`,
+          `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, avatar_external_url, password_hash, theme, created_at, last_active_at)
+           VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, NULL, ?, ?, 'instagram', ?, ?)`,
         ).run(
           fbUserId,
           decodedEmail,
+          fbEmailVerified ? 1 : 0,
+          role,
           fullName,
           finalHandle,
           bio,
@@ -765,9 +1305,14 @@ export function createApiRouter() {
         user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(fbUserId) as DbUser;
         broadcastEvent("user:registered", { user: toPublicUser(user, true) }, user.id);
       } else {
+        const nextEmailVerified = fbEmailVerified ? 1 : user.email_verified;
+        const nextRole =
+          fbEmailVerified && decodedEmail && getAdminEmailSet().has(decodedEmail)
+            ? "admin"
+            : user.role;
         db.prepare(
-          "UPDATE users SET last_active_at = ?, avatar_external_url = COALESCE(avatar_external_url, ?) WHERE id = ?",
-        ).run(now, externalAvatar, user.id);
+          "UPDATE users SET last_active_at = ?, avatar_external_url = COALESCE(avatar_external_url, ?), email_verified = ?, role = ? WHERE id = ?",
+        ).run(now, externalAvatar, nextEmailVerified, nextRole, user.id);
         const existingNfc = db
           .prepare("SELECT id FROM nfc_links WHERE user_id = ? LIMIT 1")
           .get(user.id);
@@ -829,8 +1374,78 @@ export function createApiRouter() {
     res.json({ ok: true });
   });
 
-  router.delete("/auth/account", requireAuth, (req: AuthedRequest, res) => {
+  // Delete ONLY the currently signed-in account, requiring reauthentication + server security key verification
+  router.delete("/auth/account", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
+    const { password, firebaseIdToken, securityKey } = (req.body ?? {}) as {
+      password?: string;
+      firebaseIdToken?: string;
+      securityKey?: string;
+    };
+
+    const rateKey = `delete:${me.id}:${getClientIp(req)}`;
+    const limit = checkRateLimit(rateKey);
+    if (!limit.allowed) {
+      res.status(429).json({
+        error: `Too many failed deletion attempts. Wait ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s).`,
+      });
+      return;
+    }
+
+    // 1. Reauthenticate account owner (local password OR fresh Google/Firebase ID token)
+    let reauthenticated = false;
+    if (
+      typeof password === "string" &&
+      password.length > 0 &&
+      verifyPassword(password, me.password_hash)
+    ) {
+      reauthenticated = true;
+    } else if (typeof firebaseIdToken === "string" && firebaseIdToken.trim()) {
+      try {
+        const decoded = await getFirebaseAdminAuth().verifyIdToken(firebaseIdToken.trim());
+        const fbEmail = decoded.email ? normalizeEmail(decoded.email) : null;
+        if (
+          me.id === `fb_${decoded.uid}` ||
+          (decoded.email_verified && fbEmail && me.email && me.email.toLowerCase() === fbEmail)
+        ) {
+          reauthenticated = true;
+        }
+      } catch {
+        reauthenticated = false;
+      }
+    }
+
+    if (!reauthenticated) {
+      const failRes = recordRateLimitFailure(rateKey, 5, 15 * 60 * 1000, 15 * 60 * 1000);
+      if (failRes.locked) {
+        res.status(429).json({
+          error: "Too many failed deletion attempts. Try again in 15 minutes.",
+        });
+        return;
+      }
+      res.status(401).json({
+        error: "Reauthentication failed. Enter your current password or verify with Google.",
+      });
+      return;
+    }
+
+    // 2. Verify security key strictly on server (never stored/leaked on client)
+    const expectedKey = process.env["ACCOUNT_DELETE_KEY"]?.trim() || "2233";
+    const suppliedKey = typeof securityKey === "string" ? securityKey.trim() : "";
+    if (!suppliedKey || !timingSafeEqualStrings(suppliedKey, expectedKey)) {
+      const failRes = recordRateLimitFailure(rateKey, 5, 15 * 60 * 1000, 15 * 60 * 1000);
+      if (failRes.locked) {
+        res.status(429).json({
+          error: "Too many failed security key attempts. Wait 15 minutes before retrying.",
+        });
+        return;
+      }
+      res.status(403).json({ error: "Invalid deletion security key." });
+      return;
+    }
+
+    clearRateLimit(rateKey);
+
     const mediaRows = db
       .prepare("SELECT file_path FROM media_objects WHERE owner_id = ?")
       .all(me.id) as { file_path: string }[];
@@ -940,13 +1555,14 @@ export function createApiRouter() {
     res.json({ ok: true, phoneMasked: maskPhone(phoneE164) });
   });
 
-  // Reset password with real verified OTP
+  // Reset password with real verified OTP (supports optional targetUserId when multiple accounts share the phone)
   router.post("/auth/otp/reset-password", async (req, res) => {
-    const { phone, countryCode, code, newPassword } = req.body as {
+    const { phone, countryCode, code, newPassword, targetUserId } = req.body as {
       phone?: string;
       countryCode?: string;
       code?: string;
       newPassword?: string;
+      targetUserId?: string;
     };
 
     const phoneE164 = normalizePhoneE164(phone ?? "", countryCode ?? "+91");
@@ -961,9 +1577,10 @@ export function createApiRouter() {
       return;
     }
 
-    const user = db.prepare("SELECT * FROM users WHERE phone_e164 = ? LIMIT 1").get(phoneE164) as
-      DbUser | undefined;
-    if (!user) {
+    const users = db
+      .prepare("SELECT * FROM users WHERE phone_e164 = ? ORDER BY created_at ASC")
+      .all(phoneE164) as DbUser[];
+    if (users.length === 0) {
       res.status(404).json({ error: "No account found for that phone number." });
       return;
     }
@@ -974,13 +1591,141 @@ export function createApiRouter() {
       return;
     }
 
+    const target = targetUserId ? users.find((u) => u.id === targetUserId) : users[0];
+    if (!target) {
+      res.status(404).json({ error: "Selected account was not found." });
+      return;
+    }
+
     db.prepare("UPDATE users SET password_hash = ?, phone_verified = 1 WHERE id = ?").run(
       hashPassword(pwd),
-      user.id,
+      target.id,
     );
-    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(user.id);
+    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
 
-    res.json({ ok: true });
+    res.json({ ok: true, updatedHandle: target.display_handle });
+  });
+
+  // Send email OTP (when RESEND_API_KEY configured) or return firebase email-reset guidance
+  router.post("/auth/forgot-password/email/send", async (req, res) => {
+    const rawEmail = String((req.body as { email?: string })?.email ?? "").trim();
+    const cleanEmail = normalizeEmail(rawEmail);
+    if (!cleanEmail) {
+      res.status(400).json({ error: "Enter a valid Gmail or email address." });
+      return;
+    }
+
+    const cfg = getResendConfig();
+    if (!cfg.configured) {
+      // Fall back cleanly to Firebase client reset link (never reveal whether email exists)
+      res.json({ ok: true, mode: "firebase" });
+      return;
+    }
+
+    const recentWindow = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const recentCount = db
+      .prepare(
+        "SELECT COUNT(*) AS cnt FROM email_otp_challenges WHERE LOWER(email) = LOWER(?) AND created_at > ?",
+      )
+      .get(cleanEmail, recentWindow) as { cnt: number };
+    if (recentCount.cnt >= 5) {
+      res.status(429).json({ error: "Too many reset requests. Please wait 15 minutes." });
+      return;
+    }
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    const now = new Date();
+    db.prepare(
+      "INSERT INTO email_otp_challenges (id, email, code_hash, purpose, user_id, created_at, expires_at, attempts, consumed) VALUES (?, ?, ?, 'reset_password', NULL, ?, ?, 0, 0)",
+    ).run(
+      `eotp_${crypto.randomUUID()}`,
+      cleanEmail,
+      sha256(code),
+      now.toISOString(),
+      new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
+    );
+
+    const existing = db
+      .prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1")
+      .get(cleanEmail);
+    if (existing) {
+      await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${cfg.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: cfg.from,
+          to: [cleanEmail],
+          subject: "Reading Corner Password Reset Code",
+          text: `Your Reading Corner verification code is: ${code}\nIt expires in 10 minutes.`,
+        }),
+      }).catch(() => {});
+    }
+
+    res.json({ ok: true, mode: "email_otp" });
+  });
+
+  router.post("/auth/forgot-password/email/confirm", (req, res) => {
+    const { email, code, newPassword, username } = req.body as {
+      email?: string;
+      code?: string;
+      newPassword?: string;
+      username?: string;
+    };
+    const cleanEmail = normalizeEmail(String(email ?? ""));
+    if (!cleanEmail) {
+      res.status(400).json({ error: "Valid email is required." });
+      return;
+    }
+    const pwd = String(newPassword ?? "");
+    if (pwd.length < 8) {
+      res.status(400).json({ error: "New password must be at least 8 characters." });
+      return;
+    }
+    const nowIso = new Date().toISOString();
+    const challenge = db
+      .prepare(
+        "SELECT * FROM email_otp_challenges WHERE LOWER(email) = LOWER(?) AND consumed = 0 AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
+      )
+      .get(cleanEmail, nowIso) as { id: string; code_hash: string; attempts: number } | undefined;
+
+    if (!challenge || challenge.attempts >= 5) {
+      res.status(400).json({ error: "Invalid or expired verification code." });
+      return;
+    }
+    db.prepare("UPDATE email_otp_challenges SET attempts = attempts + 1 WHERE id = ?").run(
+      challenge.id,
+    );
+    if (!timingSafeEqualStrings(sha256(String(code ?? "").trim()), challenge.code_hash)) {
+      res.status(400).json({ error: "Invalid verification code." });
+      return;
+    }
+
+    const candidates = db
+      .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?) ORDER BY created_at ASC")
+      .all(cleanEmail) as DbUser[];
+    let target = candidates[0];
+    if (username) {
+      const h = normalizeHandle(username);
+      if (h) {
+        const matched = candidates.find((u) => u.display_handle.toLowerCase() === h.toLowerCase());
+        if (matched) target = matched;
+      }
+    }
+    if (!target) {
+      res.status(404).json({ error: "Account not found." });
+      return;
+    }
+
+    db.prepare("UPDATE email_otp_challenges SET consumed = 1 WHERE id = ?").run(challenge.id);
+    db.prepare("UPDATE users SET password_hash = ?, email_verified = 1 WHERE id = ?").run(
+      hashPassword(pwd),
+      target.id,
+    );
+    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
+    res.json({ ok: true, updatedHandle: target.display_handle });
   });
 
   // Verify signed-in user's phone number with OTP
@@ -1000,14 +1745,34 @@ export function createApiRouter() {
     res.json({ ok: true, phoneVerified: true });
   });
 
-  router.post("/auth/change-password", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/auth/change-password", requireAuth, async (req: AuthedRequest, res) => {
     const user = req.authUser!;
-    const { currentPassword, newPassword } = req.body as {
+    const { currentPassword, firebaseIdToken, newPassword } = req.body as {
       currentPassword?: string;
+      firebaseIdToken?: string;
       newPassword?: string;
     };
-    if (!verifyPassword(String(currentPassword ?? ""), user.password_hash)) {
-      res.status(400).json({ error: "Current password is incorrect." });
+
+    let authorized = false;
+    if (currentPassword && verifyPassword(String(currentPassword), user.password_hash)) {
+      authorized = true;
+    } else if (firebaseIdToken) {
+      try {
+        const decoded = await getFirebaseAdminAuth().verifyIdToken(firebaseIdToken.trim());
+        const fbEmail = decoded.email ? normalizeEmail(decoded.email) : null;
+        if (
+          user.id === `fb_${decoded.uid}` ||
+          (decoded.email_verified && fbEmail && user.email && user.email.toLowerCase() === fbEmail)
+        ) {
+          authorized = true;
+        }
+      } catch {
+        authorized = false;
+      }
+    }
+
+    if (!authorized) {
+      res.status(400).json({ error: "Current password or Google verification is incorrect." });
       return;
     }
     const nextPwd = String(newPassword ?? "");
@@ -1326,6 +2091,62 @@ export function createApiRouter() {
       signedInAsDifferentAccount: Boolean((fbUid && fbUid !== fbLink.uid) || resolved),
       ownerHint: `${initial}***`,
     });
+  });
+
+  // Admin-only CONTROL User Search — strictly public/non-sensitive fields + personal link ONLY
+  router.get("/control/users", requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    const raw = String(req.query["q"] ?? "")
+      .trim()
+      .toLowerCase();
+    const like = `%${raw}%`;
+
+    const rows = (
+      raw
+        ? db
+            .prepare(
+              `SELECT u.*, n.token_ciphertext, n.revoked
+               FROM users u
+               LEFT JOIN nfc_links n ON n.user_id = u.id
+               WHERE LOWER(u.id) LIKE ? OR LOWER(u.display_handle) LIKE ? OR LOWER(u.full_name) LIKE ?
+               ORDER BY u.last_active_at DESC
+               LIMIT 100`,
+            )
+            .all(like, like, like)
+        : db
+            .prepare(
+              `SELECT u.*, n.token_ciphertext, n.revoked
+               FROM users u
+               LEFT JOIN nfc_links n ON n.user_id = u.id
+               ORDER BY u.last_active_at DESC
+               LIMIT 100`,
+            )
+            .all()
+    ) as (DbUser & { token_ciphertext: string | null; revoked: number | null })[];
+
+    const users = rows.map((u) => {
+      let nfcToken: string | null = null;
+      if (u.revoked === 0 && u.token_ciphertext) {
+        nfcToken = decryptToken(u.token_ciphertext);
+      }
+      if (!nfcToken && u.revoked !== 1) {
+        nfcToken = createNfcTokenForUser(u.id).token;
+      }
+      return {
+        id: u.id,
+        fullName: u.full_name,
+        displayHandle: u.display_handle,
+        bio: u.bio,
+        avatarUrl: u.avatar_media_id
+          ? `/api/media/${u.avatar_media_id}`
+          : (u.avatar_external_url ?? null),
+        personalLink: nfcToken ? `/nfc/${nfcToken}` : null,
+        online: isUserConnected(u.id),
+        lastActiveAt: u.last_active_at,
+        createdAt: u.created_at,
+      };
+    });
+
+    res.json({ users });
   });
 
   // Discover Users — lists ALL registered non-blocked users (strictly public fields only)

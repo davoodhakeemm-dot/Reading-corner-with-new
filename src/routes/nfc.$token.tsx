@@ -1,5 +1,14 @@
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
-import { AlertTriangle, CheckCircle2, Lock, Nfc, Phone, ShieldAlert } from "lucide-react";
+import {
+  AlertTriangle,
+  AtSign,
+  CheckCircle2,
+  Lock,
+  Mail,
+  Nfc,
+  Phone,
+  ShieldAlert,
+} from "lucide-react";
 import { motion } from "motion/react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -7,7 +16,16 @@ import { toast } from "sonner";
 import { Logo } from "@/components/Logo";
 import { ReadingActions } from "@/components/ReadingActions";
 import { TripleTapExit } from "@/components/TripleTapExit";
-import { loginAccount, logout, resolveNfcToken, useChat } from "@/lib/chat-store";
+import {
+  AccountChoiceRequiredError,
+  initialsOf,
+  loginAccount,
+  logout,
+  resolveNfcToken,
+  useChat,
+  type AccountChoiceOption,
+  type LoginMode,
+} from "@/lib/chat-store";
 
 export const Route = createFileRoute("/nfc/$token")({
   head: () => ({
@@ -29,9 +47,11 @@ function NfcTapPage() {
   const [ownerHint, setOwnerHint] = useState("R***");
   const [differentAccount, setDifferentAccount] = useState(false);
 
+  const [loginMethod, setLoginMethod] = useState<Exclude<LoginMode, "auto">>("phone");
   const [countryCode, setCountryCode] = useState("+91");
-  const [phone, setPhone] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
+  const [accountChoices, setAccountChoices] = useState<AccountChoiceOption[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -62,11 +82,10 @@ function NfcTapPage() {
     };
   }, [token, ready, me?.id, navigate]);
 
-  async function handleCardLogin(e: React.FormEvent) {
-    e.preventDefault();
+  async function submitCardLogin(targetUserId?: string) {
     setError("");
-    if (!phone.trim() || !password) {
-      setError("Enter your email, phone number, or username and password.");
+    if (!identifier.trim() || !password) {
+      setError("Enter your login detail and password.");
       return;
     }
     setBusy(true);
@@ -74,22 +93,38 @@ function NfcTapPage() {
       if (differentAccount) {
         await logout();
       }
-      await loginAccount({ identifier: phone.trim(), countryCode, password });
+      await loginAccount({
+        mode: loginMethod,
+        identifier: identifier.trim(),
+        countryCode,
+        password,
+        ...(targetUserId ? { targetUserId } : {}),
+      });
+      setAccountChoices(null);
       const recheck = await resolveNfcToken(token);
       if (recheck.status === "authorized") {
         setStatus("authorized");
-        toast.success("NFC card verified");
+        toast.success("Personal link verified");
         navigate({ to: "/messages", replace: true });
       } else {
         setError(
-          "This account does not match this NFC card. Sign in with the card owner's account.",
+          "This account does not match this personal link. Sign in with the link owner's account.",
         );
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Invalid credentials.");
+      if (err instanceof AccountChoiceRequiredError) {
+        setAccountChoices(err.accounts);
+      } else {
+        setError(err instanceof Error ? err.message : "Invalid credentials.");
+      }
     } finally {
       setBusy(false);
     }
+  }
+
+  function handleCardLogin(e: React.FormEvent) {
+    e.preventDefault();
+    void submitCardLogin();
   }
 
   return (
@@ -135,9 +170,9 @@ function NfcTapPage() {
             </motion.div>
             <div>
               <p className="font-display text-lg font-extrabold tracking-tight">
-                Reading Corner NFC Card
+                Reading Corner Personal Link
               </p>
-              <p className="text-xs text-white/70">Personal secret link verification</p>
+              <p className="text-xs text-white/70">Permanent link &amp; NFC verification</p>
             </div>
           </div>
         </div>
@@ -147,7 +182,7 @@ function NfcTapPage() {
           {status === "checking" && (
             <div className="space-y-3 py-4 text-center">
               <Logo className="mx-auto size-12 animate-pulse" />
-              <p className="text-sm font-semibold">Verifying NFC card link…</p>
+              <p className="text-sm font-semibold">Verifying personal link…</p>
               <p className="text-xs text-white/65">Checking your active device session securely.</p>
             </div>
           )}
@@ -170,7 +205,7 @@ function NfcTapPage() {
                   <div>
                     <p className="text-sm font-bold">Link Revoked or Invalid</p>
                     <p className="mt-1 text-xs leading-relaxed text-rose-200/80">
-                      This NFC card link has been revoked, regenerated, or does not exist. For your
+                      This personal link has been revoked, regenerated, or does not exist. For your
                       security, no account information is accessible.
                     </p>
                   </div>
@@ -196,40 +231,93 @@ function NfcTapPage() {
           {status === "login_required" && (
             <form onSubmit={handleCardLogin} className="space-y-4">
               <div className="rounded-2xl border border-white/15 bg-white/5 p-3.5 text-xs text-white/80">
-                <p className="font-semibold text-white">Card detected for account ({ownerHint})</p>
+                <p className="font-semibold text-white">Link detected for account ({ownerHint})</p>
                 <p className="mt-1 leading-relaxed text-white/65">
                   {differentAccount
-                    ? "This device is currently signed into a different account. Sign in with the card owner's phone number and password to open their account."
-                    : "Sign in with your phone number and password to unlock this personal NFC card."}
+                    ? "This device is currently signed into a different account. Sign in with the link owner's credentials to open their account."
+                    : "Sign in with your Gmail, phone number, or username and password to unlock this personal link."}
                 </p>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1 rounded-2xl border border-white/10 bg-[#172038]/80 p-1">
+                {(
+                  [
+                    { id: "phone", label: "Phone" },
+                    { id: "gmail", label: "Gmail" },
+                    { id: "username", label: "Username" },
+                  ] as const
+                ).map(({ id, label }) => (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => {
+                      setLoginMethod(id);
+                      setIdentifier("");
+                      setAccountChoices(null);
+                      setError("");
+                    }}
+                    className={`rounded-xl py-2 text-xs font-bold transition ${
+                      loginMethod === id
+                        ? "bg-gradient-to-r from-[#f58529] via-[#dd2a7b] to-[#8134af] text-white"
+                        : "text-white/65 hover:text-white"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
 
               <div>
                 <span className="mb-1.5 block text-xs font-semibold text-white/80">
-                  Phone number
+                  {loginMethod === "phone"
+                    ? "Phone number"
+                    : loginMethod === "gmail"
+                      ? "Gmail / Email"
+                      : "Username"}
                 </span>
                 <div className="flex gap-2">
-                  <select
-                    value={countryCode}
-                    onChange={(e) => setCountryCode(e.target.value)}
-                    className="rounded-full border border-white/15 bg-[#172038]/90 px-3 py-2.5 text-xs font-bold text-white outline-none"
-                  >
-                    {COUNTRY_CODES.map((c) => (
-                      <option key={c} value={c}>
-                        {c}
-                      </option>
-                    ))}
-                  </select>
+                  {loginMethod === "phone" && (
+                    <select
+                      value={countryCode}
+                      onChange={(e) => setCountryCode(e.target.value)}
+                      className="rounded-full border border-white/15 bg-[#172038]/90 px-3 py-2.5 text-xs font-bold text-white outline-none"
+                    >
+                      {COUNTRY_CODES.map((c) => (
+                        <option key={c} value={c}>
+                          {c}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                   <div className="flex flex-1 items-center gap-2.5 rounded-full border border-white/15 bg-[#172038]/90 p-1.5 focus-within:ring-2 focus-within:ring-[#dd2a7b]/40">
                     <span className="grid size-8 shrink-0 place-items-center rounded-full bg-gradient-to-tr from-[#2563eb] to-[#3b82f6] text-white shadow">
-                      <Phone className="size-3.5" />
+                      {loginMethod === "phone" ? (
+                        <Phone className="size-3.5" />
+                      ) : loginMethod === "gmail" ? (
+                        <Mail className="size-3.5" />
+                      ) : (
+                        <AtSign className="size-3.5" />
+                      )}
                     </span>
                     <input
-                      type="tel"
-                      inputMode="tel"
-                      value={phone}
-                      onChange={(e) => setPhone(e.target.value)}
-                      placeholder="Phone number"
+                      type={
+                        loginMethod === "gmail" ? "email" : loginMethod === "phone" ? "tel" : "text"
+                      }
+                      inputMode={
+                        loginMethod === "gmail" ? "email" : loginMethod === "phone" ? "tel" : "text"
+                      }
+                      value={identifier}
+                      onChange={(e) => {
+                        setIdentifier(e.target.value);
+                        setAccountChoices(null);
+                      }}
+                      placeholder={
+                        loginMethod === "phone"
+                          ? "Phone number"
+                          : loginMethod === "gmail"
+                            ? "Gmail or email address"
+                            : "@username"
+                      }
                       className="min-w-0 flex-1 bg-transparent pr-3 text-sm text-white outline-none placeholder:text-white/45"
                     />
                   </div>
@@ -245,12 +333,36 @@ function NfcTapPage() {
                   <input
                     type="password"
                     value={password}
-                    onChange={(e) => setPassword(e.target.value)}
+                    onChange={(e) => {
+                      setPassword(e.target.value);
+                      setAccountChoices(null);
+                    }}
                     placeholder="Enter your password"
                     className="min-w-0 flex-1 bg-transparent pr-3 text-sm text-white outline-none placeholder:text-white/45"
                   />
                 </div>
               </label>
+
+              {accountChoices && accountChoices.length > 1 && (
+                <div className="space-y-1.5 rounded-2xl border border-sky-400/35 bg-sky-500/10 p-3">
+                  <p className="text-xs font-bold">Select linked profile:</p>
+                  {accountChoices.map((acc) => (
+                    <button
+                      key={acc.id}
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void submitCardLogin(acc.id)}
+                      className="flex w-full items-center gap-2 rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-left text-xs hover:bg-white/15"
+                    >
+                      <span className="grid size-7 place-items-center rounded-full bg-white/15 font-bold">
+                        {initialsOf(acc.fullName)}
+                      </span>
+                      <span className="truncate font-bold">{acc.fullName}</span>
+                      <span className="truncate text-white/70">{acc.displayHandle}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
 
               {error && (
                 <p className="rounded-2xl border border-rose-400/30 bg-rose-500/15 px-3.5 py-2.5 text-xs font-medium text-rose-200">

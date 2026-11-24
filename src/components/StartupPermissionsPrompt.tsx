@@ -594,7 +594,9 @@ export function StartupPermissionsPrompt() {
     void queryAllAppPermissions().then((next) => {
       if (cancelled) return;
       setSnapshot(next);
-      setOpen(true);
+      if (shouldShowStartupPermissions(next, hasPromptedStartupPermissions())) {
+        setOpen(true);
+      }
     });
     return () => {
       cancelled = true;

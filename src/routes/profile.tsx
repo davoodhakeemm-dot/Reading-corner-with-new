@@ -11,6 +11,8 @@ import {
 } from "lucide-react";
 
 import { AppShell, PageHeader } from "@/components/AppShell";
+import { LinkedAccountsCard } from "@/components/LinkedAccountsCard";
+import { PersonalLinkCard } from "@/components/PersonalLinkCard";
 import { useChat } from "@/lib/chat-store";
 import { useLibrary } from "@/lib/library-store";
 import { CATEGORIES, LANGUAGES } from "@/lib/catalog";
@@ -76,7 +78,7 @@ function ProfilePage() {
               </p>
               <p className="truncate text-sm text-muted-foreground">
                 {me
-                  ? `${me.displayHandle} · ${me.email ?? me.phoneMasked ?? "Signed in"}`
+                  ? `${me.displayHandle} · ID: ${me.id} · ${me.email ?? me.phoneMasked ?? "Signed in"}`
                   : state.profile.email}
               </p>
             </div>
@@ -118,6 +120,9 @@ function ProfilePage() {
             </div>
           ))}
         </div>
+
+        {me && <PersonalLinkCard variant="surface" />}
+        {me && <LinkedAccountsCard variant="surface" />}
 
         <section>
           <h2 className="mb-3 text-lg font-bold">Your languages</h2>

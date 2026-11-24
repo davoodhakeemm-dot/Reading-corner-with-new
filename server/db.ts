@@ -42,12 +42,15 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     email TEXT,
-    phone_e164 TEXT UNIQUE,
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    phone_e164 TEXT,
     phone_verified INTEGER NOT NULL DEFAULT 0,
+    role TEXT NOT NULL DEFAULT 'user',
     full_name TEXT NOT NULL,
     display_handle TEXT NOT NULL,
     bio TEXT NOT NULL DEFAULT '',
     avatar_media_id TEXT,
+    avatar_external_url TEXT,
     password_hash TEXT NOT NULL,
     theme TEXT NOT NULL DEFAULT 'instagram',
     created_at TEXT NOT NULL,
@@ -184,19 +187,74 @@ db.exec(`
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS auth_rate_limits (
+    rate_key TEXT PRIMARY KEY,
+    failures INTEGER NOT NULL DEFAULT 0,
+    first_failure_at TEXT NOT NULL,
+    locked_until TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS email_otp_challenges (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    user_id TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    consumed INTEGER NOT NULL DEFAULT 0
+  );
 `);
 
-// Non-destructive column migrations for pre-existing databases
+export const MAX_ACCOUNTS_PER_CONTACT = 3;
+
+export function getAdminEmailSet(): Set<string> {
+  const configured = (process.env["ADMIN_EMAILS"] ?? "mohammadakeem22@gmail.com")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set(configured);
+}
+
+// Non-destructive column & index migrations for pre-existing databases
 function runSafeMigrations() {
   const userCols = db.prepare("PRAGMA table_info(users)").all() as {
     name: string;
     notnull: number;
   }[];
-  const hasEmail = userCols.some((c) => c.name === "email");
+  const userColSet = new Set(userCols.map((c) => c.name));
+  const hasEmail = userColSet.has("email");
   const phoneCol = userCols.find((c) => c.name === "phone_e164");
 
-  // Upgrade existing `users` table if `email` is missing or `phone_e164` was NOT NULL
-  if (!hasEmail || (phoneCol && phoneCol.notnull === 1)) {
+  const indexes = db.prepare("PRAGMA index_list(users)").all() as {
+    name: string;
+    unique: number;
+    origin: string;
+  }[];
+  let hasPhoneUniqueIndex = false;
+  for (const idx of indexes) {
+    if (idx.unique === 1 && idx.name !== "idx_users_handle_unique") {
+      const idxCols = db.prepare(`PRAGMA index_info("${idx.name.replace(/"/g, "")}")`).all() as {
+        name: string;
+      }[];
+      if (idxCols.some((c) => c.name === "phone_e164")) {
+        hasPhoneUniqueIndex = true;
+      }
+    }
+  }
+
+  db.exec("DROP INDEX IF EXISTS idx_users_email_unique;");
+
+  // Rebuild `users` if phone_e164 still has an inline UNIQUE constraint or legacy columns are missing
+  if (
+    !hasEmail ||
+    (phoneCol && phoneCol.notnull === 1) ||
+    hasPhoneUniqueIndex ||
+    !userColSet.has("email_verified") ||
+    !userColSet.has("role") ||
+    !userColSet.has("avatar_external_url")
+  ) {
     db.exec("PRAGMA foreign_keys = OFF;");
     db.exec("BEGIN TRANSACTION;");
     try {
@@ -204,29 +262,40 @@ function runSafeMigrations() {
         CREATE TABLE users_migrated (
           id TEXT PRIMARY KEY,
           email TEXT,
-          phone_e164 TEXT UNIQUE,
+          email_verified INTEGER NOT NULL DEFAULT 0,
+          phone_e164 TEXT,
           phone_verified INTEGER NOT NULL DEFAULT 0,
+          role TEXT NOT NULL DEFAULT 'user',
           full_name TEXT NOT NULL,
           display_handle TEXT NOT NULL,
           bio TEXT NOT NULL DEFAULT '',
           avatar_media_id TEXT,
+          avatar_external_url TEXT,
           password_hash TEXT NOT NULL,
           theme TEXT NOT NULL DEFAULT 'instagram',
           created_at TEXT NOT NULL,
           last_active_at TEXT NOT NULL
         );
       `);
-      if (hasEmail) {
-        db.exec(`
-          INSERT INTO users_migrated (id, email, phone_e164, phone_verified, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at)
-          SELECT id, email, phone_e164, phone_verified, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at FROM users;
-        `);
-      } else {
-        db.exec(`
-          INSERT INTO users_migrated (id, email, phone_e164, phone_verified, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at)
-          SELECT id, NULL, phone_e164, phone_verified, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at FROM users;
-        `);
-      }
+      const emailExpr = hasEmail ? "email" : "NULL";
+      const emailVerifiedExpr = userColSet.has("email_verified")
+        ? "email_verified"
+        : "CASE WHEN id LIKE 'fb_%' AND email IS NOT NULL THEN 1 ELSE 0 END";
+      const roleExpr = userColSet.has("role") ? "role" : "'user'";
+      const avatarExtExpr = userColSet.has("avatar_external_url") ? "avatar_external_url" : "NULL";
+
+      db.exec(`
+        INSERT INTO users_migrated (
+          id, email, email_verified, phone_e164, phone_verified, role,
+          full_name, display_handle, bio, avatar_media_id, avatar_external_url,
+          password_hash, theme, created_at, last_active_at
+        )
+        SELECT
+          id, ${emailExpr}, ${emailVerifiedExpr}, phone_e164, phone_verified, ${roleExpr},
+          full_name, display_handle, bio, avatar_media_id, ${avatarExtExpr},
+          password_hash, theme, created_at, last_active_at
+        FROM users;
+      `);
       db.exec("DROP TABLE users;");
       db.exec("ALTER TABLE users_migrated RENAME TO users;");
       db.exec("COMMIT;");
@@ -258,15 +327,16 @@ function runSafeMigrations() {
   }
 
   db.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(LOWER(email)) WHERE email IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(LOWER(email)) WHERE email IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone_e164) WHERE phone_e164 IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_handle_unique ON users(LOWER(display_handle));
   `);
 
-  const userColSet = new Set(
-    (db.prepare("PRAGMA table_info(users)").all() as { name: string }[]).map((c) => c.name),
-  );
-  if (!userColSet.has("avatar_external_url")) {
-    db.exec("ALTER TABLE users ADD COLUMN avatar_external_url TEXT;");
+  // Promote configured admin emails cleanly on verified accounts
+  for (const adminEmail of getAdminEmailSet()) {
+    db.prepare(
+      "UPDATE users SET role = 'admin', email_verified = 1 WHERE LOWER(email) = LOWER(?) AND (email_verified = 1 OR id LIKE 'fb_%')",
+    ).run(adminEmail);
   }
 
   const msgCols = db.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
@@ -289,6 +359,7 @@ function runSafeMigrations() {
     CREATE INDEX IF NOT EXISTS idx_messages_recipient_seen ON messages(recipient_id, seen_at);
     CREATE INDEX IF NOT EXISTS idx_followers_following ON followers(following_id);
     CREATE INDEX IF NOT EXISTS idx_reactions_message ON message_reactions(message_id);
+    CREATE INDEX IF NOT EXISTS idx_email_otp_email ON email_otp_challenges(LOWER(email), created_at);
   `);
 }
 
@@ -299,8 +370,10 @@ export type SecretTheme = "instagram" | "emerald" | "dark";
 export type DbUser = {
   id: string;
   email: string | null;
+  email_verified: number;
   phone_e164: string | null;
   phone_verified: number;
+  role: string;
   full_name: string;
   display_handle: string;
   bio: string;
@@ -593,4 +666,104 @@ export function didUserBlock(blockerId: string, blockedId: string): boolean {
     .prepare("SELECT 1 FROM blocked_users WHERE blocker_id = ? AND blocked_id = ? LIMIT 1")
     .get(blockerId, blockedId);
   return Boolean(row);
+}
+
+export function isAdminUser(user: DbUser | null | undefined): boolean {
+  if (!user) return false;
+  if (user.role === "admin") return true;
+  if (user.email && user.email_verified === 1) {
+    return getAdminEmailSet().has(user.email.toLowerCase());
+  }
+  return false;
+}
+
+export function countAccountsByEmail(email: string): number {
+  const row = db
+    .prepare("SELECT COUNT(*) AS cnt FROM users WHERE LOWER(email) = LOWER(?)")
+    .get(email) as { cnt: number };
+  return row.cnt;
+}
+
+export function countAccountsByPhone(phoneE164: string): number {
+  const row = db
+    .prepare("SELECT COUNT(*) AS cnt FROM users WHERE phone_e164 = ?")
+    .get(phoneE164) as { cnt: number };
+  return row.cnt;
+}
+
+export function getLinkedSiblingAccounts(user: DbUser): DbUser[] {
+  const clauses: string[] = ["id = ?"];
+  const params: string[] = [user.id];
+
+  if (user.email && user.email_verified === 1) {
+    clauses.push("(LOWER(email) = LOWER(?) AND email_verified = 1)");
+    params.push(user.email);
+  }
+  if (user.phone_e164 && user.phone_verified === 1) {
+    clauses.push("(phone_e164 = ? AND phone_verified = 1)");
+    params.push(user.phone_e164);
+  }
+
+  return db
+    .prepare(`SELECT * FROM users WHERE ${clauses.join(" OR ")} ORDER BY created_at ASC`)
+    .all(...params) as DbUser[];
+}
+
+export function checkRateLimit(rateKey: string): { allowed: boolean; retryAfterSeconds: number } {
+  const row = db
+    .prepare(
+      "SELECT failures, first_failure_at, locked_until FROM auth_rate_limits WHERE rate_key = ? LIMIT 1",
+    )
+    .get(rateKey) as
+    { failures: number; first_failure_at: string; locked_until: string | null } | undefined;
+  if (!row || !row.locked_until) {
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+  const lockMs = Date.parse(row.locked_until);
+  if (Number.isNaN(lockMs) || lockMs <= Date.now()) {
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+  return {
+    allowed: false,
+    retryAfterSeconds: Math.max(1, Math.ceil((lockMs - Date.now()) / 1000)),
+  };
+}
+
+export function recordRateLimitFailure(
+  rateKey: string,
+  maxFailures = 5,
+  windowMs = 15 * 60 * 1000,
+  lockMs = 15 * 60 * 1000,
+): { locked: boolean; retryAfterSeconds: number } {
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const row = db
+    .prepare(
+      "SELECT failures, first_failure_at, locked_until FROM auth_rate_limits WHERE rate_key = ? LIMIT 1",
+    )
+    .get(rateKey) as
+    { failures: number; first_failure_at: string; locked_until: string | null } | undefined;
+
+  const firstMs = row ? Date.parse(row.first_failure_at) : 0;
+  const expiredWindow = !row || Number.isNaN(firstMs) || now - firstMs > windowMs;
+
+  const nextFailures = expiredWindow ? 1 : row.failures + 1;
+  const nextFirstIso = expiredWindow ? nowIso : row.first_failure_at;
+  const locked = nextFailures >= maxFailures;
+  const lockedUntilIso = locked ? new Date(now + lockMs).toISOString() : null;
+
+  db.prepare(
+    `INSERT INTO auth_rate_limits (rate_key, failures, first_failure_at, locked_until)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(rate_key) DO UPDATE SET failures = excluded.failures, first_failure_at = excluded.first_failure_at, locked_until = excluded.locked_until`,
+  ).run(rateKey, nextFailures, nextFirstIso, lockedUntilIso);
+
+  return {
+    locked,
+    retryAfterSeconds: locked ? Math.ceil(lockMs / 1000) : 0,
+  };
+}
+
+export function clearRateLimit(rateKey: string) {
+  db.prepare("DELETE FROM auth_rate_limits WHERE rate_key = ?").run(rateKey);
 }

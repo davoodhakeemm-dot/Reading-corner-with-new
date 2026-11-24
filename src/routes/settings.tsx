@@ -1,12 +1,21 @@
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
 import { InstallApp } from "@/components/InstallApp";
-import { RotateCcw, Trash2 } from "lucide-react";
+import { AlertTriangle, Eye, EyeOff, KeyRound, RotateCcw, ShieldCheck } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
 import { AppShell, PageHeader } from "@/components/AppShell";
+import { LinkedAccountsCard } from "@/components/LinkedAccountsCard";
+import { PersonalLinkCard } from "@/components/PersonalLinkCard";
 import { DevicePermissionsCard } from "@/components/StartupPermissionsPrompt";
-import { removeAllUsersAndData, useChat } from "@/lib/chat-store";
+import {
+  changePassword,
+  deleteAccount,
+  getFreshGoogleReauthToken,
+  logout,
+  sendPasswordReset,
+  useChat,
+} from "@/lib/chat-store";
 import { useLibrary } from "@/lib/library-store";
 import { cn } from "@/lib/utils";
 
@@ -17,7 +26,7 @@ export const Route = createFileRoute("/settings")({
       {
         name: "description",
         content:
-          "Control app appearance, reading defaults, notifications, account settings and reset reading data.",
+          "Control app appearance, reading defaults, personal link & QR code, linked accounts, and account settings.",
       },
       { property: "og:title", content: "Settings — Reading Corner" },
       { property: "og:description", content: "Tune Reading Corner to the way you read." },
@@ -31,27 +40,101 @@ export const Route = createFileRoute("/settings")({
 function SettingsPage() {
   const navigate = useNavigate();
   const { state, update, setReader, reset } = useLibrary();
-  const { me, logout, deleteAccount, sendPasswordReset, changePassword } = useChat();
+  const { me } = useChat();
 
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [deletePassword, setDeletePassword] = useState("");
+  const [deleteGoogleToken, setDeleteGoogleToken] = useState<string | null>(null);
+  const [deleteSecurityKey, setDeleteSecurityKey] = useState("");
+  const [showDeleteKey, setShowDeleteKey] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const [deletingBusy, setDeletingBusy] = useState(false);
+
   const [showPasswordModal, setShowPasswordModal] = useState(false);
   const [currentPw, setCurrentPw] = useState("");
   const [newPw, setNewPw] = useState("");
+  const [pwGoogleToken, setPwGoogleToken] = useState<string | null>(null);
+  const [pwBusy, setPwBusy] = useState(false);
+
+  function closeDeleteModal() {
+    setShowDeleteModal(false);
+    setDeletePassword("");
+    setDeleteGoogleToken(null);
+    setDeleteSecurityKey("");
+    setDeleteError("");
+  }
+
+  function closePasswordModal() {
+    setShowPasswordModal(false);
+    setCurrentPw("");
+    setNewPw("");
+    setPwGoogleToken(null);
+  }
+
+  async function handleGoogleReauthForDelete() {
+    setDeleteError("");
+    try {
+      const tok = await getFreshGoogleReauthToken();
+      setDeleteGoogleToken(tok);
+      toast.success("Google ownership verified. Enter the deletion security key to continue.");
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "Google verification failed.");
+    }
+  }
+
+  async function handleConfirmDeleteAccount() {
+    setDeleteError("");
+    if (!deletePassword && !deleteGoogleToken) {
+      setDeleteError("Enter your current password or verify with Google first.");
+      return;
+    }
+    if (!deleteSecurityKey.trim()) {
+      setDeleteError("Enter the deletion security key.");
+      return;
+    }
+    setDeletingBusy(true);
+    try {
+      await deleteAccount({
+        ...(deletePassword ? { password: deletePassword } : {}),
+        ...(deleteGoogleToken ? { firebaseIdToken: deleteGoogleToken } : {}),
+        securityKey: deleteSecurityKey.trim(),
+      });
+      closeDeleteModal();
+      toast.success("Account permanently deleted.");
+      navigate({ to: "/auth", replace: true });
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "Deletion failed.");
+    } finally {
+      setDeletingBusy(false);
+    }
+  }
 
   return (
     <AppShell>
       <div className="mx-auto max-w-2xl space-y-6 px-4 py-5 sm:px-6">
-        <PageHeader title="Settings" subtitle="Appearance, reading defaults, account and data." />
+        <PageHeader
+          title="Settings"
+          subtitle="Appearance, reading defaults, personal link and account."
+        />
 
         {me && (
           <Card title="Account Management">
             <div className="space-y-3">
-              <div className="flex items-center justify-between text-sm">
-                <div>
-                  <p className="font-semibold">{me.fullName}</p>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="font-semibold">{me.fullName}</p>
+                    <span className="rounded-full bg-secondary px-2 py-0.5 text-[11px] font-bold text-secondary-foreground">
+                      {me.displayHandle}
+                    </span>
+                    {me.isAdmin && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[11px] font-bold text-emerald-600">
+                        <ShieldCheck className="size-3" /> Admin
+                      </span>
+                    )}
+                  </div>
                   <p className="text-xs text-muted-foreground">
-                    {me.email ?? me.phoneMasked ?? me.displayHandle}
+                    {me.email ?? me.phoneMasked ?? me.displayHandle} · ID: {me.id}
                   </p>
                 </div>
                 <button
@@ -66,7 +149,7 @@ function SettingsPage() {
                 </button>
               </div>
 
-              <div className="flex flex-wrap gap-2 pt-2 border-t border-border/50">
+              <div className="flex flex-wrap gap-2 border-t border-border/50 pt-2">
                 <button
                   onClick={() => setShowPasswordModal(true)}
                   className="press rounded-full bg-secondary px-3.5 py-2 text-xs font-bold text-secondary-foreground"
@@ -81,7 +164,7 @@ function SettingsPage() {
                     }
                     try {
                       await sendPasswordReset(me.email);
-                      toast.success(`Password reset email sent to ${me.email}`);
+                      toast.success(`Password reset instructions sent to ${me.email}`);
                     } catch (err) {
                       toast.error(
                         err instanceof Error ? err.message : "Could not send reset email.",
@@ -92,6 +175,14 @@ function SettingsPage() {
                 >
                   Forgot Password
                 </button>
+                {me.isAdmin && (
+                  <Link
+                    to="/control"
+                    className="press inline-flex items-center gap-1.5 rounded-full bg-emerald-600 px-3.5 py-2 text-xs font-bold text-white"
+                  >
+                    <ShieldCheck className="size-3.5" /> CONTROL Directory
+                  </Link>
+                )}
                 <button
                   onClick={() => setShowDeleteModal(true)}
                   className="press rounded-full bg-rose-600 px-3.5 py-2 text-xs font-bold text-white hover:bg-rose-500"
@@ -102,6 +193,9 @@ function SettingsPage() {
             </div>
           </Card>
         )}
+
+        {me && <PersonalLinkCard variant="surface" />}
+        {me && <LinkedAccountsCard variant="surface" />}
 
         <Card title="Appearance">
           <Row label="App theme">
@@ -186,85 +280,119 @@ function SettingsPage() {
 
         <InstallApp />
 
-        <Card title="Data">
+        <Card title="Reading Data">
           <p className="text-sm text-muted-foreground">
-            Your progress, favorites and bookmarks are stored on this device only.
+            Resetting local reading data clears progress, favorites, and bookmarks on this profile.
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             <button
-              onClick={() => reset()}
+              onClick={() => {
+                reset();
+                toast.success("Reading data reset.");
+              }}
               className="press inline-flex items-center gap-2 rounded-full bg-destructive px-4 py-2 text-xs font-bold text-destructive-foreground"
             >
-              <RotateCcw className="size-3.5" /> Reset all reading data
-            </button>
-            <button
-              onClick={async () => {
-                if (
-                  window.confirm(
-                    "Are you sure you want to remove all users and reset the database? All registered accounts and database records will be permanently deleted.",
-                  )
-                ) {
-                  try {
-                    await removeAllUsersAndData();
-                    toast.success("All users and database records removed.");
-                    navigate({ to: "/auth", replace: true });
-                  } catch (err) {
-                    toast.error(err instanceof Error ? err.message : "Could not remove all users.");
-                  }
-                }
-              }}
-              className="press inline-flex items-center gap-2 rounded-full bg-rose-600 px-4 py-2 text-xs font-bold text-white shadow-md hover:bg-rose-500"
-            >
-              <Trash2 className="size-3.5" /> Remove all users &amp; database
+              <RotateCcw className="size-3.5" /> Reset reading data
             </button>
           </div>
         </Card>
       </div>
 
       {showDeleteModal && (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-3xl bg-card p-6 shadow-2xl space-y-4">
-            <h3 className="text-lg font-bold text-rose-600">Permanently Delete Account?</h3>
-            <p className="text-sm text-muted-foreground">
-              Are you sure you want to permanently delete your account? All your profile data, chat
-              messages, and personal information will be permanently removed according to our
-              data-retention policy. This action cannot be undone.
-            </p>
-            <div>
-              <label className="mb-1 block text-xs font-semibold">
-                Enter your password to confirm:
-              </label>
-              <input
-                type="password"
-                value={deletePassword}
-                onChange={(e) => setDeletePassword(e.target.value)}
-                placeholder="••••••••"
-                className="w-full rounded-xl border border-border bg-background px-3.5 py-2 text-sm"
-              />
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/65 p-4 backdrop-blur-sm">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirm Account Deletion"
+            className="w-full max-w-md space-y-4 rounded-3xl bg-card p-6 shadow-2xl"
+          >
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="mt-0.5 size-6 shrink-0 text-rose-600" />
+              <div>
+                <h3 className="text-lg font-bold text-rose-600">Permanently Delete Account?</h3>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  This deletes ONLY this profile ({me?.displayHandle}) — including its messages,
+                  media gallery, personal link, and reading state. Linked sibling accounts are NOT
+                  removed. This action cannot be undone.
+                </p>
+              </div>
             </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="mb-1 block text-xs font-semibold">
+                  1. Verify Account Ownership (Password or Google)
+                </label>
+                <input
+                  type="password"
+                  value={deletePassword}
+                  onChange={(e) => setDeletePassword(e.target.value)}
+                  placeholder="Enter your account password"
+                  className="w-full rounded-xl border border-border bg-background px-3.5 py-2 text-sm outline-none"
+                />
+                {me?.email && (
+                  <button
+                    type="button"
+                    onClick={() => void handleGoogleReauthForDelete()}
+                    className="mt-2 inline-flex items-center gap-1.5 text-xs font-bold text-primary hover:underline"
+                  >
+                    {deleteGoogleToken
+                      ? "✓ Google ownership verified"
+                      : "Signed in with Google? Verify with Google instead"}
+                  </button>
+                )}
+              </div>
+
+              <div>
+                <label className="mb-1 flex items-center gap-1.5 text-xs font-semibold">
+                  <KeyRound className="size-3.5" /> 2. Deletion Security Key
+                </label>
+                <div className="flex items-center rounded-xl border border-border bg-background pr-2">
+                  <input
+                    type={showDeleteKey ? "text" : "password"}
+                    value={deleteSecurityKey}
+                    onChange={(e) => setDeleteSecurityKey(e.target.value)}
+                    placeholder="Enter security key"
+                    aria-label="Deletion security key"
+                    className="min-w-0 flex-1 bg-transparent px-3.5 py-2 text-sm outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowDeleteKey((s) => !s)}
+                    aria-label={showDeleteKey ? "Hide security key" : "Show security key"}
+                    className="grid size-8 place-items-center opacity-70 hover:opacity-100"
+                  >
+                    {showDeleteKey ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                  </button>
+                </div>
+              </div>
+
+              {deleteError && (
+                <p
+                  role="alert"
+                  className="rounded-xl bg-rose-500/15 px-3 py-2 text-xs font-semibold text-rose-600"
+                >
+                  {deleteError}
+                </p>
+              )}
+            </div>
+
             <div className="flex justify-end gap-2 pt-2">
               <button
-                onClick={() => {
-                  setShowDeleteModal(false);
-                  setDeletePassword("");
-                }}
+                type="button"
+                disabled={deletingBusy}
+                onClick={closeDeleteModal}
                 className="press rounded-full bg-secondary px-4 py-2 text-xs font-bold"
               >
                 Cancel
               </button>
               <button
-                onClick={async () => {
-                  try {
-                    await deleteAccount(deletePassword);
-                    toast.success("Account permanently deleted.");
-                    navigate({ to: "/auth", replace: true });
-                  } catch (err) {
-                    toast.error(err instanceof Error ? err.message : "Deletion failed.");
-                  }
-                }}
-                className="press rounded-full bg-rose-600 px-4 py-2 text-xs font-bold text-white"
+                type="button"
+                disabled={deletingBusy}
+                onClick={() => void handleConfirmDeleteAccount()}
+                className="press rounded-full bg-rose-600 px-4 py-2 text-xs font-bold text-white disabled:opacity-50"
               >
-                Confirm Delete
+                {deletingBusy ? "Deleting…" : "Confirm Permanent Delete"}
               </button>
             </div>
           </div>
@@ -273,17 +401,39 @@ function SettingsPage() {
 
       {showPasswordModal && (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-3xl bg-card p-6 shadow-2xl space-y-4">
+          <div className="w-full max-w-md space-y-4 rounded-3xl bg-card p-6 shadow-2xl">
             <h3 className="text-lg font-bold">Change Password</h3>
             <div className="space-y-3">
               <div>
-                <label className="mb-1 block text-xs font-semibold">Current Password</label>
+                <label className="mb-1 block text-xs font-semibold">
+                  Current Password (or Verify with Google)
+                </label>
                 <input
                   type="password"
                   value={currentPw}
                   onChange={(e) => setCurrentPw(e.target.value)}
+                  placeholder="Current password"
                   className="w-full rounded-xl border border-border bg-background px-3.5 py-2 text-sm"
                 />
+                {me?.email && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const tok = await getFreshGoogleReauthToken();
+                        setPwGoogleToken(tok);
+                        toast.success("Google verified. Enter your new password below.");
+                      } catch (err) {
+                        toast.error(
+                          err instanceof Error ? err.message : "Google verification failed.",
+                        );
+                      }
+                    }}
+                    className="mt-1.5 text-xs font-bold text-primary hover:underline"
+                  >
+                    {pwGoogleToken ? "✓ Verified with Google" : "Verify with Google instead"}
+                  </button>
+                )}
               </div>
               <div>
                 <label className="mb-1 block text-xs font-semibold">
@@ -299,30 +449,31 @@ function SettingsPage() {
             </div>
             <div className="flex justify-end gap-2 pt-2">
               <button
-                onClick={() => {
-                  setShowPasswordModal(false);
-                  setCurrentPw("");
-                  setNewPw("");
-                }}
+                type="button"
+                disabled={pwBusy}
+                onClick={closePasswordModal}
                 className="press rounded-full bg-secondary px-4 py-2 text-xs font-bold"
               >
                 Cancel
               </button>
               <button
+                type="button"
+                disabled={pwBusy}
                 onClick={async () => {
+                  setPwBusy(true);
                   try {
-                    await changePassword(currentPw, newPw);
+                    await changePassword(currentPw, newPw, pwGoogleToken || undefined);
                     toast.success("Password changed successfully.");
-                    setShowPasswordModal(false);
-                    setCurrentPw("");
-                    setNewPw("");
+                    closePasswordModal();
                   } catch (err) {
                     toast.error(err instanceof Error ? err.message : "Could not change password.");
+                  } finally {
+                    setPwBusy(false);
                   }
                 }}
-                className="press rounded-full bg-brand px-4 py-2 text-xs font-bold text-primary-foreground"
+                className="press rounded-full bg-brand px-4 py-2 text-xs font-bold text-primary-foreground disabled:opacity-50"
               >
-                Update Password
+                {pwBusy ? "Updating…" : "Update Password"}
               </button>
             </div>
           </div>

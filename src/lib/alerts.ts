@@ -63,6 +63,11 @@ export function triggerVibration(pattern: number | number[]): boolean {
   if (typeof navigator === "undefined" || typeof navigator.vibrate !== "function") {
     return false;
   }
+  const userActivation = (navigator as Navigator & { userActivation?: { hasBeenActive?: boolean } })
+    .userActivation;
+  if (userActivation && !userActivation.hasBeenActive) {
+    return false;
+  }
   try {
     return navigator.vibrate(pattern);
   } catch {
@@ -72,6 +77,11 @@ export function triggerVibration(pattern: number | number[]): boolean {
 
 export function stopVibration(): void {
   if (typeof navigator === "undefined" || typeof navigator.vibrate !== "function") {
+    return;
+  }
+  const userActivation = (navigator as Navigator & { userActivation?: { hasBeenActive?: boolean } })
+    .userActivation;
+  if (userActivation && !userActivation.hasBeenActive) {
     return;
   }
   try {

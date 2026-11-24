@@ -1,5 +1,5 @@
-import { useNavigate } from "@tanstack/react-router";
-import { Compass, MessageCircle, User } from "lucide-react";
+import { Link, useNavigate } from "@tanstack/react-router";
+import { Compass, MessageCircle, ShieldCheck, User } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useMemo, useState } from "react";
 
@@ -229,6 +229,18 @@ export function InstagramShell({
               </span>
               <span className="relative z-10 hidden lg:inline">Profile</span>
             </button>
+
+            {me.isAdmin && (
+              <Link
+                to="/control"
+                className={cn(
+                  "relative flex min-h-[48px] w-full items-center justify-center gap-3 rounded-2xl px-3 text-sm font-bold text-emerald-500 transition hover:bg-emerald-500/10 lg:justify-start",
+                )}
+              >
+                <ShieldCheck className="relative z-10 size-5 shrink-0" />
+                <span className="relative z-10 hidden lg:inline">CONTROL</span>
+              </Link>
+            )}
           </nav>
         </div>
 
