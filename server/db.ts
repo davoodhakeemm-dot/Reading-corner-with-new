@@ -24,6 +24,25 @@ function getSupabase(): SupabaseClient {
   return supabase;
 }
 
+export async function createSignedMediaUpload(key: string): Promise<string> {
+  const { data, error } = await getSupabase()
+    .storage.from(MEDIA_BUCKET)
+    .createSignedUploadUrl(key, { upsert: true });
+  if (error) throw new Error(`Could not prepare media upload: ${error.message}`);
+  return data.token;
+}
+
+export async function mediaStorageObjectExists(key: string): Promise<boolean> {
+  const separator = key.lastIndexOf("/");
+  const folder = separator < 0 ? "" : key.slice(0, separator);
+  const filename = separator < 0 ? key : key.slice(separator + 1);
+  const { data, error } = await getSupabase()
+    .storage.from(MEDIA_BUCKET)
+    .list(folder, { search: filename, limit: 100 });
+  if (error) throw new Error(`Could not verify uploaded media: ${error.message}`);
+  return data.some((item) => item.name === filename);
+}
+
 export async function uploadMediaStorage(
   key: string,
   file: Buffer,

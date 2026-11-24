@@ -9,6 +9,7 @@ import {
   updateProfile,
   type User as FirebaseUser,
 } from "firebase/auth";
+import { createClient } from "@supabase/supabase-js";
 import { useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
@@ -1784,52 +1785,88 @@ export async function markThreadSeen(peerId: string) {
 
 export async function uploadChatMedia(file: File, recipientId?: string) {
   if (!state.me) throw new Error("Authentication required.");
-  const form = new FormData();
-  form.append("file", file);
-  if (recipientId) form.append("recipientId", recipientId);
+  const kind: MediaKind | null = file.type.startsWith("image/")
+    ? "image"
+    : file.type.startsWith("video/")
+      ? "video"
+      : file.type.startsWith("audio/")
+        ? "audio"
+        : null;
+  if (!kind) throw new Error("Choose a supported image, video, or audio file.");
 
-  const headers = await getBearerHeaders();
-  const resp = await fetch("/api/media", {
-    method: "POST",
-    headers,
-    credentials: "include",
-    body: form,
-  });
-  const data = (await resp.json().catch(() => ({}))) as {
+  const ticket = await apiJson<{
     id: string;
     kind: MediaKind;
     mimeType: string;
     originalName: string;
-    sizeBytes?: number;
-    createdAt?: string;
+    sizeBytes: number;
+    createdAt: string;
     url: string;
-    mine?: boolean;
-    error?: string;
-  };
-  if (!resp.ok) {
-    throw new Error(data.error || "Could not upload media.");
-  }
-  const safeName = data.originalName || file.name;
-  primeMediaObjectUrl(data.url, file);
-  uploadedMediaMeta.set(data.id, {
-    url: data.url,
-    kind: data.kind,
-    name: safeName,
+    mine: boolean;
+    storageKey: string;
+    uploadToken: string;
+    supabaseUrl: string;
+    anonKey: string;
+    recipientId: string | null;
+  }>("/api/media/upload-ticket", {
+    method: "POST",
+    body: {
+      kind,
+      mimeType: file.type,
+      originalName: file.name,
+      sizeBytes: file.size,
+      ...(recipientId ? { recipientId } : {}),
+    },
   });
+
+  if (!ticket.supabaseUrl || !ticket.anonKey) {
+    throw new Error("Media storage is not configured for direct uploads.");
+  }
+
+  const storageClient = createClient(ticket.supabaseUrl, ticket.anonKey);
+  const { error: uploadError } = await storageClient.storage
+    .from("reading-corner-media")
+    .uploadToSignedUrl(ticket.storageKey, ticket.uploadToken, file, {
+      contentType: file.type,
+      upsert: true,
+    });
+  if (uploadError) throw new Error(`Could not upload ${file.name}: ${uploadError.message}`);
+
+  const data = await apiJson<{
+    id: string;
+    kind: MediaKind;
+    mimeType: string;
+    originalName: string;
+    sizeBytes: number;
+    createdAt: string;
+    url: string;
+    mine: boolean;
+  }>("/api/media/complete", {
+    method: "POST",
+    body: {
+      id: ticket.id,
+      kind: ticket.kind,
+      mimeType: ticket.mimeType,
+      originalName: ticket.originalName,
+      sizeBytes: ticket.sizeBytes,
+      ...(ticket.recipientId ? { recipientId: ticket.recipientId } : {}),
+    },
+  });
+
+  primeMediaObjectUrl(data.url, file);
+  uploadedMediaMeta.set(data.id, { url: data.url, kind: data.kind, name: data.originalName });
   if (data.kind === "image" || data.kind === "video") {
     const newItem: GalleryItem = {
       id: data.id,
       kind: data.kind,
       mimeType: data.mimeType || file.type,
-      originalName: safeName,
-      sizeBytes: data.sizeBytes ?? file.size,
-      createdAt: data.createdAt ?? new Date().toISOString(),
+      originalName: data.originalName || file.name,
+      sizeBytes: data.sizeBytes,
+      createdAt: data.createdAt,
       url: data.url,
       mine: true,
     };
-    setState({
-      gallery: [newItem, ...state.gallery.filter((g) => g.id !== data.id)],
-    });
+    setState({ gallery: [newItem, ...state.gallery.filter((item) => item.id !== data.id)] });
   }
   return data;
 }
