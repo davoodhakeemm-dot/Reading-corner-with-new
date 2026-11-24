@@ -16,14 +16,15 @@ import {
   createNfcTokenForUser,
   db,
   decryptToken,
+  deleteMediaStorage,
   didUserBlock,
+  downloadMediaStorage,
   getAdminEmailSet,
   getFollowStats,
   getLinkedSiblingAccounts,
   hashPassword,
   isAdminUser,
   isBlockedBetween,
-  mediaDir,
   normalizeEmail,
   normalizeHandle,
   normalizePhoneE164,
@@ -32,6 +33,7 @@ import {
   signCookieToken,
   threadKeyFor,
   toPublicUser,
+  uploadMediaStorage,
   verifyCookieToken,
   verifyPassword,
   type DbUser,
@@ -123,13 +125,7 @@ const SESSION_DAYS = 30;
 const MAX_MEDIA_BYTES = 25 * 1024 * 1024; // 25MB for photos & short videos
 
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, mediaDir),
-    filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname || "").slice(0, 12);
-      cb(null, `${Date.now()}_${crypto.randomUUID()}${ext}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: MAX_MEDIA_BYTES },
 });
 
@@ -228,34 +224,33 @@ function extractToken(req: Request): string | null {
   return null;
 }
 
-function lookupSessionUser(req: Request): { user: DbUser; token: string } | null {
+async function lookupSessionUser(req: Request): Promise<{ user: DbUser; token: string } | null> {
   const token = extractToken(req);
   if (!token) return null;
   const now = new Date().toISOString();
-  const row = db
+  const row = (await db
     .prepare(
       `SELECT u.* FROM sessions s
        JOIN users u ON u.id = s.user_id
        WHERE s.token_hash = ? AND s.expires_at > ?
        LIMIT 1`,
     )
-    .get(sha256(token), now) as DbUser | undefined;
+    .get(sha256(token), now)) as DbUser | undefined;
   if (!row) return null;
   return { user: row, token };
 }
 
-function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
-  const resolved = lookupSessionUser(req);
+async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
+  const resolved = await lookupSessionUser(req);
   if (!resolved) {
     res.status(401).json({ error: "Authentication required." });
     return;
   }
   req.authUser = resolved.user;
   req.authToken = resolved.token;
-  db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(
-    new Date().toISOString(),
-    resolved.user.id,
-  );
+  await db
+    .prepare("UPDATE users SET last_active_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), resolved.user.id);
   next();
 }
 
@@ -267,20 +262,22 @@ function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
   next();
 }
 
-function issueSession(userId: string, req: Request, res: Response): string {
+async function issueSession(userId: string, req: Request, res: Response): Promise<string> {
   const token = `rc_sess_${crypto.randomBytes(32).toString("base64url")}`;
   const now = new Date();
   const expires = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1000);
-  db.prepare(
-    "INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, user_agent) VALUES (?, ?, ?, ?, ?, ?)",
-  ).run(
-    `sess_${crypto.randomUUID()}`,
-    userId,
-    sha256(token),
-    expires.toISOString(),
-    now.toISOString(),
-    String(req.headers["user-agent"] ?? "").slice(0, 200),
-  );
+  await db
+    .prepare(
+      "INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, user_agent) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run(
+      `sess_${crypto.randomUUID()}`,
+      userId,
+      sha256(token),
+      expires.toISOString(),
+      now.toISOString(),
+      String(req.headers["user-agent"] ?? "").slice(0, 200),
+    );
 
   const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
   res.clearCookie("rc_fb_session", { path: "/" });
@@ -294,7 +291,7 @@ function issueSession(userId: string, req: Request, res: Response): string {
   return token;
 }
 
-function makeUniqueHandle(fullName: string): string {
+async function makeUniqueHandle(fullName: string): Promise<string> {
   const slug = fullName
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "")
@@ -302,7 +299,7 @@ function makeUniqueHandle(fullName: string): string {
   for (let i = 0; i < 6; i += 1) {
     const suffix = crypto.randomBytes(2).toString("hex");
     const candidate = `@${slug || "reader"}.${suffix}`;
-    const exists = db
+    const exists = await db
       .prepare("SELECT 1 FROM users WHERE LOWER(display_handle) = LOWER(?) LIMIT 1")
       .get(candidate);
     if (!exists) return candidate;
@@ -316,9 +313,9 @@ function maskPhone(e164: string | null): string | undefined {
   return `${e164.slice(0, 4)}••••${e164.slice(-3)}`;
 }
 
-function toSelfUser(user: DbUser) {
+async function toSelfUser(user: DbUser) {
   return {
-    ...toPublicUser(user, true, user.id),
+    ...(await toPublicUser(user, true, user.id)),
     email: user.email,
     emailVerified: user.email_verified === 1,
     phoneMasked: maskPhone(user.phone_e164),
@@ -327,12 +324,12 @@ function toSelfUser(user: DbUser) {
   };
 }
 
-function getReactionsForMessage(messageId: string, viewerId?: string) {
-  const rows = db
+async function getReactionsForMessage(messageId: string, viewerId?: string) {
+  const rows = (await db
     .prepare(
       "SELECT user_id, emoji FROM message_reactions WHERE message_id = ? ORDER BY created_at ASC",
     )
-    .all(messageId) as { user_id: string; emoji: string }[];
+    .all(messageId)) as { user_id: string; emoji: string }[];
 
   const grouped = new Map<
     string,
@@ -355,7 +352,7 @@ function getReactionsForMessage(messageId: string, viewerId?: string) {
   return Array.from(grouped.values());
 }
 
-function serializeMessage(m: DbMessageRow, viewerId?: string) {
+async function serializeMessage(m: DbMessageRow, viewerId?: string) {
   const isDeleted = Boolean(m.deleted_at);
   let replyTo: {
     id: string;
@@ -367,14 +364,14 @@ function serializeMessage(m: DbMessageRow, viewerId?: string) {
   } | null = null;
 
   if (m.reply_to_id) {
-    const parent = db
+    const parent = (await db
       .prepare(
         `SELECT m.id, m.sender_id, m.text, m.media_kind, m.deleted_at, u.full_name
          FROM messages m
          LEFT JOIN users u ON u.id = m.sender_id
          WHERE m.id = ? LIMIT 1`,
       )
-      .get(m.reply_to_id) as
+      .get(m.reply_to_id)) as
       | {
           id: string;
           sender_id: string;
@@ -410,7 +407,7 @@ function serializeMessage(m: DbMessageRow, viewerId?: string) {
     mediaName: isDeleted ? null : m.media_name,
     replyToId: m.reply_to_id,
     replyTo,
-    reactions: isDeleted ? [] : getReactionsForMessage(m.id, viewerId),
+    reactions: isDeleted ? [] : await getReactionsForMessage(m.id, viewerId),
     editedAt: m.edited_at,
     deletedAt: m.deleted_at,
     deliveredAt: m.delivered_at,
@@ -419,44 +416,48 @@ function serializeMessage(m: DbMessageRow, viewerId?: string) {
   };
 }
 
-function findUserByIdentifier(rawIdentifier: string, countryCode = "+91"): DbUser | undefined {
+async function findUserByIdentifier(
+  rawIdentifier: string,
+  countryCode = "+91",
+): Promise<DbUser | undefined> {
   const trimmed = rawIdentifier.trim();
   if (!trimmed) return undefined;
 
   // 1. Exact case-insensitive email match
   const asEmail = normalizeEmail(trimmed);
   if (asEmail) {
-    const byEmail = db
+    const byEmail = (await db
       .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1")
-      .get(asEmail) as DbUser | undefined;
+      .get(asEmail)) as DbUser | undefined;
     if (byEmail) return byEmail;
   }
 
   // 2. Display handle match (with or without leading @)
   const cleanHandle = trimmed.replace(/^@+/, "").toLowerCase();
   if (cleanHandle && !cleanHandle.includes("@")) {
-    const byHandle = db
+    const byHandle = (await db
       .prepare("SELECT * FROM users WHERE LOWER(display_handle) = ? LIMIT 1")
-      .get(`@${cleanHandle}`) as DbUser | undefined;
+      .get(`@${cleanHandle}`)) as DbUser | undefined;
     if (byHandle) return byHandle;
   }
 
   // 3. Phone E.164 match
   const asPhone = normalizePhoneE164(trimmed, countryCode);
   if (asPhone) {
-    const byPhone = db.prepare("SELECT * FROM users WHERE phone_e164 = ? LIMIT 1").get(asPhone) as
-      DbUser | undefined;
+    const byPhone = (await db
+      .prepare("SELECT * FROM users WHERE phone_e164 = ? LIMIT 1")
+      .get(asPhone)) as DbUser | undefined;
     if (byPhone) return byPhone;
   }
 
   return undefined;
 }
 
-function findCandidatesByMode(
+async function findCandidatesByMode(
   mode: "phone" | "gmail" | "username" | "auto",
   rawIdentifier: string,
   countryCode = "+91",
-): { error?: string; candidates: DbUser[] } {
+): Promise<{ error?: string; candidates: DbUser[] }> {
   const trimmed = rawIdentifier.trim();
   if (!trimmed) {
     return { error: "Enter your login identifier.", candidates: [] };
@@ -467,9 +468,9 @@ function findCandidatesByMode(
     if (!asPhone) {
       return { error: "Enter a valid phone number with country code.", candidates: [] };
     }
-    const candidates = db
+    const candidates = (await db
       .prepare("SELECT * FROM users WHERE phone_e164 = ? ORDER BY created_at ASC")
-      .all(asPhone) as DbUser[];
+      .all(asPhone)) as DbUser[];
     return { candidates };
   }
 
@@ -478,9 +479,9 @@ function findCandidatesByMode(
     if (!asEmail) {
       return { error: "Enter a valid Gmail or email address.", candidates: [] };
     }
-    const candidates = db
+    const candidates = (await db
       .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?) ORDER BY created_at ASC")
-      .all(asEmail) as DbUser[];
+      .all(asEmail)) as DbUser[];
     return { candidates };
   }
 
@@ -489,9 +490,9 @@ function findCandidatesByMode(
     if (!asHandle) {
       return { error: "Enter a valid username (at least 2 characters).", candidates: [] };
     }
-    const candidates = db
+    const candidates = (await db
       .prepare("SELECT * FROM users WHERE LOWER(display_handle) = LOWER(?) LIMIT 1")
-      .all(asHandle) as DbUser[];
+      .all(asHandle)) as DbUser[];
     return { candidates };
   }
 
@@ -499,29 +500,29 @@ function findCandidatesByMode(
   const found = new Map<string, DbUser>();
   const asEmail = normalizeEmail(trimmed);
   if (asEmail) {
-    const rows = db
+    const rows = (await db
       .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?) ORDER BY created_at ASC")
-      .all(asEmail) as DbUser[];
+      .all(asEmail)) as DbUser[];
     for (const r of rows) found.set(r.id, r);
   }
   const cleanHandle = trimmed.replace(/^@+/, "").toLowerCase();
   if (cleanHandle && !cleanHandle.includes("@")) {
-    const rows = db
+    const rows = (await db
       .prepare("SELECT * FROM users WHERE LOWER(display_handle) = ? LIMIT 1")
-      .all(`@${cleanHandle}`) as DbUser[];
+      .all(`@${cleanHandle}`)) as DbUser[];
     for (const r of rows) found.set(r.id, r);
   }
   const asPhone = normalizePhoneE164(trimmed, countryCode);
   if (asPhone) {
-    const rows = db
+    const rows = (await db
       .prepare("SELECT * FROM users WHERE phone_e164 = ? ORDER BY created_at ASC")
-      .all(asPhone) as DbUser[];
+      .all(asPhone)) as DbUser[];
     for (const r of rows) found.set(r.id, r);
   }
   return { candidates: Array.from(found.values()) };
 }
 
-function saveAvatarDataUrl(userId: string, avatarDataUrl?: string): string | null {
+async function saveAvatarDataUrl(userId: string, avatarDataUrl?: string): Promise<string | null> {
   if (!avatarDataUrl || !avatarDataUrl.startsWith("data:image/")) return null;
   const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(avatarDataUrl);
   if (!match || !match[1] || !match[2]) return null;
@@ -529,12 +530,15 @@ function saveAvatarDataUrl(userId: string, avatarDataUrl?: string): string | nul
   if (buf.byteLength > 4 * 1024 * 1024) return null;
   const ext = match[1].split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "jpg";
   const fileName = `avatar_${userId}.${ext}`;
+  const storageKey = `avatars/${userId}/${fileName}`;
   const now = new Date().toISOString();
-  fs.writeFileSync(path.join(mediaDir, fileName), buf);
+  await uploadMediaStorage(storageKey, buf, match[1]);
   const avatarMediaId = `med_${crypto.randomUUID()}`;
-  db.prepare(
-    "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, NULL, 'image', ?, ?, ?, ?, 1, ?)",
-  ).run(avatarMediaId, userId, match[1], fileName, fileName, buf.byteLength, now);
+  await db
+    .prepare(
+      "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, NULL, 'image', ?, ?, ?, ?, 1, ?)",
+    )
+    .run(avatarMediaId, userId, match[1], fileName, storageKey, buf.byteLength, now);
   return avatarMediaId;
 }
 
@@ -632,7 +636,7 @@ export function createApiRouter() {
 
       let emailVerified = 0;
       let phoneVerified = 0;
-      const callerSession = lookupSessionUser(req);
+      const callerSession = await lookupSessionUser(req);
 
       if (firebaseIdToken && cleanEmail) {
         try {
@@ -655,8 +659,8 @@ export function createApiRouter() {
         phoneVerified = 1;
       }
 
-      const existingEmailCount = cleanEmail ? countAccountsByEmail(cleanEmail) : 0;
-      const existingPhoneCount = phoneE164 ? countAccountsByPhone(phoneE164) : 0;
+      const existingEmailCount = cleanEmail ? await countAccountsByEmail(cleanEmail) : 0;
+      const existingPhoneCount = phoneE164 ? await countAccountsByPhone(phoneE164) : 0;
 
       if (existingEmailCount > 0 && cleanEmail) {
         if (existingEmailCount >= MAX_ACCOUNTS_PER_CONTACT) {
@@ -670,9 +674,9 @@ export function createApiRouter() {
           callerSession.user.email?.toLowerCase() === cleanEmail &&
           callerSession.user.email_verified === 1,
         );
-        const existingEmailRows = db
+        const existingEmailRows = (await db
           .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?)")
-          .all(cleanEmail) as DbUser[];
+          .all(cleanEmail)) as DbUser[];
         const anyVerifiedEmailRow = existingEmailRows.some((u) => u.email_verified === 1);
         const passwordMatchesExisting = Boolean(
           linkToExisting &&
@@ -705,9 +709,9 @@ export function createApiRouter() {
           callerSession.user.phone_e164 === phoneE164 &&
           callerSession.user.phone_verified === 1,
         );
-        const existingPhoneRows = db
+        const existingPhoneRows = (await db
           .prepare("SELECT * FROM users WHERE phone_e164 = ?")
-          .all(phoneE164) as DbUser[];
+          .all(phoneE164)) as DbUser[];
         const anyVerifiedPhoneRow = existingPhoneRows.some((u) => u.phone_verified === 1);
         const passwordMatchesExisting = Boolean(
           linkToExisting &&
@@ -738,7 +742,7 @@ export function createApiRouter() {
           });
           return;
         }
-        const existingHandle = db
+        const existingHandle = await db
           .prepare("SELECT id FROM users WHERE LOWER(display_handle) = LOWER(?) LIMIT 1")
           .get(normalized);
         if (existingHandle) {
@@ -749,43 +753,45 @@ export function createApiRouter() {
         }
         finalHandle = normalized;
       } else {
-        finalHandle = makeUniqueHandle(name);
+        finalHandle = await makeUniqueHandle(name);
       }
 
       const userId = `u_${crypto.randomUUID()}`;
       const now = new Date().toISOString();
-      const avatarMediaId = saveAvatarDataUrl(userId, avatarDataUrl);
+      const avatarMediaId = await saveAvatarDataUrl(userId, avatarDataUrl);
       const role =
         emailVerified === 1 && cleanEmail && getAdminEmailSet().has(cleanEmail) ? "admin" : "user";
 
-      db.prepare(
-        `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at)
+      await db
+        .prepare(
+          `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'instagram', ?, ?)`,
-      ).run(
-        userId,
-        cleanEmail,
-        emailVerified,
-        phoneE164,
-        phoneVerified,
-        role,
-        name,
-        finalHandle,
-        String(bio).trim().slice(0, 200),
-        avatarMediaId,
-        hashPassword(pwd),
-        now,
-        now,
-      );
+        )
+        .run(
+          userId,
+          cleanEmail,
+          emailVerified,
+          phoneE164,
+          phoneVerified,
+          role,
+          name,
+          finalHandle,
+          String(bio).trim().slice(0, 200),
+          avatarMediaId,
+          hashPassword(pwd),
+          now,
+          now,
+        );
 
-      createNfcTokenForUser(userId);
-      const token = issueSession(userId, req, res);
-      const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as DbUser;
+      await createNfcTokenForUser(userId);
+      const token = await issueSession(userId, req, res);
+      const user = (await db.prepare("SELECT * FROM users WHERE id = ?").get(userId)) as DbUser;
 
-      broadcastEvent("user:registered", { user: toPublicUser(user, true) }, user.id);
+      broadcastEvent("user:registered", { user: await toPublicUser(user, true) }, user.id);
 
       res.status(201).json({
         token,
-        user: toSelfUser(user),
+        user: await toSelfUser(user),
       });
     } catch (err) {
       console.error("register error", err);
@@ -794,7 +800,7 @@ export function createApiRouter() {
   });
 
   // Login using explicit mode: phone | gmail | username | auto + password
-  router.post("/auth/login", (req, res) => {
+  router.post("/auth/login", async (req, res) => {
     const {
       mode = "auto",
       identifier,
@@ -843,7 +849,7 @@ export function createApiRouter() {
     }
 
     const rateKey = `login:${getClientIp(req)}:${chosenMode}:${rawIdentifier.toLowerCase()}`;
-    const limit = checkRateLimit(rateKey);
+    const limit = await checkRateLimit(rateKey);
     if (!limit.allowed) {
       res.status(429).json({
         error: `Too many failed sign-in attempts. Please wait ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s).`,
@@ -851,7 +857,7 @@ export function createApiRouter() {
       return;
     }
 
-    const { error: formatError, candidates } = findCandidatesByMode(
+    const { error: formatError, candidates } = await findCandidatesByMode(
       chosenMode,
       rawIdentifier,
       countryCode ?? "+91",
@@ -869,7 +875,7 @@ export function createApiRouter() {
     const matched = scopedCandidates.filter((u) => verifyPassword(pwd, u.password_hash));
 
     if (matched.length === 0) {
-      const failRes = recordRateLimitFailure(rateKey, 10, 15 * 60 * 1000, 15 * 60 * 1000);
+      const failRes = await recordRateLimitFailure(rateKey, 10, 15 * 60 * 1000, 15 * 60 * 1000);
       if (failRes.locked) {
         res.status(429).json({
           error: "Too many failed sign-in attempts. Please wait 15 minutes and try again.",
@@ -880,7 +886,7 @@ export function createApiRouter() {
       return;
     }
 
-    clearRateLimit(rateKey);
+    await clearRateLimit(rateKey);
 
     // If multiple sibling accounts share the same verified contact AND password, ask caller which handle to open
     if (matched.length > 1) {
@@ -899,30 +905,31 @@ export function createApiRouter() {
     }
 
     const user = matched[0]!;
-    const existingNfc = db
+    const existingNfc = await db
       .prepare("SELECT id FROM nfc_links WHERE user_id = ? LIMIT 1")
       .get(user.id);
     if (!existingNfc) {
-      createNfcTokenForUser(user.id);
+      await createNfcTokenForUser(user.id);
     }
 
     const now = new Date().toISOString();
-    db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, user.id);
-    const token = issueSession(user.id, req, res);
+    await db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, user.id);
+    const token = await issueSession(user.id, req, res);
 
     res.json({
       token,
-      user: toSelfUser({ ...user, last_active_at: now }),
+      user: await toSelfUser({ ...user, last_active_at: now }),
     });
   });
 
   // List linked accounts sharing the signed-in user's verified email or verified phone (max 3 per contact)
-  router.get("/auth/linked-accounts", requireAuth, (req: AuthedRequest, res) => {
+  router.get("/auth/linked-accounts", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
-    const siblings = getLinkedSiblingAccounts(me);
-    const emailCount = me.email && me.email_verified === 1 ? countAccountsByEmail(me.email) : 0;
+    const siblings = await getLinkedSiblingAccounts(me);
+    const emailCount =
+      me.email && me.email_verified === 1 ? await countAccountsByEmail(me.email) : 0;
     const phoneCount =
-      me.phone_e164 && me.phone_verified === 1 ? countAccountsByPhone(me.phone_e164) : 0;
+      me.phone_e164 && me.phone_verified === 1 ? await countAccountsByPhone(me.phone_e164) : 0;
 
     res.json({
       maxAccounts: MAX_ACCOUNTS_PER_CONTACT,
@@ -953,7 +960,7 @@ export function createApiRouter() {
   });
 
   // Create an additional linked account sharing the signed-in user's verified Gmail or verified phone (max 3)
-  router.post("/auth/linked-accounts/create", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/auth/linked-accounts/create", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const {
       fullName,
@@ -1002,13 +1009,13 @@ export function createApiRouter() {
       if (hasVerifiedPhone && me.phone_e164) attachPhone = me.phone_e164;
     }
 
-    if (attachEmail && countAccountsByEmail(attachEmail) >= MAX_ACCOUNTS_PER_CONTACT) {
+    if (attachEmail && (await countAccountsByEmail(attachEmail)) >= MAX_ACCOUNTS_PER_CONTACT) {
       res.status(409).json({
         error: `Maximum limit of ${MAX_ACCOUNTS_PER_CONTACT} accounts reached for ${attachEmail}.`,
       });
       return;
     }
-    if (attachPhone && countAccountsByPhone(attachPhone) >= MAX_ACCOUNTS_PER_CONTACT) {
+    if (attachPhone && (await countAccountsByPhone(attachPhone)) >= MAX_ACCOUNTS_PER_CONTACT) {
       res.status(409).json({
         error: `Maximum limit of ${MAX_ACCOUNTS_PER_CONTACT} accounts reached for your verified phone number.`,
       });
@@ -1037,7 +1044,7 @@ export function createApiRouter() {
         });
         return;
       }
-      const conflict = db
+      const conflict = await db
         .prepare("SELECT id FROM users WHERE LOWER(display_handle) = LOWER(?) LIMIT 1")
         .get(normalized);
       if (conflict) {
@@ -1046,12 +1053,12 @@ export function createApiRouter() {
       }
       finalHandle = normalized;
     } else {
-      finalHandle = makeUniqueHandle(name);
+      finalHandle = await makeUniqueHandle(name);
     }
 
     const userId = `u_${crypto.randomUUID()}`;
     const now = new Date().toISOString();
-    const avatarMediaId = saveAvatarDataUrl(userId, avatarDataUrl);
+    const avatarMediaId = await saveAvatarDataUrl(userId, avatarDataUrl);
     const emailVerified = attachEmail ? 1 : 0;
     const phoneVerified = attachPhone ? 1 : 0;
     const role =
@@ -1059,46 +1066,54 @@ export function createApiRouter() {
         ? "admin"
         : "user";
 
-    db.prepare(
-      `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at)
+    await db
+      .prepare(
+        `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, password_hash, theme, created_at, last_active_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'instagram', ?, ?)`,
-    ).run(
-      userId,
-      attachEmail,
-      emailVerified,
-      attachPhone,
-      phoneVerified,
-      role,
-      name,
-      finalHandle,
-      String(bio).trim().slice(0, 200),
-      avatarMediaId,
-      hashPassword(pwd),
-      now,
-      now,
+      )
+      .run(
+        userId,
+        attachEmail,
+        emailVerified,
+        attachPhone,
+        phoneVerified,
+        role,
+        name,
+        finalHandle,
+        String(bio).trim().slice(0, 200),
+        avatarMediaId,
+        hashPassword(pwd),
+        now,
+        now,
+      );
+
+    await createNfcTokenForUser(userId);
+    const createdUser = (await db
+      .prepare("SELECT * FROM users WHERE id = ?")
+      .get(userId)) as DbUser;
+    broadcastEvent(
+      "user:registered",
+      { user: await toPublicUser(createdUser, true) },
+      createdUser.id,
     );
 
-    createNfcTokenForUser(userId);
-    const createdUser = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as DbUser;
-    broadcastEvent("user:registered", { user: toPublicUser(createdUser, true) }, createdUser.id);
-
-    const token = switchToNew ? issueSession(createdUser.id, req, res) : null;
+    const token = switchToNew ? await issueSession(createdUser.id, req, res) : null;
     res.status(201).json({
       token,
       switched: Boolean(switchToNew),
-      user: toSelfUser(createdUser),
+      user: await toSelfUser(createdUser),
     });
   });
 
   // Switch instantaneously between linked sibling accounts sharing a verified email or phone
-  router.post("/auth/switch-account", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/auth/switch-account", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const targetUserId = String((req.body as { targetUserId?: string })?.targetUserId ?? "").trim();
     if (!targetUserId) {
       res.status(400).json({ error: "Target account ID is required." });
       return;
     }
-    const siblings = getLinkedSiblingAccounts(me);
+    const siblings = await getLinkedSiblingAccounts(me);
     const target = siblings.find((u) => u.id === targetUserId);
     if (!target) {
       res
@@ -1107,20 +1122,20 @@ export function createApiRouter() {
       return;
     }
 
-    const existingNfc = db
+    const existingNfc = await db
       .prepare("SELECT id FROM nfc_links WHERE user_id = ? LIMIT 1")
       .get(target.id);
     if (!existingNfc) {
-      createNfcTokenForUser(target.id);
+      await createNfcTokenForUser(target.id);
     }
 
     const now = new Date().toISOString();
-    db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, target.id);
-    const token = issueSession(target.id, req, res);
+    await db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, target.id);
+    const token = await issueSession(target.id, req, res);
 
     res.json({
       token,
-      user: toSelfUser({ ...target, last_active_at: now }),
+      user: await toSelfUser({ ...target, last_active_at: now }),
     });
   });
 
@@ -1144,11 +1159,13 @@ export function createApiRouter() {
         return;
       }
       const nextRole = isAdminUser(me) || getAdminEmailSet().has(decodedEmail) ? "admin" : me.role;
-      db.prepare(
-        "UPDATE users SET email = COALESCE(email, ?), email_verified = 1, role = ? WHERE id = ?",
-      ).run(decodedEmail, nextRole, me.id);
-      const updated = db.prepare("SELECT * FROM users WHERE id = ?").get(me.id) as DbUser;
-      res.json({ ok: true, user: toSelfUser(updated) });
+      await db
+        .prepare(
+          "UPDATE users SET email = COALESCE(email, ?), email_verified = 1, role = ? WHERE id = ?",
+        )
+        .run(decodedEmail, nextRole, me.id);
+      const updated = (await db.prepare("SELECT * FROM users WHERE id = ?").get(me.id)) as DbUser;
+      res.json({ ok: true, user: await toSelfUser(updated) });
     } catch {
       res.status(401).json({ error: "Invalid Firebase verification token." });
     }
@@ -1194,22 +1211,22 @@ export function createApiRouter() {
       let user: DbUser | undefined;
 
       if (body.targetUserId && decodedEmail && fbEmailVerified) {
-        user = db
+        user = (await db
           .prepare("SELECT * FROM users WHERE id = ? AND LOWER(email) = LOWER(?) LIMIT 1")
-          .get(body.targetUserId, decodedEmail) as DbUser | undefined;
+          .get(body.targetUserId, decodedEmail)) as DbUser | undefined;
       }
 
       if (!user) {
-        user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(fbUserId) as
+        user = (await db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(fbUserId)) as
           DbUser | undefined;
       }
 
       if (!user && decodedEmail) {
-        user = db
+        user = (await db
           .prepare(
             "SELECT * FROM users WHERE LOWER(email) = LOWER(?) ORDER BY created_at ASC LIMIT 1",
           )
-          .get(decodedEmail) as DbUser | undefined;
+          .get(decodedEmail)) as DbUser | undefined;
       }
 
       let created = false;
@@ -1229,14 +1246,14 @@ export function createApiRouter() {
         if (body.username) {
           const candidate = normalizeHandle(body.username);
           if (candidate) {
-            const exists = db
+            const exists = await db
               .prepare("SELECT id FROM users WHERE LOWER(display_handle) = LOWER(?) LIMIT 1")
               .get(candidate);
             if (!exists) finalHandle = candidate;
           }
         }
         if (!finalHandle) {
-          finalHandle = makeUniqueHandle(fullName);
+          finalHandle = await makeUniqueHandle(fullName);
         }
 
         const bio = String(body.bio ?? "")
@@ -1248,29 +1265,31 @@ export function createApiRouter() {
             ? "admin"
             : "user";
 
-        db.prepare(
-          `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, avatar_external_url, password_hash, theme, created_at, last_active_at)
+        await db
+          .prepare(
+            `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, avatar_external_url, password_hash, theme, created_at, last_active_at)
            VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, NULL, ?, ?, 'instagram', ?, ?)`,
-        ).run(
-          fbUserId,
-          decodedEmail,
-          fbEmailVerified ? 1 : 0,
-          role,
-          fullName,
-          finalHandle,
-          bio,
-          externalAvatar,
-          hashPassword(crypto.randomBytes(24).toString("hex")),
-          now,
-          now,
-        );
+          )
+          .run(
+            fbUserId,
+            decodedEmail,
+            fbEmailVerified ? 1 : 0,
+            role,
+            fullName,
+            finalHandle,
+            bio,
+            externalAvatar,
+            hashPassword(crypto.randomBytes(24).toString("hex")),
+            now,
+            now,
+          );
 
         // Preserve any legacy firebase_nfc_links token for continuity, or create a fresh one
-        const legacyNfc = db
+        const legacyNfc = (await db
           .prepare(
             "SELECT token_ciphertext, token_hash, revoked, version, created_at, updated_at FROM firebase_nfc_links WHERE uid = ? LIMIT 1",
           )
-          .get(fbUid) as
+          .get(fbUid)) as
           | {
               token_ciphertext: string | null;
               token_hash: string | null;
@@ -1287,46 +1306,54 @@ export function createApiRouter() {
           legacyNfc.token_ciphertext &&
           legacyNfc.token_hash
         ) {
-          db.prepare(
-            "INSERT OR IGNORE INTO nfc_links (id, user_id, token_ciphertext, token_hash, revoked, version, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
-          ).run(
-            `nfc_${crypto.randomUUID()}`,
-            fbUserId,
-            legacyNfc.token_ciphertext,
-            legacyNfc.token_hash,
-            legacyNfc.version,
-            legacyNfc.created_at,
-            now,
-          );
+          await db
+            .prepare(
+              "INSERT INTO nfc_links (id, user_id, token_ciphertext, token_hash, revoked, version, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?) ON CONFLICT DO NOTHING",
+            )
+            .run(
+              `nfc_${crypto.randomUUID()}`,
+              fbUserId,
+              legacyNfc.token_ciphertext,
+              legacyNfc.token_hash,
+              legacyNfc.version,
+              legacyNfc.created_at,
+              now,
+            );
         } else {
-          createNfcTokenForUser(fbUserId);
+          await createNfcTokenForUser(fbUserId);
         }
 
-        user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(fbUserId) as DbUser;
-        broadcastEvent("user:registered", { user: toPublicUser(user, true) }, user.id);
+        user = (await db
+          .prepare("SELECT * FROM users WHERE id = ? LIMIT 1")
+          .get(fbUserId)) as DbUser;
+        broadcastEvent("user:registered", { user: await toPublicUser(user, true) }, user.id);
       } else {
         const nextEmailVerified = fbEmailVerified ? 1 : user.email_verified;
         const nextRole =
           fbEmailVerified && decodedEmail && getAdminEmailSet().has(decodedEmail)
             ? "admin"
             : user.role;
-        db.prepare(
-          "UPDATE users SET last_active_at = ?, avatar_external_url = COALESCE(avatar_external_url, ?), email_verified = ?, role = ? WHERE id = ?",
-        ).run(now, externalAvatar, nextEmailVerified, nextRole, user.id);
-        const existingNfc = db
+        await db
+          .prepare(
+            "UPDATE users SET last_active_at = ?, avatar_external_url = COALESCE(avatar_external_url, ?), email_verified = ?, role = ? WHERE id = ?",
+          )
+          .run(now, externalAvatar, nextEmailVerified, nextRole, user.id);
+        const existingNfc = await db
           .prepare("SELECT id FROM nfc_links WHERE user_id = ? LIMIT 1")
           .get(user.id);
         if (!existingNfc) {
-          createNfcTokenForUser(user.id);
+          await createNfcTokenForUser(user.id);
         }
-        user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(user.id) as DbUser;
+        user = (await db
+          .prepare("SELECT * FROM users WHERE id = ? LIMIT 1")
+          .get(user.id)) as DbUser;
       }
 
-      const token = issueSession(user.id, req, res);
+      const token = await issueSession(user.id, req, res);
       res.status(created ? 201 : 200).json({
         token,
         created,
-        user: toSelfUser(user),
+        user: await toSelfUser(user),
       });
     } catch (err) {
       console.error("firebase-session error:", err);
@@ -1364,10 +1391,10 @@ export function createApiRouter() {
     }
   });
 
-  router.post("/auth/logout", (req: AuthedRequest, res) => {
+  router.post("/auth/logout", async (req: AuthedRequest, res) => {
     const token = extractToken(req);
     if (token) {
-      db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(sha256(token));
+      await db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(sha256(token));
     }
     res.clearCookie("rc_session", { path: "/" });
     res.clearCookie("rc_fb_session", { path: "/" });
@@ -1384,7 +1411,7 @@ export function createApiRouter() {
     };
 
     const rateKey = `delete:${me.id}:${getClientIp(req)}`;
-    const limit = checkRateLimit(rateKey);
+    const limit = await checkRateLimit(rateKey);
     if (!limit.allowed) {
       res.status(429).json({
         error: `Too many failed deletion attempts. Wait ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s).`,
@@ -1416,7 +1443,7 @@ export function createApiRouter() {
     }
 
     if (!reauthenticated) {
-      const failRes = recordRateLimitFailure(rateKey, 5, 15 * 60 * 1000, 15 * 60 * 1000);
+      const failRes = await recordRateLimitFailure(rateKey, 5, 15 * 60 * 1000, 15 * 60 * 1000);
       if (failRes.locked) {
         res.status(429).json({
           error: "Too many failed deletion attempts. Try again in 15 minutes.",
@@ -1433,7 +1460,7 @@ export function createApiRouter() {
     const expectedKey = process.env["ACCOUNT_DELETE_KEY"]?.trim() || "2233";
     const suppliedKey = typeof securityKey === "string" ? securityKey.trim() : "";
     if (!suppliedKey || !timingSafeEqualStrings(suppliedKey, expectedKey)) {
-      const failRes = recordRateLimitFailure(rateKey, 5, 15 * 60 * 1000, 15 * 60 * 1000);
+      const failRes = await recordRateLimitFailure(rateKey, 5, 15 * 60 * 1000, 15 * 60 * 1000);
       if (failRes.locked) {
         res.status(429).json({
           error: "Too many failed security key attempts. Wait 15 minutes before retrying.",
@@ -1444,25 +1471,14 @@ export function createApiRouter() {
       return;
     }
 
-    clearRateLimit(rateKey);
+    await clearRateLimit(rateKey);
 
-    const mediaRows = db
+    const mediaRows = (await db
       .prepare("SELECT file_path FROM media_objects WHERE owner_id = ?")
-      .all(me.id) as { file_path: string }[];
+      .all(me.id)) as { file_path: string }[];
 
-    db.prepare("DELETE FROM users WHERE id = ?").run(me.id);
-
-    const resolvedMediaDir = path.resolve(mediaDir);
-    for (const m of mediaRows) {
-      if (!m.file_path) continue;
-      const diskPath = path.resolve(resolvedMediaDir, m.file_path);
-      if (!diskPath.startsWith(resolvedMediaDir + path.sep)) continue;
-      try {
-        if (fs.existsSync(diskPath)) fs.unlinkSync(diskPath);
-      } catch {
-        /* ignore file cleanup errors */
-      }
-    }
+    await Promise.all(mediaRows.map((media) => deleteMediaStorage(media.file_path)));
+    await db.prepare("DELETE FROM users WHERE id = ?").run(me.id);
 
     res.clearCookie("rc_session", { path: "/" });
     res.clearCookie("rc_fb_session", { path: "/" });
@@ -1470,32 +1486,32 @@ export function createApiRouter() {
     res.json({ ok: true, deletedUserId: me.id });
   });
 
-  router.get("/auth/session", (req, res) => {
-    const resolved = lookupSessionUser(req);
+  router.get("/auth/session", async (req, res) => {
+    const resolved = await lookupSessionUser(req);
     if (!resolved) {
       res.json({ authenticated: false, user: null });
       return;
     }
     const { user } = resolved;
     const now = new Date().toISOString();
-    db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, user.id);
+    await db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, user.id);
     res.json({
       authenticated: true,
-      user: toSelfUser({ ...user, last_active_at: now }),
+      user: await toSelfUser({ ...user, last_active_at: now }),
     });
   });
 
-  router.get("/auth/me", (req, res) => {
-    const resolved = lookupSessionUser(req);
+  router.get("/auth/me", async (req, res) => {
+    const resolved = await lookupSessionUser(req);
     if (!resolved) {
       res.status(401).json({ error: "Not signed in." });
       return;
     }
     const { user } = resolved;
     const now = new Date().toISOString();
-    db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, user.id);
+    await db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, user.id);
     res.json({
-      user: toSelfUser({ ...user, last_active_at: now }),
+      user: await toSelfUser({ ...user, last_active_at: now }),
     });
   });
 
@@ -1518,7 +1534,7 @@ export function createApiRouter() {
     }
 
     if (purpose === "reset_password") {
-      const existing = db
+      const existing = await db
         .prepare("SELECT id FROM users WHERE phone_e164 = ? LIMIT 1")
         .get(phoneE164);
       if (!existing) {
@@ -1528,9 +1544,9 @@ export function createApiRouter() {
     }
 
     const recentWindow = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-    const recentCount = db
+    const recentCount = (await db
       .prepare("SELECT COUNT(*) AS cnt FROM otp_challenges WHERE phone_e164 = ? AND created_at > ?")
-      .get(phoneE164, recentWindow) as { cnt: number };
+      .get(phoneE164, recentWindow)) as { cnt: number };
 
     if (recentCount.cnt >= 5) {
       res.status(429).json({ error: "Too many OTP requests. Please wait 15 minutes." });
@@ -1544,15 +1560,17 @@ export function createApiRouter() {
     }
 
     const now = new Date();
-    db.prepare(
-      "INSERT INTO otp_challenges (id, phone_e164, purpose, created_at, expires_at, attempts, consumed) VALUES (?, ?, ?, ?, ?, 0, 0)",
-    ).run(
-      `otp_${crypto.randomUUID()}`,
-      phoneE164,
-      purpose,
-      now.toISOString(),
-      new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
-    );
+    await db
+      .prepare(
+        "INSERT INTO otp_challenges (id, phone_e164, purpose, created_at, expires_at, attempts, consumed) VALUES (?, ?, ?, ?, ?, 0, 0)",
+      )
+      .run(
+        `otp_${crypto.randomUUID()}`,
+        phoneE164,
+        purpose,
+        now.toISOString(),
+        new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
+      );
 
     res.json({ ok: true, phoneMasked: maskPhone(phoneE164) });
   });
@@ -1579,9 +1597,9 @@ export function createApiRouter() {
       return;
     }
 
-    const users = db
+    const users = (await db
       .prepare("SELECT * FROM users WHERE phone_e164 = ? ORDER BY created_at ASC")
-      .all(phoneE164) as DbUser[];
+      .all(phoneE164)) as DbUser[];
     if (users.length === 0) {
       res.status(404).json({ error: "No account found for that phone number." });
       return;
@@ -1599,11 +1617,10 @@ export function createApiRouter() {
       return;
     }
 
-    db.prepare("UPDATE users SET password_hash = ?, phone_verified = 1 WHERE id = ?").run(
-      hashPassword(pwd),
-      target.id,
-    );
-    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
+    await db
+      .prepare("UPDATE users SET password_hash = ?, phone_verified = 1 WHERE id = ?")
+      .run(hashPassword(pwd), target.id);
+    await db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
 
     res.json({ ok: true, updatedHandle: target.display_handle });
   });
@@ -1625,11 +1642,11 @@ export function createApiRouter() {
     }
 
     const recentWindow = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-    const recentCount = db
+    const recentCount = (await db
       .prepare(
         "SELECT COUNT(*) AS cnt FROM email_otp_challenges WHERE LOWER(email) = LOWER(?) AND created_at > ?",
       )
-      .get(cleanEmail, recentWindow) as { cnt: number };
+      .get(cleanEmail, recentWindow)) as { cnt: number };
     if (recentCount.cnt >= 5) {
       res.status(429).json({ error: "Too many reset requests. Please wait 15 minutes." });
       return;
@@ -1637,17 +1654,19 @@ export function createApiRouter() {
 
     const code = String(crypto.randomInt(100000, 1000000));
     const now = new Date();
-    db.prepare(
-      "INSERT INTO email_otp_challenges (id, email, code_hash, purpose, user_id, created_at, expires_at, attempts, consumed) VALUES (?, ?, ?, 'reset_password', NULL, ?, ?, 0, 0)",
-    ).run(
-      `eotp_${crypto.randomUUID()}`,
-      cleanEmail,
-      sha256(code),
-      now.toISOString(),
-      new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
-    );
+    await db
+      .prepare(
+        "INSERT INTO email_otp_challenges (id, email, code_hash, purpose, user_id, created_at, expires_at, attempts, consumed) VALUES (?, ?, ?, 'reset_password', NULL, ?, ?, 0, 0)",
+      )
+      .run(
+        `eotp_${crypto.randomUUID()}`,
+        cleanEmail,
+        sha256(code),
+        now.toISOString(),
+        new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
+      );
 
-    const existing = db
+    const existing = await db
       .prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1")
       .get(cleanEmail);
     if (existing) {
@@ -1669,7 +1688,7 @@ export function createApiRouter() {
     res.json({ ok: true, mode: "email_otp" });
   });
 
-  router.post("/auth/forgot-password/email/confirm", (req, res) => {
+  router.post("/auth/forgot-password/email/confirm", async (req, res) => {
     const { email, code, newPassword, username } = req.body as {
       email?: string;
       code?: string;
@@ -1687,27 +1706,27 @@ export function createApiRouter() {
       return;
     }
     const nowIso = new Date().toISOString();
-    const challenge = db
+    const challenge = (await db
       .prepare(
         "SELECT * FROM email_otp_challenges WHERE LOWER(email) = LOWER(?) AND consumed = 0 AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
       )
-      .get(cleanEmail, nowIso) as { id: string; code_hash: string; attempts: number } | undefined;
+      .get(cleanEmail, nowIso)) as { id: string; code_hash: string; attempts: number } | undefined;
 
     if (!challenge || challenge.attempts >= 5) {
       res.status(400).json({ error: "Invalid or expired verification code." });
       return;
     }
-    db.prepare("UPDATE email_otp_challenges SET attempts = attempts + 1 WHERE id = ?").run(
-      challenge.id,
-    );
+    await db
+      .prepare("UPDATE email_otp_challenges SET attempts = attempts + 1 WHERE id = ?")
+      .run(challenge.id);
     if (!timingSafeEqualStrings(sha256(String(code ?? "").trim()), challenge.code_hash)) {
       res.status(400).json({ error: "Invalid verification code." });
       return;
     }
 
-    const candidates = db
+    const candidates = (await db
       .prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?) ORDER BY created_at ASC")
-      .all(cleanEmail) as DbUser[];
+      .all(cleanEmail)) as DbUser[];
     let target = candidates[0];
     if (username) {
       const h = normalizeHandle(username);
@@ -1721,12 +1740,11 @@ export function createApiRouter() {
       return;
     }
 
-    db.prepare("UPDATE email_otp_challenges SET consumed = 1 WHERE id = ?").run(challenge.id);
-    db.prepare("UPDATE users SET password_hash = ?, email_verified = 1 WHERE id = ?").run(
-      hashPassword(pwd),
-      target.id,
-    );
-    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
+    await db.prepare("UPDATE email_otp_challenges SET consumed = 1 WHERE id = ?").run(challenge.id);
+    await db
+      .prepare("UPDATE users SET password_hash = ?, email_verified = 1 WHERE id = ?")
+      .run(hashPassword(pwd), target.id);
+    await db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
     res.json({ ok: true, updatedHandle: target.display_handle });
   });
 
@@ -1743,7 +1761,7 @@ export function createApiRouter() {
       res.status(400).json({ error: check.error, needsConfig: !getTwilioConfig().configured });
       return;
     }
-    db.prepare("UPDATE users SET phone_verified = 1 WHERE id = ?").run(user.id);
+    await db.prepare("UPDATE users SET phone_verified = 1 WHERE id = ?").run(user.id);
     res.json({ ok: true, phoneVerified: true });
   });
 
@@ -1782,15 +1800,14 @@ export function createApiRouter() {
       res.status(400).json({ error: "New password must be at least 8 characters." });
       return;
     }
-    db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(
-      hashPassword(nextPwd),
-      user.id,
-    );
+    await db
+      .prepare("UPDATE users SET password_hash = ? WHERE id = ?")
+      .run(hashPassword(nextPwd), user.id);
     res.json({ ok: true });
   });
 
   // Update profile details
-  router.patch("/profile", requireAuth, (req: AuthedRequest, res) => {
+  router.patch("/profile", requireAuth, async (req: AuthedRequest, res) => {
     const user = req.authUser!;
     const { fullName, bio, displayHandle } = req.body as {
       fullName?: string;
@@ -1811,7 +1828,7 @@ export function createApiRouter() {
         res.status(400).json({ error: "Username must be at least 2 characters." });
         return;
       }
-      const conflict = db
+      const conflict = await db
         .prepare("SELECT id FROM users WHERE LOWER(display_handle) = LOWER(?) AND id != ? LIMIT 1")
         .get(normalized, user.id);
       if (conflict) {
@@ -1821,70 +1838,75 @@ export function createApiRouter() {
       nextHandle = normalized;
     }
 
-    db.prepare("UPDATE users SET full_name = ?, bio = ?, display_handle = ? WHERE id = ?").run(
-      nextName,
-      nextBio,
-      nextHandle,
-      user.id,
-    );
+    await db
+      .prepare("UPDATE users SET full_name = ?, bio = ?, display_handle = ? WHERE id = ?")
+      .run(nextName, nextBio, nextHandle, user.id);
 
-    const updated = db.prepare("SELECT * FROM users WHERE id = ?").get(user.id) as DbUser;
+    const updated = (await db.prepare("SELECT * FROM users WHERE id = ?").get(user.id)) as DbUser;
     res.json({
-      user: toSelfUser(updated),
+      user: await toSelfUser(updated),
     });
   });
 
-  router.patch("/profile/theme", requireAuth, (req: AuthedRequest, res) => {
+  router.patch("/profile/theme", requireAuth, async (req: AuthedRequest, res) => {
     const user = req.authUser!;
     const { theme } = req.body as { theme?: string };
     if (theme !== "instagram" && theme !== "emerald" && theme !== "dark") {
       res.status(400).json({ error: "Theme must be instagram, emerald, or dark." });
       return;
     }
-    db.prepare("UPDATE users SET theme = ? WHERE id = ?").run(theme as SecretTheme, user.id);
+    await db.prepare("UPDATE users SET theme = ? WHERE id = ?").run(theme as SecretTheme, user.id);
     res.json({ ok: true, theme });
   });
 
-  router.post("/profile/avatar", requireAuth, upload.single("file"), (req: AuthedRequest, res) => {
-    const user = req.authUser!;
-    const file = req.file;
-    if (!file) {
-      res.status(400).json({ error: "No image file provided." });
-      return;
-    }
-    if (!file.mimetype.startsWith("image/")) {
-      fs.unlinkSync(file.path);
-      res.status(400).json({ error: "Avatar must be an image file." });
-      return;
-    }
+  router.post(
+    "/profile/avatar",
+    requireAuth,
+    upload.single("file"),
+    async (req: AuthedRequest, res) => {
+      const user = req.authUser!;
+      const file = req.file;
+      if (!file) {
+        res.status(400).json({ error: "No image file provided." });
+        return;
+      }
+      if (!file.mimetype.startsWith("image/")) {
+        res.status(400).json({ error: "Avatar must be an image file." });
+        return;
+      }
 
-    const mediaId = `med_${crypto.randomUUID()}`;
-    const now = new Date().toISOString();
-    db.prepare(
-      "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, NULL, 'image', ?, ?, ?, ?, 1, ?)",
-    ).run(
-      mediaId,
-      user.id,
-      file.mimetype,
-      file.originalname || "avatar.jpg",
-      file.filename,
-      file.size,
-      now,
-    );
+      const mediaId = `med_${crypto.randomUUID()}`;
+      const storageKey = `avatars/${user.id}/${mediaId}`;
+      const now = new Date().toISOString();
+      await uploadMediaStorage(storageKey, file.buffer, file.mimetype);
+      await db
+        .prepare(
+          "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, NULL, 'image', ?, ?, ?, ?, 1, ?)",
+        )
+        .run(
+          mediaId,
+          user.id,
+          file.mimetype,
+          file.originalname || "avatar.jpg",
+          storageKey,
+          file.size,
+          now,
+        );
 
-    db.prepare("UPDATE users SET avatar_media_id = ? WHERE id = ?").run(mediaId, user.id);
-    const updated = db.prepare("SELECT * FROM users WHERE id = ?").get(user.id) as DbUser;
-    res.json({
-      user: toSelfUser(updated),
-    });
-  });
+      await db.prepare("UPDATE users SET avatar_media_id = ? WHERE id = ?").run(mediaId, user.id);
+      const updated = (await db.prepare("SELECT * FROM users WHERE id = ?").get(user.id)) as DbUser;
+      res.json({
+        user: await toSelfUser(updated),
+      });
+    },
+  );
 
   // Personal NFC Card & Secret Link Management (supports SQLite sessions + Firebase users)
   router.get("/nfc", async (req: AuthedRequest, res) => {
-    const resolved = lookupSessionUser(req);
+    const resolved = await lookupSessionUser(req);
     if (resolved) {
       const user = resolved.user;
-      let row = db.prepare("SELECT * FROM nfc_links WHERE user_id = ?").get(user.id) as
+      let row = (await db.prepare("SELECT * FROM nfc_links WHERE user_id = ?").get(user.id)) as
         | {
             token_ciphertext: string | null;
             revoked: number;
@@ -1894,8 +1916,8 @@ export function createApiRouter() {
         | undefined;
 
       if (!row) {
-        createNfcTokenForUser(user.id);
-        row = db.prepare("SELECT * FROM nfc_links WHERE user_id = ?").get(user.id) as {
+        await createNfcTokenForUser(user.id);
+        row = (await db.prepare("SELECT * FROM nfc_links WHERE user_id = ?").get(user.id)) as {
           token_ciphertext: string | null;
           revoked: number;
           version: number;
@@ -1925,7 +1947,7 @@ export function createApiRouter() {
     const hintName = String(req.query["fullName"] ?? "").trim();
     const hintHandle = String(req.query["displayHandle"] ?? "").trim();
 
-    let fbRow = db.prepare("SELECT * FROM firebase_nfc_links WHERE uid = ?").get(fbUid) as
+    let fbRow = (await db.prepare("SELECT * FROM firebase_nfc_links WHERE uid = ?").get(fbUid)) as
       | {
           token_ciphertext: string | null;
           revoked: number;
@@ -1935,8 +1957,8 @@ export function createApiRouter() {
       | undefined;
 
     if (!fbRow) {
-      createFirebaseNfcToken(fbUid, hintName || "Reader", hintHandle);
-      fbRow = db.prepare("SELECT * FROM firebase_nfc_links WHERE uid = ?").get(fbUid) as {
+      await createFirebaseNfcToken(fbUid, hintName || "Reader", hintHandle);
+      fbRow = (await db.prepare("SELECT * FROM firebase_nfc_links WHERE uid = ?").get(fbUid)) as {
         token_ciphertext: string | null;
         revoked: number;
         version: number;
@@ -1957,9 +1979,9 @@ export function createApiRouter() {
   });
 
   router.post("/nfc/regenerate", async (req: AuthedRequest, res) => {
-    const resolved = lookupSessionUser(req);
+    const resolved = await lookupSessionUser(req);
     if (resolved) {
-      const { token, version } = createNfcTokenForUser(resolved.user.id);
+      const { token, version } = await createNfcTokenForUser(resolved.user.id);
       res.json({
         revoked: false,
         version,
@@ -1977,7 +1999,7 @@ export function createApiRouter() {
     }
 
     const body = (req.body ?? {}) as { fullName?: string; displayHandle?: string };
-    const { token, version } = createFirebaseNfcToken(
+    const { token, version } = await createFirebaseNfcToken(
       fbUid,
       String(body.fullName ?? "Reader"),
       String(body.displayHandle ?? ""),
@@ -1992,12 +2014,14 @@ export function createApiRouter() {
   });
 
   router.post("/nfc/revoke", async (req: AuthedRequest, res) => {
-    const resolved = lookupSessionUser(req);
+    const resolved = await lookupSessionUser(req);
     const now = new Date().toISOString();
     if (resolved) {
-      db.prepare(
-        "UPDATE nfc_links SET revoked = 1, token_ciphertext = NULL, token_hash = NULL, updated_at = ? WHERE user_id = ?",
-      ).run(now, resolved.user.id);
+      await db
+        .prepare(
+          "UPDATE nfc_links SET revoked = 1, token_ciphertext = NULL, token_hash = NULL, updated_at = ? WHERE user_id = ?",
+        )
+        .run(now, resolved.user.id);
       res.json({ revoked: true, token: null, path: null, updatedAt: now });
       return;
     }
@@ -2008,14 +2032,16 @@ export function createApiRouter() {
       return;
     }
 
-    db.prepare(
-      "UPDATE firebase_nfc_links SET revoked = 1, token_ciphertext = NULL, token_hash = NULL, updated_at = ? WHERE uid = ?",
-    ).run(now, fbUid);
+    await db
+      .prepare(
+        "UPDATE firebase_nfc_links SET revoked = 1, token_ciphertext = NULL, token_hash = NULL, updated_at = ? WHERE uid = ?",
+      )
+      .run(now, fbUid);
     res.json({ revoked: true, token: null, path: null, updatedAt: now });
   });
 
   // Instant login via permanent Personal Link (/nfc/<token>) — verifies cryptographic unrevoked token
-  router.post("/nfc/login", (req, res) => {
+  router.post("/nfc/login", async (req, res) => {
     const token = String((req.body as { token?: string })?.token ?? "").trim();
     if (!token || token.length < 16) {
       res.status(404).json({ status: "invalid", error: "This link is invalid or was revoked." });
@@ -2023,7 +2049,7 @@ export function createApiRouter() {
     }
 
     const tokenHash = sha256(token);
-    const link = db
+    const link = (await db
       .prepare(
         `SELECT n.user_id, u.*
          FROM nfc_links n
@@ -2031,47 +2057,47 @@ export function createApiRouter() {
          WHERE n.token_hash = ? AND n.revoked = 0
          LIMIT 1`,
       )
-      .get(tokenHash) as (DbUser & { user_id: string }) | undefined;
+      .get(tokenHash)) as (DbUser & { user_id: string }) | undefined;
 
     if (link) {
       const now = new Date().toISOString();
-      db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, link.user_id);
-      const sessionToken = issueSession(link.user_id, req, res);
-      const updatedUser = db
+      await db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, link.user_id);
+      const sessionToken = await issueSession(link.user_id, req, res);
+      const updatedUser = (await db
         .prepare("SELECT * FROM users WHERE id = ? LIMIT 1")
-        .get(link.user_id) as DbUser;
+        .get(link.user_id)) as DbUser;
       res.json({
         status: "authorized",
         token: sessionToken,
-        user: toSelfUser(updatedUser),
+        user: await toSelfUser(updatedUser),
       });
       return;
     }
 
-    const fbLink = db
+    const fbLink = (await db
       .prepare(
         `SELECT uid, full_name, display_handle
          FROM firebase_nfc_links
          WHERE token_hash = ? AND revoked = 0
          LIMIT 1`,
       )
-      .get(tokenHash) as { uid: string; full_name: string; display_handle: string } | undefined;
+      .get(tokenHash)) as { uid: string; full_name: string; display_handle: string } | undefined;
 
     if (fbLink) {
-      const fbUser = db
+      const fbUser = (await db
         .prepare("SELECT * FROM users WHERE id = ? OR id = ? LIMIT 1")
-        .get(`fb_${fbLink.uid}`, fbLink.uid) as DbUser | undefined;
+        .get(`fb_${fbLink.uid}`, fbLink.uid)) as DbUser | undefined;
       if (fbUser) {
         const now = new Date().toISOString();
-        db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, fbUser.id);
-        const sessionToken = issueSession(fbUser.id, req, res);
-        const updatedUser = db
+        await db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, fbUser.id);
+        const sessionToken = await issueSession(fbUser.id, req, res);
+        const updatedUser = (await db
           .prepare("SELECT * FROM users WHERE id = ? LIMIT 1")
-          .get(fbUser.id) as DbUser;
+          .get(fbUser.id)) as DbUser;
         res.json({
           status: "authorized",
           token: sessionToken,
-          user: toSelfUser(updatedUser),
+          user: await toSelfUser(updatedUser),
         });
         return;
       }
@@ -2089,10 +2115,10 @@ export function createApiRouter() {
     }
 
     const tokenHash = sha256(token);
-    const resolved = lookupSessionUser(req);
+    const resolved = await lookupSessionUser(req);
     const fbUid = await resolveFirebaseUid(req);
 
-    const link = db
+    const link = (await db
       .prepare(
         `SELECT n.user_id, n.revoked, u.full_name, u.display_handle
          FROM nfc_links n
@@ -2100,7 +2126,7 @@ export function createApiRouter() {
          WHERE n.token_hash = ? AND n.revoked = 0
          LIMIT 1`,
       )
-      .get(tokenHash) as
+      .get(tokenHash)) as
       { user_id: string; revoked: number; full_name: string; display_handle: string } | undefined;
 
     if (link) {
@@ -2127,14 +2153,14 @@ export function createApiRouter() {
       return;
     }
 
-    const fbLink = db
+    const fbLink = (await db
       .prepare(
         `SELECT uid, full_name, display_handle
          FROM firebase_nfc_links
          WHERE token_hash = ? AND revoked = 0
          LIMIT 1`,
       )
-      .get(tokenHash) as { uid: string; full_name: string; display_handle: string } | undefined;
+      .get(tokenHash)) as { uid: string; full_name: string; display_handle: string } | undefined;
 
     if (!fbLink) {
       res.status(404).json({ status: "invalid" });
@@ -2162,7 +2188,7 @@ export function createApiRouter() {
   });
 
   // CONTROL User Search — authenticated directory showing public ID, username, DP, and personal link (no PII)
-  router.get("/control/users", requireAuth, (req: AuthedRequest, res) => {
+  router.get("/control/users", requireAuth, async (req: AuthedRequest, res) => {
     const raw = String(req.query["q"] ?? "")
       .trim()
       .toLowerCase();
@@ -2170,7 +2196,7 @@ export function createApiRouter() {
 
     const rows = (
       raw
-        ? db
+        ? await db
             .prepare(
               `SELECT u.*, n.token_ciphertext, n.revoked
                FROM users u
@@ -2180,7 +2206,7 @@ export function createApiRouter() {
                LIMIT 500`,
             )
             .all(like, like, like)
-        : db
+        : await db
             .prepare(
               `SELECT u.*, n.token_ciphertext, n.revoked
                FROM users u
@@ -2191,34 +2217,35 @@ export function createApiRouter() {
             .all()
     ) as (DbUser & { token_ciphertext: string | null; revoked: number | null })[];
 
-    const users = rows.map((u) => {
-      let nfcToken: string | null = null;
-      if (u.revoked === 0 && u.token_ciphertext) {
-        nfcToken = decryptToken(u.token_ciphertext);
-      }
-      if (!nfcToken && u.revoked !== 1) {
-        nfcToken = createNfcTokenForUser(u.id).token;
-      }
-      return {
-        id: u.id,
-        fullName: u.full_name,
-        displayHandle: u.display_handle,
-        bio: u.bio,
-        avatarUrl: u.avatar_media_id
-          ? `/api/media/${u.avatar_media_id}`
-          : (u.avatar_external_url ?? null),
-        personalLink: nfcToken ? `/nfc/${nfcToken}` : null,
-        online: isUserConnected(u.id),
-        lastActiveAt: u.last_active_at,
-        createdAt: u.created_at,
-      };
-    });
-
+    const users = await Promise.all(
+      rows.map(async (u) => {
+        let nfcToken: string | null = null;
+        if (u.revoked === 0 && u.token_ciphertext) {
+          nfcToken = decryptToken(u.token_ciphertext);
+        }
+        if (!nfcToken && u.revoked !== 1) {
+          nfcToken = (await createNfcTokenForUser(u.id)).token;
+        }
+        return {
+          id: u.id,
+          fullName: u.full_name,
+          displayHandle: u.display_handle,
+          bio: u.bio,
+          avatarUrl: u.avatar_media_id
+            ? `/api/media/${u.avatar_media_id}`
+            : (u.avatar_external_url ?? null),
+          personalLink: nfcToken ? `/nfc/${nfcToken}` : null,
+          online: isUserConnected(u.id),
+          lastActiveAt: u.last_active_at,
+          createdAt: u.created_at,
+        };
+      }),
+    );
     res.json({ users });
   });
 
   // Remove a user from CONTROL directory — authenticated + rate-limited server-side removal code check
-  router.delete("/control/users/:userId", requireAuth, (req: AuthedRequest, res) => {
+  router.delete("/control/users/:userId", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const targetId = String(req.params["userId"] ?? "").trim();
     if (!targetId) {
@@ -2227,7 +2254,7 @@ export function createApiRouter() {
     }
 
     const rateKey = `control-remove:${me.id}:${getClientIp(req)}`;
-    const limit = checkRateLimit(rateKey);
+    const limit = await checkRateLimit(rateKey);
     if (!limit.allowed) {
       res.status(429).json({
         error: `Too many invalid removal code attempts. Wait ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s).`,
@@ -2245,7 +2272,7 @@ export function createApiRouter() {
     const expectedKey = process.env["CONTROL_REMOVE_CODE"]?.trim() || "2233";
 
     if (!suppliedCode || !timingSafeEqualStrings(suppliedCode, expectedKey)) {
-      const failRes = recordRateLimitFailure(rateKey, 5, 15 * 60 * 1000, 15 * 60 * 1000);
+      const failRes = await recordRateLimitFailure(rateKey, 5, 15 * 60 * 1000, 15 * 60 * 1000);
       if (failRes.locked) {
         res.status(429).json({
           error: "Too many invalid removal code attempts. Try again in 15 minutes.",
@@ -2256,32 +2283,21 @@ export function createApiRouter() {
       return;
     }
 
-    clearRateLimit(rateKey);
+    await clearRateLimit(rateKey);
 
-    const target = db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(targetId) as
+    const target = (await db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(targetId)) as
       { id: string } | undefined;
     if (!target) {
       res.status(404).json({ error: "User account not found." });
       return;
     }
 
-    const mediaRows = db
+    const mediaRows = (await db
       .prepare("SELECT file_path FROM media_objects WHERE owner_id = ?")
-      .all(targetId) as { file_path: string }[];
+      .all(targetId)) as { file_path: string }[];
 
-    db.prepare("DELETE FROM users WHERE id = ?").run(targetId);
-
-    const resolvedMediaDir = path.resolve(mediaDir);
-    for (const m of mediaRows) {
-      if (!m.file_path) continue;
-      const diskPath = path.resolve(resolvedMediaDir, m.file_path);
-      if (!diskPath.startsWith(resolvedMediaDir + path.sep)) continue;
-      try {
-        if (fs.existsSync(diskPath)) fs.unlinkSync(diskPath);
-      } catch {
-        /* ignore file cleanup errors */
-      }
-    }
+    await Promise.all(mediaRows.map((media) => deleteMediaStorage(media.file_path)));
+    await db.prepare("DELETE FROM users WHERE id = ?").run(targetId);
 
     const selfDeleted = targetId === me.id;
     if (selfDeleted) {
@@ -2293,7 +2309,7 @@ export function createApiRouter() {
   });
 
   // Discover Users — lists ALL registered non-blocked users (strictly public fields only)
-  router.get("/users", requireAuth, (req: AuthedRequest, res) => {
+  router.get("/users", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const raw = String(req.query["q"] ?? "")
       .trim()
@@ -2303,7 +2319,7 @@ export function createApiRouter() {
     let rows: DbUser[];
     if (raw) {
       const like = `%${raw}%`;
-      rows = db
+      rows = (await db
         .prepare(
           `SELECT * FROM users
            WHERE id != ?
@@ -2311,24 +2327,29 @@ export function createApiRouter() {
            ORDER BY last_active_at DESC
            LIMIT 500`,
         )
-        .all(me.id, like, like, like) as DbUser[];
+        .all(me.id, like, like, like)) as DbUser[];
     } else {
-      rows = db
+      rows = (await db
         .prepare(
           `SELECT * FROM users
            WHERE id != ?
            ORDER BY last_active_at DESC
            LIMIT 500`,
         )
-        .all(me.id) as DbUser[];
+        .all(me.id)) as DbUser[];
     }
 
-    let visible = rows
-      .filter((u) => !didUserBlock(u.id, me.id))
-      .map((u) => ({
-        ...toPublicUser(u, isUserConnected(u.id) || undefined, me.id),
-        blockedByMe: didUserBlock(me.id, u.id),
-      }));
+    let visible = (
+      await Promise.all(
+        rows.map(async (u) => {
+          if (await didUserBlock(u.id, me.id)) return null;
+          return {
+            ...(await toPublicUser(u, isUserConnected(u.id) || undefined, me.id)),
+            blockedByMe: await didUserBlock(me.id, u.id),
+          };
+        }),
+      )
+    ).filter((u): u is NonNullable<typeof u> => u !== null);
 
     if (filter === "following") {
       visible = visible.filter((u) => u.isFollowing);
@@ -2345,19 +2366,24 @@ export function createApiRouter() {
   });
 
   // Search users by name, username, or phone (strictly public fields returned)
-  router.get("/users/search", requireAuth, (req: AuthedRequest, res) => {
+  router.get("/users/search", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const raw = String(req.query["q"] ?? "").trim();
     if (!raw) {
-      const recent = db
+      const recent = (await db
         .prepare("SELECT * FROM users WHERE id != ? ORDER BY last_active_at DESC LIMIT 100")
-        .all(me.id) as DbUser[];
-      const visible = recent
-        .filter((u) => !didUserBlock(u.id, me.id))
-        .map((u) => ({
-          ...toPublicUser(u, isUserConnected(u.id) || undefined, me.id),
-          blockedByMe: didUserBlock(me.id, u.id),
-        }));
+        .all(me.id)) as DbUser[];
+      const visible = (
+        await Promise.all(
+          recent.map(async (u) => {
+            if (await didUserBlock(u.id, me.id)) return null;
+            return {
+              ...(await toPublicUser(u, isUserConnected(u.id) || undefined, me.id)),
+              blockedByMe: await didUserBlock(me.id, u.id),
+            };
+          }),
+        )
+      ).filter((u): u is NonNullable<typeof u> => u !== null);
       res.json({ users: visible });
       return;
     }
@@ -2365,7 +2391,7 @@ export function createApiRouter() {
     const maybePhone = normalizePhoneE164(raw, "+91");
     const like = `%${raw.toLowerCase()}%`;
 
-    const rows = db
+    const rows = (await db
       .prepare(
         `SELECT * FROM users
          WHERE id != ?
@@ -2373,64 +2399,71 @@ export function createApiRouter() {
          ORDER BY last_active_at DESC
          LIMIT 30`,
       )
-      .all(me.id, like, like, maybePhone ?? "") as DbUser[];
+      .all(me.id, like, like, maybePhone ?? "")) as DbUser[];
 
-    const visible = rows
-      .filter((u) => !didUserBlock(u.id, me.id))
-      .map((u) => ({
-        ...toPublicUser(u, isUserConnected(u.id) || undefined, me.id),
-        blockedByMe: didUserBlock(me.id, u.id),
-      }));
+    const visible = (
+      await Promise.all(
+        rows.map(async (u) => {
+          if (await didUserBlock(u.id, me.id)) return null;
+          return {
+            ...(await toPublicUser(u, isUserConnected(u.id) || undefined, me.id)),
+            blockedByMe: await didUserBlock(me.id, u.id),
+          };
+        }),
+      )
+    ).filter((u): u is NonNullable<typeof u> => u !== null);
 
     res.json({ users: visible });
   });
 
   // Public profile view for another user (strictly hides email, phone, password)
-  router.get("/users/:userId", requireAuth, (req: AuthedRequest, res) => {
+  router.get("/users/:userId", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const targetId = String(req.params["userId"] ?? "").trim();
-    const target = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(targetId) as
+    const target = (await db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(targetId)) as
       DbUser | undefined;
 
-    if (!target || (target.id !== me.id && didUserBlock(target.id, me.id))) {
+    if (!target || (target.id !== me.id && (await didUserBlock(target.id, me.id)))) {
       res.status(404).json({ error: "User not found." });
       return;
     }
 
     res.json({
       user: {
-        ...toPublicUser(target, isUserConnected(target.id) || undefined, me.id),
-        blockedByMe: didUserBlock(me.id, target.id),
-        blockedMe: didUserBlock(target.id, me.id),
+        ...(await toPublicUser(target, isUserConnected(target.id) || undefined, me.id)),
+        blockedByMe: await didUserBlock(me.id, target.id),
+        blockedMe: await didUserBlock(target.id, me.id),
       },
     });
   });
 
   // Follow / Unfollow a user
-  router.post("/users/:userId/follow", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/users/:userId/follow", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const targetId = String(req.params["userId"] ?? "").trim();
     if (!targetId || targetId === me.id) {
       res.status(400).json({ error: "Cannot follow yourself." });
       return;
     }
-    const target = db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(targetId);
+    const target = await db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(targetId);
     if (!target) {
       res.status(404).json({ error: "User not found." });
       return;
     }
-    if (isBlockedBetween(me.id, targetId)) {
+    if (await isBlockedBetween(me.id, targetId)) {
       res.status(403).json({ error: "Cannot follow a blocked user." });
       return;
     }
 
     const now = new Date().toISOString();
-    db.prepare(
-      "INSERT OR IGNORE INTO followers (follower_id, following_id, created_at) VALUES (?, ?, ?)",
-    ).run(me.id, targetId, now);
+    await db
+      .prepare(
+        "INSERT INTO followers (follower_id, following_id, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+      )
+      .run(me.id, targetId, now);
 
-    const targetStats = getFollowStats(targetId, me.id);
-    const myStats = getFollowStats(me.id, me.id);
+    const targetStats = await getFollowStats(targetId, me.id);
+    const myStats = await getFollowStats(me.id, me.id);
 
     sendToUser(targetId, "follow:updated", {
       followerId: me.id,
@@ -2455,16 +2488,15 @@ export function createApiRouter() {
     });
   });
 
-  router.delete("/users/:userId/follow", requireAuth, (req: AuthedRequest, res) => {
+  router.delete("/users/:userId/follow", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const targetId = String(req.params["userId"] ?? "").trim();
-    db.prepare("DELETE FROM followers WHERE follower_id = ? AND following_id = ?").run(
-      me.id,
-      targetId,
-    );
+    await db
+      .prepare("DELETE FROM followers WHERE follower_id = ? AND following_id = ?")
+      .run(me.id, targetId);
 
-    const targetStats = getFollowStats(targetId, me.id);
-    const myStats = getFollowStats(me.id, me.id);
+    const targetStats = await getFollowStats(targetId, me.id);
+    const myStats = await getFollowStats(me.id, me.id);
 
     sendToUser(targetId, "follow:updated", {
       followerId: me.id,
@@ -2490,22 +2522,24 @@ export function createApiRouter() {
   });
 
   // List active conversations for the current user (sorted pinned first, then latest message)
-  router.get("/conversations", requireAuth, (req: AuthedRequest, res) => {
+  router.get("/conversations", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
 
     // Mark any undelivered messages addressed to me as delivered now
     const deliveredAt = new Date().toISOString();
-    const undeliveredSenders = db
+    const undeliveredSenders = (await db
       .prepare(
         "SELECT DISTINCT sender_id FROM messages WHERE recipient_id = ? AND delivered_at IS NULL",
       )
-      .all(me.id) as { sender_id: string }[];
+      .all(me.id)) as { sender_id: string }[];
     if (undeliveredSenders.length > 0) {
-      db.prepare(
-        "UPDATE messages SET delivered_at = ? WHERE recipient_id = ? AND delivered_at IS NULL",
-      ).run(deliveredAt, me.id);
+      await db
+        .prepare(
+          "UPDATE messages SET delivered_at = ? WHERE recipient_id = ? AND delivered_at IS NULL",
+        )
+        .run(deliveredAt, me.id);
       for (const { sender_id } of undeliveredSenders) {
-        if (!isBlockedBetween(me.id, sender_id)) {
+        if (!(await isBlockedBetween(me.id, sender_id))) {
           sendToUser(sender_id, "messages:delivered", {
             byUserId: me.id,
             peerId: me.id,
@@ -2515,46 +2549,49 @@ export function createApiRouter() {
       }
     }
 
-    const peerRows = db
+    const peerRows = (await db
       .prepare(
         `SELECT DISTINCT CASE WHEN sender_id = ? THEN recipient_id ELSE sender_id END AS peer_id
          FROM messages
          WHERE sender_id = ? OR recipient_id = ?`,
       )
-      .all(me.id, me.id, me.id) as { peer_id: string }[];
+      .all(me.id, me.id, me.id)) as { peer_id: string }[];
 
-    const conversations = peerRows
-      .map(({ peer_id }) => {
-        const peer = db.prepare("SELECT * FROM users WHERE id = ?").get(peer_id) as
-          DbUser | undefined;
-        if (!peer) return null;
-        const key = threadKeyFor(me.id, peer.id);
-        const lastMsg = db
-          .prepare("SELECT * FROM messages WHERE thread_key = ? ORDER BY created_at DESC LIMIT 1")
-          .get(key) as DbMessageRow | undefined;
+    const conversations = (
+      await Promise.all(
+        peerRows.map(async ({ peer_id }) => {
+          const peer = (await db.prepare("SELECT * FROM users WHERE id = ?").get(peer_id)) as
+            DbUser | undefined;
+          if (!peer) return null;
+          const key = threadKeyFor(me.id, peer.id);
+          const lastMsg = (await db
+            .prepare("SELECT * FROM messages WHERE thread_key = ? ORDER BY created_at DESC LIMIT 1")
+            .get(key)) as DbMessageRow | undefined;
 
-        const unread = db
-          .prepare(
-            "SELECT COUNT(*) AS cnt FROM messages WHERE thread_key = ? AND recipient_id = ? AND seen_at IS NULL AND deleted_at IS NULL",
-          )
-          .get(key, me.id) as { cnt: number };
+          const unread = (await db
+            .prepare(
+              "SELECT COUNT(*) AS cnt FROM messages WHERE thread_key = ? AND recipient_id = ? AND seen_at IS NULL AND deleted_at IS NULL",
+            )
+            .get(key, me.id)) as { cnt: number };
 
-        const settings = db
-          .prepare(
-            "SELECT pinned, muted FROM conversation_settings WHERE user_id = ? AND peer_id = ? LIMIT 1",
-          )
-          .get(me.id, peer.id) as { pinned: number; muted: number } | undefined;
+          const settings = (await db
+            .prepare(
+              "SELECT pinned, muted FROM conversation_settings WHERE user_id = ? AND peer_id = ? LIMIT 1",
+            )
+            .get(me.id, peer.id)) as { pinned: number; muted: number } | undefined;
 
-        return {
-          peer: toPublicUser(peer, isUserConnected(peer.id) || undefined, me.id),
-          blockedByMe: didUserBlock(me.id, peer.id),
-          blockedMe: didUserBlock(peer.id, me.id),
-          pinned: settings?.pinned === 1,
-          muted: settings?.muted === 1,
-          lastMessage: lastMsg ? serializeMessage(lastMsg, me.id) : null,
-          unreadCount: unread.cnt,
-        };
-      })
+          return {
+            peer: await toPublicUser(peer, isUserConnected(peer.id) || undefined, me.id),
+            blockedByMe: await didUserBlock(me.id, peer.id),
+            blockedMe: await didUserBlock(peer.id, me.id),
+            pinned: settings?.pinned === 1,
+            muted: settings?.muted === 1,
+            lastMessage: lastMsg ? await serializeMessage(lastMsg, me.id) : null,
+            unreadCount: unread.cnt,
+          };
+        }),
+      )
+    )
       .filter((x): x is NonNullable<typeof x> => Boolean(x))
       .sort((a, b) => {
         if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
@@ -2565,7 +2602,7 @@ export function createApiRouter() {
   });
 
   // Update pin/mute settings for a conversation
-  router.patch("/conversations/:peerId", requireAuth, (req: AuthedRequest, res) => {
+  router.patch("/conversations/:peerId", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const peerId = String(req.params["peerId"] ?? "").trim();
     if (!peerId || peerId === me.id) {
@@ -2573,31 +2610,34 @@ export function createApiRouter() {
       return;
     }
 
-    const existing = db
+    const existing = (await db
       .prepare(
         "SELECT pinned, muted FROM conversation_settings WHERE user_id = ? AND peer_id = ? LIMIT 1",
       )
-      .get(me.id, peerId) as { pinned: number; muted: number } | undefined;
+      .get(me.id, peerId)) as { pinned: number; muted: number } | undefined;
 
     const body = req.body as { pinned?: boolean; muted?: boolean };
     const pinned = body.pinned !== undefined ? (body.pinned ? 1 : 0) : (existing?.pinned ?? 0);
     const muted = body.muted !== undefined ? (body.muted ? 1 : 0) : (existing?.muted ?? 0);
     const now = new Date().toISOString();
 
-    db.prepare(
-      `INSERT INTO conversation_settings (user_id, peer_id, pinned, muted, updated_at)
+    await db
+      .prepare(
+        `INSERT INTO conversation_settings (user_id, peer_id, pinned, muted, updated_at)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(user_id, peer_id) DO UPDATE SET pinned = excluded.pinned, muted = excluded.muted, updated_at = excluded.updated_at`,
-    ).run(me.id, peerId, pinned, muted, now);
+      )
+      .run(me.id, peerId, pinned, muted, now);
 
     res.json({ ok: true, pinned: pinned === 1, muted: muted === 1 });
   });
 
   // Fetch thread messages with a peer (supports ?q= search)
-  router.get("/messages/:peerId", requireAuth, (req: AuthedRequest, res) => {
+  router.get("/messages/:peerId", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const peerId = String(req.params["peerId"] ?? "");
-    const peer = db.prepare("SELECT * FROM users WHERE id = ?").get(peerId) as DbUser | undefined;
+    const peer = (await db.prepare("SELECT * FROM users WHERE id = ?").get(peerId)) as
+      DbUser | undefined;
     if (!peer) {
       res.status(404).json({ error: "User not found." });
       return;
@@ -2605,12 +2645,12 @@ export function createApiRouter() {
 
     const key = threadKeyFor(me.id, peer.id);
     const now = new Date().toISOString();
-    const deliv = db
+    const deliv = await db
       .prepare(
         "UPDATE messages SET delivered_at = ? WHERE thread_key = ? AND sender_id = ? AND recipient_id = ? AND delivered_at IS NULL",
       )
       .run(now, key, peer.id, me.id);
-    if (deliv.changes > 0 && !isBlockedBetween(me.id, peer.id)) {
+    if (deliv.changes > 0 && !(await isBlockedBetween(me.id, peer.id))) {
       sendToUser(peer.id, "messages:delivered", {
         byUserId: me.id,
         peerId: me.id,
@@ -2623,35 +2663,35 @@ export function createApiRouter() {
       .toLowerCase();
     let rows: DbMessageRow[];
     if (q) {
-      rows = db
+      rows = (await db
         .prepare(
           "SELECT * FROM messages WHERE thread_key = ? AND deleted_at IS NULL AND LOWER(text) LIKE ? ORDER BY created_at ASC LIMIT 300",
         )
-        .all(key, `%${q}%`) as DbMessageRow[];
+        .all(key, `%${q}%`)) as DbMessageRow[];
     } else {
-      rows = db
+      rows = (await db
         .prepare("SELECT * FROM messages WHERE thread_key = ? ORDER BY created_at ASC LIMIT 300")
-        .all(key) as DbMessageRow[];
+        .all(key)) as DbMessageRow[];
     }
 
-    const settings = db
+    const settings = (await db
       .prepare(
         "SELECT pinned, muted FROM conversation_settings WHERE user_id = ? AND peer_id = ? LIMIT 1",
       )
-      .get(me.id, peer.id) as { pinned: number; muted: number } | undefined;
+      .get(me.id, peer.id)) as { pinned: number; muted: number } | undefined;
 
     res.json({
-      peer: toPublicUser(peer, isUserConnected(peer.id) || undefined, me.id),
-      blockedByMe: didUserBlock(me.id, peer.id),
-      blockedMe: didUserBlock(peer.id, me.id),
+      peer: await toPublicUser(peer, isUserConnected(peer.id) || undefined, me.id),
+      blockedByMe: await didUserBlock(me.id, peer.id),
+      blockedMe: await didUserBlock(peer.id, me.id),
       pinned: settings?.pinned === 1,
       muted: settings?.muted === 1,
-      messages: rows.map((r) => serializeMessage(r, me.id)),
+      messages: await Promise.all(rows.map((r) => serializeMessage(r, me.id))),
     });
   });
 
   // Send message (supports text, media, gallery reuse, replies, and delivery receipts)
-  router.post("/messages", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/messages", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const {
       peerId,
@@ -2671,13 +2711,14 @@ export function createApiRouter() {
       return;
     }
 
-    const peer = db.prepare("SELECT * FROM users WHERE id = ?").get(targetId) as DbUser | undefined;
+    const peer = (await db.prepare("SELECT * FROM users WHERE id = ?").get(targetId)) as
+      DbUser | undefined;
     if (!peer) {
       res.status(404).json({ error: "Recipient not found." });
       return;
     }
 
-    if (isBlockedBetween(me.id, peer.id)) {
+    if (await isBlockedBetween(me.id, peer.id)) {
       res.status(403).json({
         error: "Messaging is blocked between you and this user.",
       });
@@ -2690,11 +2731,11 @@ export function createApiRouter() {
     let validMediaId: string | null = null;
 
     if (mediaId) {
-      const mediaRow = db
+      const mediaRow = (await db
         .prepare(
           "SELECT * FROM media_objects WHERE id = ? AND (owner_id = ? OR recipient_id = ?) LIMIT 1",
         )
-        .get(mediaId, me.id, me.id) as
+        .get(mediaId, me.id, me.id)) as
         | {
             id: string;
             owner_id: string;
@@ -2711,10 +2752,9 @@ export function createApiRouter() {
       mediaKind = mediaRow.kind;
       mediaName = mediaRow.original_name;
       if (!mediaRow.recipient_id && mediaRow.owner_id === me.id) {
-        db.prepare("UPDATE media_objects SET recipient_id = ? WHERE id = ?").run(
-          peer.id,
-          mediaRow.id,
-        );
+        await db
+          .prepare("UPDATE media_objects SET recipient_id = ? WHERE id = ?")
+          .run(peer.id, mediaRow.id);
       }
     }
 
@@ -2726,9 +2766,9 @@ export function createApiRouter() {
     const key = threadKeyFor(me.id, peer.id);
     let validReplyToId: string | null = null;
     if (replyToId) {
-      const parent = db
+      const parent = (await db
         .prepare("SELECT id FROM messages WHERE id = ? AND thread_key = ? LIMIT 1")
-        .get(String(replyToId), key) as { id: string } | undefined;
+        .get(String(replyToId), key)) as { id: string } | undefined;
       if (parent) validReplyToId = parent.id;
     }
 
@@ -2743,32 +2783,36 @@ export function createApiRouter() {
           ? "Voice note"
           : "Sent a photo");
 
-    db.prepare(
-      `INSERT INTO messages (id, thread_key, sender_id, recipient_id, text, media_id, media_kind, media_name, reply_to_id, delivered_at, created_at, seen_at)
+    await db
+      .prepare(
+        `INSERT INTO messages (id, thread_key, sender_id, recipient_id, text, media_id, media_kind, media_name, reply_to_id, delivered_at, created_at, seen_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-    ).run(
-      msgId,
-      key,
-      me.id,
-      peer.id,
-      displayText,
-      validMediaId,
-      mediaKind,
-      mediaName,
-      validReplyToId,
-      deliveredAt,
-      now,
-    );
+      )
+      .run(
+        msgId,
+        key,
+        me.id,
+        peer.id,
+        displayText,
+        validMediaId,
+        mediaKind,
+        mediaName,
+        validReplyToId,
+        deliveredAt,
+        now,
+      );
 
-    const saved = db.prepare("SELECT * FROM messages WHERE id = ?").get(msgId) as DbMessageRow;
+    const saved = (await db
+      .prepare("SELECT * FROM messages WHERE id = ?")
+      .get(msgId)) as DbMessageRow;
 
     const payloadForPeer = {
-      message: serializeMessage(saved, peer.id),
-      sender: toPublicUser(me, true, peer.id),
+      message: await serializeMessage(saved, peer.id),
+      sender: await toPublicUser(me, true, peer.id),
     };
     const payloadForMe = {
-      message: serializeMessage(saved, me.id),
-      sender: toPublicUser(me, true, me.id),
+      message: await serializeMessage(saved, me.id),
+      sender: await toPublicUser(me, true, me.id),
     };
 
     sendToUser(peer.id, "message:new", payloadForPeer);
@@ -2778,10 +2822,10 @@ export function createApiRouter() {
   });
 
   // Edit own message
-  router.patch("/messages/:id", requireAuth, (req: AuthedRequest, res) => {
+  router.patch("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const msgId = String(req.params["id"] ?? "").trim();
-    const msg = db.prepare("SELECT * FROM messages WHERE id = ? LIMIT 1").get(msgId) as
+    const msg = (await db.prepare("SELECT * FROM messages WHERE id = ? LIMIT 1").get(msgId)) as
       DbMessageRow | undefined;
 
     if (!msg) {
@@ -2806,15 +2850,15 @@ export function createApiRouter() {
     }
 
     const editedAt = new Date().toISOString();
-    db.prepare("UPDATE messages SET text = ?, edited_at = ? WHERE id = ?").run(
-      cleanText,
-      editedAt,
-      msg.id,
-    );
+    await db
+      .prepare("UPDATE messages SET text = ?, edited_at = ? WHERE id = ?")
+      .run(cleanText, editedAt, msg.id);
 
-    const updated = db.prepare("SELECT * FROM messages WHERE id = ?").get(msg.id) as DbMessageRow;
-    const forSender = serializeMessage(updated, msg.sender_id);
-    const forRecipient = serializeMessage(updated, msg.recipient_id);
+    const updated = (await db
+      .prepare("SELECT * FROM messages WHERE id = ?")
+      .get(msg.id)) as DbMessageRow;
+    const forSender = await serializeMessage(updated, msg.sender_id);
+    const forRecipient = await serializeMessage(updated, msg.recipient_id);
 
     sendToUser(msg.sender_id, "message:updated", { message: forSender });
     sendToUser(msg.recipient_id, "message:updated", { message: forRecipient });
@@ -2823,10 +2867,10 @@ export function createApiRouter() {
   });
 
   // Delete own message (soft-delete preserves thread continuity cleanly)
-  router.delete("/messages/:id", requireAuth, (req: AuthedRequest, res) => {
+  router.delete("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const msgId = String(req.params["id"] ?? "").trim();
-    const msg = db.prepare("SELECT * FROM messages WHERE id = ? LIMIT 1").get(msgId) as
+    const msg = (await db.prepare("SELECT * FROM messages WHERE id = ? LIMIT 1").get(msgId)) as
       DbMessageRow | undefined;
 
     if (!msg) {
@@ -2839,13 +2883,17 @@ export function createApiRouter() {
     }
 
     const deletedAt = new Date().toISOString();
-    db.prepare(
-      "UPDATE messages SET deleted_at = ?, text = '', media_id = NULL, media_kind = NULL, media_name = NULL WHERE id = ?",
-    ).run(deletedAt, msg.id);
-    db.prepare("DELETE FROM message_reactions WHERE message_id = ?").run(msg.id);
+    await db
+      .prepare(
+        "UPDATE messages SET deleted_at = ?, text = '', media_id = NULL, media_kind = NULL, media_name = NULL WHERE id = ?",
+      )
+      .run(deletedAt, msg.id);
+    await db.prepare("DELETE FROM message_reactions WHERE message_id = ?").run(msg.id);
 
-    const updated = db.prepare("SELECT * FROM messages WHERE id = ?").get(msg.id) as DbMessageRow;
-    const serialized = serializeMessage(updated, me.id);
+    const updated = (await db
+      .prepare("SELECT * FROM messages WHERE id = ?")
+      .get(msg.id)) as DbMessageRow;
+    const serialized = await serializeMessage(updated, me.id);
 
     sendToUser(msg.sender_id, "message:deleted", { message: serialized });
     sendToUser(msg.recipient_id, "message:deleted", { message: serialized });
@@ -2854,14 +2902,14 @@ export function createApiRouter() {
   });
 
   // React to a message with an emoji (toggles if same emoji clicked again)
-  router.post("/messages/:id/reactions", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/messages/:id/reactions", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const msgId = String(req.params["id"] ?? "").trim();
     const emoji = String((req.body as { emoji?: string })?.emoji ?? "")
       .trim()
       .slice(0, 12);
 
-    const msg = db.prepare("SELECT * FROM messages WHERE id = ? LIMIT 1").get(msgId) as
+    const msg = (await db.prepare("SELECT * FROM messages WHERE id = ? LIMIT 1").get(msgId)) as
       DbMessageRow | undefined;
     if (!msg || msg.deleted_at) {
       res.status(404).json({ error: "Message not found." });
@@ -2871,32 +2919,33 @@ export function createApiRouter() {
       res.status(403).json({ error: "Not authorized to react to this message." });
       return;
     }
-    if (isBlockedBetween(msg.sender_id, msg.recipient_id)) {
+    if (await isBlockedBetween(msg.sender_id, msg.recipient_id)) {
       res.status(403).json({ error: "Messaging is blocked between you and this user." });
       return;
     }
 
-    const existing = db
+    const existing = (await db
       .prepare("SELECT emoji FROM message_reactions WHERE message_id = ? AND user_id = ? LIMIT 1")
-      .get(msg.id, me.id) as { emoji: string } | undefined;
+      .get(msg.id, me.id)) as { emoji: string } | undefined;
 
     if (!emoji || existing?.emoji === emoji) {
-      db.prepare("DELETE FROM message_reactions WHERE message_id = ? AND user_id = ?").run(
-        msg.id,
-        me.id,
-      );
+      await db
+        .prepare("DELETE FROM message_reactions WHERE message_id = ? AND user_id = ?")
+        .run(msg.id, me.id);
     } else {
       const now = new Date().toISOString();
-      db.prepare(
-        `INSERT INTO message_reactions (message_id, user_id, emoji, created_at)
+      await db
+        .prepare(
+          `INSERT INTO message_reactions (message_id, user_id, emoji, created_at)
          VALUES (?, ?, ?, ?)
          ON CONFLICT(message_id, user_id) DO UPDATE SET emoji = excluded.emoji, created_at = excluded.created_at`,
-      ).run(msg.id, me.id, emoji, now);
+        )
+        .run(msg.id, me.id, emoji, now);
     }
 
-    const reactionsForMe = getReactionsForMessage(msg.id, me.id);
+    const reactionsForMe = await getReactionsForMessage(msg.id, me.id);
     const peerId = msg.sender_id === me.id ? msg.recipient_id : msg.sender_id;
-    const reactionsForPeer = getReactionsForMessage(msg.id, peerId);
+    const reactionsForPeer = await getReactionsForMessage(msg.id, peerId);
 
     sendToUser(me.id, "message:reaction", {
       messageId: msg.id,
@@ -2913,17 +2962,17 @@ export function createApiRouter() {
   });
 
   // Mark messages in a thread as seen
-  router.post("/messages/:peerId/seen", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/messages/:peerId/seen", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const peerId = String(req.params["peerId"] ?? "");
-    if (!peerId || isBlockedBetween(me.id, peerId)) {
+    if (!peerId || (await isBlockedBetween(me.id, peerId))) {
       res.json({ ok: true, updated: 0 });
       return;
     }
 
     const key = threadKeyFor(me.id, peerId);
     const seenAt = new Date().toISOString();
-    const result = db
+    const result = await db
       .prepare(
         "UPDATE messages SET seen_at = ?, delivered_at = COALESCE(delivered_at, ?) WHERE thread_key = ? AND sender_id = ? AND recipient_id = ? AND seen_at IS NULL",
       )
@@ -2941,10 +2990,9 @@ export function createApiRouter() {
   router.post("/media", upload.single("file"), async (req: AuthedRequest, res) => {
     const file = req.file;
     const fbUid = await resolveFirebaseUid(req);
-    const resolved = fbUid ? null : lookupSessionUser(req);
+    const resolved = fbUid ? null : await lookupSessionUser(req);
 
     if (!fbUid && !resolved) {
-      if (file && fs.existsSync(file.path)) fs.unlinkSync(file.path);
       res.status(401).json({ error: "Authentication required." });
       return;
     }
@@ -2957,8 +3005,7 @@ export function createApiRouter() {
     const recipientId =
       typeof req.body?.["recipientId"] === "string" ? req.body["recipientId"].trim() : null;
 
-    if (resolved && recipientId && isBlockedBetween(resolved.user.id, recipientId)) {
-      fs.unlinkSync(file.path);
+    if (resolved && recipientId && (await isBlockedBetween(resolved.user.id, recipientId))) {
       res.status(403).json({ error: "Cannot share media with a blocked user." });
       return;
     }
@@ -2972,42 +3019,47 @@ export function createApiRouter() {
           : null;
 
     if (!kind) {
-      fs.unlinkSync(file.path);
       res.status(400).json({ error: "Only image, video, and audio files are supported." });
       return;
     }
 
     const mediaId = `${fbUid ? "fbm" : "med"}_${crypto.randomUUID()}`;
+    const storageKey = `${fbUid ? `firebase/${fbUid}` : `users/${resolved!.user.id}`}/${mediaId}`;
     const now = new Date().toISOString();
+    await uploadMediaStorage(storageKey, file.buffer, file.mimetype);
 
     if (fbUid) {
-      db.prepare(
-        "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).run(
-        mediaId,
-        fbUid,
-        recipientId || null,
-        kind,
-        file.mimetype,
-        file.originalname || `${kind}.${kind === "video" ? "mp4" : "jpg"}`,
-        file.filename,
-        file.size,
-        now,
-      );
+      await db
+        .prepare(
+          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          mediaId,
+          fbUid,
+          recipientId || null,
+          kind,
+          file.mimetype,
+          file.originalname || `${kind}.${kind === "video" ? "mp4" : "jpg"}`,
+          storageKey,
+          file.size,
+          now,
+        );
     } else if (resolved) {
-      db.prepare(
-        "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-      ).run(
-        mediaId,
-        resolved.user.id,
-        recipientId,
-        kind,
-        file.mimetype,
-        file.originalname || `${kind}.${kind === "video" ? "mp4" : "jpg"}`,
-        file.filename,
-        file.size,
-        now,
-      );
+      await db
+        .prepare(
+          "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+        )
+        .run(
+          mediaId,
+          resolved.user.id,
+          recipientId,
+          kind,
+          file.mimetype,
+          file.originalname || `${kind}.${kind === "video" ? "mp4" : "jpg"}`,
+          storageKey,
+          file.size,
+          now,
+        );
     }
 
     res.status(201).json({
@@ -3037,9 +3089,9 @@ export function createApiRouter() {
       res.status(400).json({ error: "recipientId is required." });
       return;
     }
-    const fbItem = db
+    const fbItem = (await db
       .prepare("SELECT id, owner_uid, recipient_uid FROM firebase_media WHERE id = ? LIMIT 1")
-      .get(mediaId) as { id: string; owner_uid: string; recipient_uid: string | null } | undefined;
+      .get(mediaId)) as { id: string; owner_uid: string; recipient_uid: string | null } | undefined;
     if (!fbItem || fbItem.owner_uid !== fbUid) {
       res.status(404).json({ error: "Media not found." });
       return;
@@ -3051,17 +3103,16 @@ export function createApiRouter() {
         .filter(Boolean),
     );
     existing.add(recipientId);
-    db.prepare("UPDATE firebase_media SET recipient_uid = ? WHERE id = ?").run(
-      Array.from(existing).join(","),
-      mediaId,
-    );
+    await db
+      .prepare("UPDATE firebase_media SET recipient_uid = ? WHERE id = ?")
+      .run(Array.from(existing).join(","), mediaId);
     res.json({ ok: true });
   });
 
-  // Delete an owned media file from the gallery & disk storage
-  router.delete("/media/:id", async (req: AuthedRequest, res) => {
+  // Save media shared with the current user as a private copy in their gallery.
+  router.post("/media/:id/save", async (req: AuthedRequest, res) => {
     const fbUid = await resolveFirebaseUid(req);
-    const resolved = fbUid ? null : lookupSessionUser(req);
+    const resolved = fbUid ? null : await lookupSessionUser(req);
     if (!fbUid && !resolved) {
       res.status(401).json({ error: "Authentication required." });
       return;
@@ -3073,12 +3124,144 @@ export function createApiRouter() {
       return;
     }
 
-    const baseMediaDir = path.resolve(mediaDir);
+    if (fbUid) {
+      const item = (await db
+        .prepare("SELECT * FROM firebase_media WHERE id = ? LIMIT 1")
+        .get(mediaId)) as
+        | {
+            id: string;
+            owner_uid: string;
+            recipient_uid: string | null;
+            kind: string;
+            mime_type: string;
+            original_name: string;
+            file_path: string;
+            size_bytes: number;
+          }
+        | undefined;
+      if (!item) {
+        res.status(404).json({ error: "Media not found." });
+        return;
+      }
+      if (item.owner_uid === fbUid) {
+        res.json({ ok: true, alreadySaved: true, id: item.id });
+        return;
+      }
+      const recipients = (item.recipient_uid ?? "").split(",").map((value) => value.trim());
+      if (!recipients.includes(fbUid)) {
+        res.status(403).json({ error: "You do not have permission to save this media." });
+        return;
+      }
+
+      const bytes = await downloadMediaStorage(item.file_path);
+      if (!bytes) {
+        res.status(404).json({ error: "Media file missing." });
+        return;
+      }
+      const savedId = `fbm_${crypto.randomUUID()}`;
+      const storageKey = `firebase/${fbUid}/${savedId}`;
+      const createdAt = new Date().toISOString();
+      await uploadMediaStorage(storageKey, bytes, item.mime_type);
+      await db
+        .prepare(
+          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          savedId,
+          fbUid,
+          item.kind,
+          item.mime_type,
+          item.original_name,
+          storageKey,
+          item.size_bytes,
+          createdAt,
+        );
+      res.status(201).json({ ok: true, alreadySaved: false, id: savedId });
+      return;
+    }
+
+    const me = resolved!.user;
+    const item = (await db
+      .prepare("SELECT * FROM media_objects WHERE id = ? LIMIT 1")
+      .get(mediaId)) as
+      | {
+          id: string;
+          owner_id: string;
+          recipient_id: string | null;
+          kind: string;
+          mime_type: string;
+          original_name: string;
+          file_path: string;
+          size_bytes: number;
+          is_public_avatar: number;
+        }
+      | undefined;
+    if (!item) {
+      res.status(404).json({ error: "Media not found." });
+      return;
+    }
+    if (item.owner_id === me.id) {
+      res.json({ ok: true, alreadySaved: true, id: item.id });
+      return;
+    }
+    const sharedInMessage = Boolean(
+      await db
+        .prepare(
+          "SELECT 1 FROM messages WHERE media_id = ? AND deleted_at IS NULL AND (sender_id = ? OR recipient_id = ?) LIMIT 1",
+        )
+        .get(item.id, me.id, me.id),
+    );
+    const allowed = item.is_public_avatar !== 1 && (item.recipient_id === me.id || sharedInMessage);
+    if (!allowed || (await isBlockedBetween(me.id, item.owner_id))) {
+      res.status(403).json({ error: "You do not have permission to save this media." });
+      return;
+    }
+
+    const bytes = await downloadMediaStorage(item.file_path);
+    if (!bytes) {
+      res.status(404).json({ error: "Media file missing." });
+      return;
+    }
+    const savedId = `med_${crypto.randomUUID()}`;
+    const storageKey = `users/${me.id}/${savedId}`;
+    const createdAt = new Date().toISOString();
+    await uploadMediaStorage(storageKey, bytes, item.mime_type);
+    await db
+      .prepare(
+        "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?)",
+      )
+      .run(
+        savedId,
+        me.id,
+        item.kind,
+        item.mime_type,
+        item.original_name,
+        storageKey,
+        item.size_bytes,
+        createdAt,
+      );
+    res.status(201).json({ ok: true, alreadySaved: false, id: savedId });
+  });
+
+  // Delete an owned media file from the gallery & disk storage
+  router.delete("/media/:id", async (req: AuthedRequest, res) => {
+    const fbUid = await resolveFirebaseUid(req);
+    const resolved = fbUid ? null : await lookupSessionUser(req);
+    if (!fbUid && !resolved) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    const mediaId = String(req.params["id"] ?? "").trim();
+    if (!mediaId) {
+      res.status(400).json({ error: "Media ID is required." });
+      return;
+    }
 
     if (fbUid) {
-      const fbItem = db
+      const fbItem = (await db
         .prepare("SELECT id, owner_uid, file_path FROM firebase_media WHERE id = ? LIMIT 1")
-        .get(mediaId) as { id: string; owner_uid: string; file_path: string } | undefined;
+        .get(mediaId)) as { id: string; owner_uid: string; file_path: string } | undefined;
       if (!fbItem) {
         res.status(404).json({ error: "Media not found." });
         return;
@@ -3088,25 +3271,20 @@ export function createApiRouter() {
         return;
       }
 
-      db.prepare("DELETE FROM firebase_media WHERE id = ? AND owner_uid = ?").run(mediaId, fbUid);
-      const fullPath = path.resolve(baseMediaDir, path.basename(fbItem.file_path));
-      if (fullPath.startsWith(baseMediaDir + path.sep) && fs.existsSync(fullPath)) {
-        try {
-          fs.unlinkSync(fullPath);
-        } catch {
-          /* ignore file unlink race */
-        }
-      }
+      await deleteMediaStorage(fbItem.file_path);
+      await db
+        .prepare("DELETE FROM firebase_media WHERE id = ? AND owner_uid = ?")
+        .run(mediaId, fbUid);
       res.json({ ok: true, id: mediaId });
       return;
     }
 
     const me = resolved!.user;
-    const item = db
+    const item = (await db
       .prepare(
         "SELECT id, owner_id, file_path, is_public_avatar FROM media_objects WHERE id = ? LIMIT 1",
       )
-      .get(mediaId) as
+      .get(mediaId)) as
       { id: string; owner_id: string; file_path: string; is_public_avatar: number } | undefined;
     if (!item) {
       res.status(404).json({ error: "Media not found." });
@@ -3121,19 +3299,11 @@ export function createApiRouter() {
       return;
     }
 
-    db.prepare("UPDATE messages SET media_kind = NULL, media_name = NULL WHERE media_id = ?").run(
-      mediaId,
-    );
-    db.prepare("DELETE FROM media_objects WHERE id = ? AND owner_id = ?").run(mediaId, me.id);
-
-    const fullPath = path.resolve(baseMediaDir, path.basename(item.file_path));
-    if (fullPath.startsWith(baseMediaDir + path.sep) && fs.existsSync(fullPath)) {
-      try {
-        fs.unlinkSync(fullPath);
-      } catch {
-        /* ignore file unlink race */
-      }
-    }
+    await db
+      .prepare("UPDATE messages SET media_kind = NULL, media_name = NULL WHERE media_id = ?")
+      .run(mediaId);
+    await deleteMediaStorage(item.file_path);
+    await db.prepare("DELETE FROM media_objects WHERE id = ? AND owner_id = ?").run(mediaId, me.id);
 
     res.json({ ok: true, id: mediaId });
   });
@@ -3141,19 +3311,18 @@ export function createApiRouter() {
   // Protected private media endpoint with ACL & block check
   router.get("/media/:id", async (req: AuthedRequest, res) => {
     const fbUid = await resolveFirebaseUid(req);
-    const resolved = fbUid ? null : lookupSessionUser(req);
+    const resolved = fbUid ? null : await lookupSessionUser(req);
     if (!fbUid && !resolved) {
       res.status(401).json({ error: "Authentication required." });
       return;
     }
 
     const mediaId = String(req.params["id"] ?? "");
-    const baseMediaDir = path.resolve(mediaDir);
 
     if (fbUid) {
-      const fbItem = db
+      const fbItem = (await db
         .prepare("SELECT * FROM firebase_media WHERE id = ? LIMIT 1")
-        .get(mediaId) as
+        .get(mediaId)) as
         | {
             id: string;
             owner_uid: string;
@@ -3176,8 +3345,8 @@ export function createApiRouter() {
         res.status(403).json({ error: "You do not have permission to access this private media." });
         return;
       }
-      const fullPath = path.resolve(baseMediaDir, path.basename(fbItem.file_path));
-      if (!fullPath.startsWith(baseMediaDir + path.sep) || !fs.existsSync(fullPath)) {
+      const file = await downloadMediaStorage(fbItem.file_path);
+      if (!file) {
         res.status(404).json({ error: "Media file missing." });
         return;
       }
@@ -3187,12 +3356,14 @@ export function createApiRouter() {
         const safeName = fbItem.original_name.replace(/["\r\n]/g, "_");
         res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
       }
-      res.sendFile(fullPath, { dotfiles: "allow" });
+      res.send(file);
       return;
     }
 
     const me = resolved!.user;
-    const item = db.prepare("SELECT * FROM media_objects WHERE id = ? LIMIT 1").get(mediaId) as
+    const item = (await db
+      .prepare("SELECT * FROM media_objects WHERE id = ? LIMIT 1")
+      .get(mediaId)) as
       | {
           id: string;
           owner_id: string;
@@ -3211,13 +3382,13 @@ export function createApiRouter() {
     }
 
     if (item.is_public_avatar === 1) {
-      if (item.owner_id !== me.id && isBlockedBetween(me.id, item.owner_id)) {
+      if (item.owner_id !== me.id && (await isBlockedBetween(me.id, item.owner_id))) {
         res.status(403).json({ error: "Access denied." });
         return;
       }
     } else {
       const sharedInMessage = Boolean(
-        db
+        await db
           .prepare(
             "SELECT 1 FROM messages WHERE media_id = ? AND deleted_at IS NULL AND (sender_id = ? OR recipient_id = ?) LIMIT 1",
           )
@@ -3228,7 +3399,7 @@ export function createApiRouter() {
         res.status(403).json({ error: "You do not have permission to access this private media." });
         return;
       }
-      if (item.recipient_id && isBlockedBetween(item.owner_id, item.recipient_id)) {
+      if (item.recipient_id && (await isBlockedBetween(item.owner_id, item.recipient_id))) {
         if (item.owner_id !== me.id) {
           res.status(403).json({ error: "Media unavailable due to block." });
           return;
@@ -3236,8 +3407,8 @@ export function createApiRouter() {
       }
     }
 
-    const fullPath = path.resolve(baseMediaDir, path.basename(item.file_path));
-    if (!fullPath.startsWith(baseMediaDir + path.sep) || !fs.existsSync(fullPath)) {
+    const file = await downloadMediaStorage(item.file_path);
+    if (!file) {
       res.status(404).json({ error: "Media file missing." });
       return;
     }
@@ -3248,20 +3419,20 @@ export function createApiRouter() {
       const safeName = item.original_name.replace(/["\r\n]/g, "_");
       res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
     }
-    res.sendFile(fullPath, { dotfiles: "allow" });
+    res.send(file);
   });
 
   // Gallery for Profile & Chat picker: photos & videos owned by or shared with the signed-in user
   router.get("/gallery", async (req: AuthedRequest, res) => {
     const fbUid = await resolveFirebaseUid(req);
-    const resolved = fbUid ? null : lookupSessionUser(req);
+    const resolved = fbUid ? null : await lookupSessionUser(req);
     if (!fbUid && !resolved) {
       res.status(401).json({ error: "Authentication required." });
       return;
     }
 
     if (fbUid) {
-      const rows = db
+      const rows = (await db
         .prepare(
           `SELECT id, owner_uid, recipient_uid, kind, mime_type, original_name, size_bytes, created_at
            FROM firebase_media
@@ -3269,7 +3440,7 @@ export function createApiRouter() {
            ORDER BY created_at DESC
            LIMIT 200`,
         )
-        .all() as {
+        .all()) as {
         id: string;
         owner_uid: string;
         recipient_uid: string | null;
@@ -3304,7 +3475,7 @@ export function createApiRouter() {
     }
 
     const me = resolved!.user;
-    const rows = db
+    const rows = (await db
       .prepare(
         `SELECT id, owner_id, recipient_id, kind, mime_type, original_name, size_bytes, created_at
          FROM media_objects
@@ -3314,7 +3485,7 @@ export function createApiRouter() {
          ORDER BY created_at DESC
          LIMIT 120`,
       )
-      .all(me.id, me.id) as {
+      .all(me.id, me.id)) as {
       id: string;
       owner_id: string;
       recipient_id: string | null;
@@ -3325,26 +3496,31 @@ export function createApiRouter() {
       created_at: string;
     }[];
 
-    const items = rows
-      .filter((r) => r.owner_id === me.id || !isBlockedBetween(me.id, r.owner_id))
-      .map((r) => ({
-        id: r.id,
-        kind: r.kind as "image" | "video",
-        mimeType: r.mime_type,
-        originalName: r.original_name,
-        sizeBytes: r.size_bytes,
-        createdAt: r.created_at,
-        url: `/api/media/${r.id}`,
-        mine: r.owner_id === me.id,
-      }));
+    const items = (
+      await Promise.all(
+        rows.map(async (r) => {
+          if (r.owner_id !== me.id && (await isBlockedBetween(me.id, r.owner_id))) return null;
+          return {
+            id: r.id,
+            kind: r.kind as "image" | "video",
+            mimeType: r.mime_type,
+            originalName: r.original_name,
+            sizeBytes: r.size_bytes,
+            createdAt: r.created_at,
+            url: `/api/media/${r.id}`,
+            mine: r.owner_id === me.id,
+          };
+        }),
+      )
+    ).filter((item): item is NonNullable<typeof item> => item !== null);
 
     res.json({ items });
   });
 
   // Blocking system (backend-enforced)
-  router.get("/blocks", requireAuth, (req: AuthedRequest, res) => {
+  router.get("/blocks", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
-    const rows = db
+    const rows = (await db
       .prepare(
         `SELECT u.*, b.created_at AS blocked_at
          FROM blocked_users b
@@ -3352,33 +3528,36 @@ export function createApiRouter() {
          WHERE b.blocker_id = ?
          ORDER BY b.created_at DESC`,
       )
-      .all(me.id) as (DbUser & { blocked_at: string })[];
+      .all(me.id)) as (DbUser & { blocked_at: string })[];
 
-    res.json({
-      blockedUsers: rows.map((u) => ({
-        ...toPublicUser(u, false, me.id),
+    const blockedUsers = await Promise.all(
+      rows.map(async (u) => ({
+        ...(await toPublicUser(u, false, me.id)),
         blockedAt: u.blocked_at,
       })),
-    });
+    );
+    res.json({ blockedUsers });
   });
 
-  router.post("/blocks", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/blocks", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const targetId = String((req.body as { targetUserId?: string })?.targetUserId ?? "").trim();
     if (!targetId || targetId === me.id) {
       res.status(400).json({ error: "Valid user required." });
       return;
     }
-    const target = db.prepare("SELECT id FROM users WHERE id = ?").get(targetId);
+    const target = await db.prepare("SELECT id FROM users WHERE id = ?").get(targetId);
     if (!target) {
       res.status(404).json({ error: "User not found." });
       return;
     }
 
     const now = new Date().toISOString();
-    db.prepare(
-      "INSERT OR IGNORE INTO blocked_users (blocker_id, blocked_id, created_at) VALUES (?, ?, ?)",
-    ).run(me.id, targetId, now);
+    await db
+      .prepare(
+        "INSERT INTO blocked_users (blocker_id, blocked_id, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+      )
+      .run(me.id, targetId, now);
 
     sendToUser(targetId, "block:updated", { byUserId: me.id, blocked: true });
     sendToUser(me.id, "block:updated", { targetUserId: targetId, blocked: true });
@@ -3386,13 +3565,12 @@ export function createApiRouter() {
     res.status(201).json({ ok: true, blockedUserId: targetId });
   });
 
-  router.delete("/blocks/:targetId", requireAuth, (req: AuthedRequest, res) => {
+  router.delete("/blocks/:targetId", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const targetId = String(req.params["targetId"] ?? "").trim();
-    db.prepare("DELETE FROM blocked_users WHERE blocker_id = ? AND blocked_id = ?").run(
-      me.id,
-      targetId,
-    );
+    await db
+      .prepare("DELETE FROM blocked_users WHERE blocker_id = ? AND blocked_id = ?")
+      .run(me.id, targetId);
 
     sendToUser(targetId, "block:updated", { byUserId: me.id, blocked: false });
     sendToUser(me.id, "block:updated", { targetUserId: targetId, blocked: false });
@@ -3401,7 +3579,7 @@ export function createApiRouter() {
   });
 
   // Report user safety endpoint
-  router.post("/reports", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/reports", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const {
       reportedUserId,
@@ -3417,7 +3595,7 @@ export function createApiRouter() {
       res.status(400).json({ error: "Valid user to report is required." });
       return;
     }
-    const target = db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(targetId);
+    const target = await db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(targetId);
     if (!target) {
       res.status(404).json({ error: "User not found." });
       return;
@@ -3431,22 +3609,24 @@ export function createApiRouter() {
     }
 
     const reportId = `rep_${crypto.randomUUID()}`;
-    db.prepare(
-      "INSERT INTO user_reports (id, reporter_id, reported_user_id, reason, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).run(
-      reportId,
-      me.id,
-      targetId,
-      cleanReason,
-      String(details).trim().slice(0, 500),
-      new Date().toISOString(),
-    );
+    await db
+      .prepare(
+        "INSERT INTO user_reports (id, reporter_id, reported_user_id, reason, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        reportId,
+        me.id,
+        targetId,
+        cleanReason,
+        String(details).trim().slice(0, 500),
+        new Date().toISOString(),
+      );
 
     res.status(201).json({ ok: true, reportId });
   });
 
   // Backend-enforced call initiation check
-  router.post("/calls/initiate", requireAuth, (req: AuthedRequest, res) => {
+  router.post("/calls/initiate", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const { targetUserId, callType = "audio" } = req.body as {
       targetUserId?: string;
@@ -3457,7 +3637,7 @@ export function createApiRouter() {
       res.status(400).json({ error: "Valid recipient required." });
       return;
     }
-    if (isBlockedBetween(me.id, targetId)) {
+    if (await isBlockedBetween(me.id, targetId)) {
       res.status(403).json({ error: "Cannot initiate call. This user is blocked." });
       return;
     }
@@ -3465,17 +3645,17 @@ export function createApiRouter() {
     sendToUser(targetId, "call:incoming", {
       callId,
       callType: callType === "video" ? "video" : "audio",
-      from: toPublicUser(me, true, targetId),
+      from: await toPublicUser(me, true, targetId),
     });
     res.json({ ok: true, callId });
   });
 
   // Protected per-user reading progress, bookmarks, favorites & history sync
-  router.get("/reading-state", requireAuth, (req: AuthedRequest, res) => {
+  router.get("/reading-state", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
-    const row = db
+    const row = (await db
       .prepare("SELECT state_json, updated_at FROM user_reading_state WHERE user_id = ? LIMIT 1")
-      .get(me.id) as { state_json: string; updated_at: string } | undefined;
+      .get(me.id)) as { state_json: string; updated_at: string } | undefined;
 
     if (!row) {
       res.json({ state: null, updatedAt: null });
@@ -3490,7 +3670,7 @@ export function createApiRouter() {
     }
   });
 
-  router.put("/reading-state", requireAuth, (req: AuthedRequest, res) => {
+  router.put("/reading-state", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const body = req.body as { state?: Record<string, unknown> };
     if (
@@ -3533,11 +3713,13 @@ export function createApiRouter() {
       return;
     }
 
-    db.prepare(
-      `INSERT INTO user_reading_state (user_id, state_json, updated_at)
+    await db
+      .prepare(
+        `INSERT INTO user_reading_state (user_id, state_json, updated_at)
        VALUES (?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at`,
-    ).run(me.id, serialized, now);
+      )
+      .run(me.id, serialized, now);
 
     res.json({ ok: true, updatedAt: now });
   });

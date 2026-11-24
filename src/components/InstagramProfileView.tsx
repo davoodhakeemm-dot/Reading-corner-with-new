@@ -174,19 +174,28 @@ export function InstagramProfileView({
 
     setUploadingGallery(true);
     let uploadedCount = 0;
+    const failures: string[] = [];
     try {
       for (const file of validFiles) {
-        await uploadChatMedia(file);
-        uploadedCount += 1;
+        try {
+          await uploadChatMedia(file);
+          uploadedCount += 1;
+        } catch (error) {
+          failures.push(error instanceof Error ? error.message : `Could not upload ${file.name}.`);
+        }
       }
-      await fetchGallery();
-      toast.success(
-        uploadedCount === 1
-          ? "Added to your private gallery"
-          : `Added ${uploadedCount} items to your private gallery`,
-      );
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Upload failed.");
+      if (uploadedCount > 0) await fetchGallery();
+      if (failures.length === 0) {
+        toast.success(
+          uploadedCount === 1
+            ? "Added to your personal gallery"
+            : `Added ${uploadedCount} items to your personal gallery`,
+        );
+      } else if (uploadedCount > 0) {
+        toast.warning(`${uploadedCount} item(s) added. ${failures.length} could not be uploaded.`);
+      } else {
+        toast.error(failures[0] ?? "Upload failed.");
+      }
     } finally {
       setUploadingGallery(false);
     }
@@ -696,7 +705,7 @@ export function InstagramProfileView({
               <div>
                 <h2 className="font-display text-lg font-bold">Gallery</h2>
                 <p className={cn("text-xs", theme.mutedText)}>
-                  Real photos and videos uploaded from your device or shared in chat.
+                  Your private photos and videos. Add multiple files at once (up to 25 MB each).
                 </p>
               </div>
               <button

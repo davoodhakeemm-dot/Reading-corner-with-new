@@ -59,48 +59,48 @@ function parseSessionTokenFromRequest(req: IncomingMessage): string | null {
   return null;
 }
 
-function resolveUserFromToken(token: string | null): DbUser | null {
+async function resolveUserFromToken(token: string | null): Promise<DbUser | null> {
   if (!token) return null;
   const now = new Date().toISOString();
-  const row = db
+  const row = (await db
     .prepare(
       `SELECT u.* FROM sessions s
        JOIN users u ON u.id = s.user_id
        WHERE s.token_hash = ? AND s.expires_at > ?
        LIMIT 1`,
     )
-    .get(sha256(token), now) as DbUser | undefined;
+    .get(sha256(token), now)) as DbUser | undefined;
   return row ?? null;
 }
 
-export function broadcastPresence(userId: string, online: boolean) {
+export async function broadcastPresence(userId: string, online: boolean) {
   const now = new Date().toISOString();
-  db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, userId);
+  await db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, userId);
 
   // Notify connected non-blocked users so active chats and Discover Users stay live
   for (const connectedUserId of userSockets.keys()) {
-    if (connectedUserId !== userId && !isBlockedBetween(userId, connectedUserId)) {
+    if (connectedUserId !== userId && !(await isBlockedBetween(userId, connectedUserId))) {
       sendToUser(connectedUserId, "presence:update", { userId, online, lastActiveAt: now });
     }
   }
 }
 
-function markPendingDeliveredForUser(userId: string) {
+async function markPendingDeliveredForUser(userId: string) {
   const now = new Date().toISOString();
-  const pendingSenders = db
+  const pendingSenders = (await db
     .prepare(
       "SELECT DISTINCT sender_id FROM messages WHERE recipient_id = ? AND delivered_at IS NULL",
     )
-    .all(userId) as { sender_id: string }[];
+    .all(userId)) as { sender_id: string }[];
 
   if (pendingSenders.length === 0) return;
 
-  db.prepare(
-    "UPDATE messages SET delivered_at = ? WHERE recipient_id = ? AND delivered_at IS NULL",
-  ).run(now, userId);
+  await db
+    .prepare("UPDATE messages SET delivered_at = ? WHERE recipient_id = ? AND delivered_at IS NULL")
+    .run(now, userId);
 
   for (const { sender_id } of pendingSenders) {
-    if (!isBlockedBetween(userId, sender_id)) {
+    if (!(await isBlockedBetween(userId, sender_id))) {
       sendToUser(sender_id, "messages:delivered", {
         byUserId: userId,
         peerId: userId,
@@ -113,7 +113,7 @@ function markPendingDeliveredForUser(userId: string) {
 export function attachWebSocketServer(httpServer: HttpServer) {
   const wss = new WebSocketServer({ noServer: true });
 
-  httpServer.on("upgrade", (req, socket, head) => {
+  httpServer.on("upgrade", async (req, socket, head) => {
     const reqUrl = req.url ?? "";
     const pathname = reqUrl.split("?")[0];
     if (pathname !== "/ws") {
@@ -121,7 +121,7 @@ export function attachWebSocketServer(httpServer: HttpServer) {
     }
 
     const token = parseSessionTokenFromRequest(req);
-    const user = resolveUserFromToken(token);
+    const user = await resolveUserFromToken(token);
     if (!user) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
@@ -158,7 +158,7 @@ export function attachWebSocketServer(httpServer: HttpServer) {
       ws.isAlive = true;
     });
 
-    ws.on("message", (raw) => {
+    ws.on("message", async (raw) => {
       try {
         const data = JSON.parse(raw.toString()) as {
           event?: string;
@@ -168,10 +168,9 @@ export function attachWebSocketServer(httpServer: HttpServer) {
         const payload = data.payload ?? {};
 
         if (event === "ping") {
-          db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(
-            new Date().toISOString(),
-            userId,
-          );
+          await db
+            .prepare("UPDATE users SET last_active_at = ? WHERE id = ?")
+            .run(new Date().toISOString(), userId);
           ws.send(JSON.stringify({ event: "pong", payload: { ts: Date.now() } }));
           return;
         }
@@ -179,17 +178,17 @@ export function attachWebSocketServer(httpServer: HttpServer) {
         if (event === "typing") {
           const peerId = typeof payload["peerId"] === "string" ? payload["peerId"] : "";
           const active = Boolean(payload["active"]);
-          if (!peerId || isBlockedBetween(userId, peerId)) return;
+          if (!peerId || (await isBlockedBetween(userId, peerId))) return;
           sendToUser(peerId, "typing", { fromUserId: userId, active });
           return;
         }
 
         if (event === "messages:seen") {
           const peerId = typeof payload["peerId"] === "string" ? payload["peerId"] : "";
-          if (!peerId || isBlockedBetween(userId, peerId)) return;
+          if (!peerId || (await isBlockedBetween(userId, peerId))) return;
           const key = threadKeyFor(userId, peerId);
           const seenAt = new Date().toISOString();
-          const result = db
+          const result = await db
             .prepare(
               "UPDATE messages SET seen_at = ? WHERE thread_key = ? AND sender_id = ? AND recipient_id = ? AND seen_at IS NULL",
             )
@@ -206,7 +205,7 @@ export function attachWebSocketServer(httpServer: HttpServer) {
           const targetId = typeof payload["targetId"] === "string" ? payload["targetId"] : "";
           const callType = payload["callType"] === "video" ? "video" : "audio";
           if (!targetId || targetId === userId) return;
-          if (isBlockedBetween(userId, targetId)) {
+          if (await isBlockedBetween(userId, targetId)) {
             ws.send(
               JSON.stringify({
                 event: "call:error",
@@ -215,10 +214,12 @@ export function attachWebSocketServer(httpServer: HttpServer) {
             );
             return;
           }
-          const caller = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(userId) as
-            DbUser | undefined;
-          const target = db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(targetId) as
-            { id: string } | undefined;
+          const caller = (await db
+            .prepare("SELECT * FROM users WHERE id = ? LIMIT 1")
+            .get(userId)) as DbUser | undefined;
+          const target = (await db
+            .prepare("SELECT id FROM users WHERE id = ? LIMIT 1")
+            .get(targetId)) as { id: string } | undefined;
           if (!caller || !target) {
             ws.send(
               JSON.stringify({
@@ -252,7 +253,7 @@ export function attachWebSocketServer(httpServer: HttpServer) {
             sendToUser(targetId, "call:incoming", {
               callId,
               callType,
-              from: toPublicUser(caller, true, targetId),
+              from: await toPublicUser(caller, true, targetId),
             });
           }
           sendToUser(userId, "call:ringing", {
@@ -268,7 +269,7 @@ export function attachWebSocketServer(httpServer: HttpServer) {
           const targetId = typeof payload["targetId"] === "string" ? payload["targetId"] : "";
           const callId = typeof payload["callId"] === "string" ? payload["callId"] : "";
           const action = typeof payload["action"] === "string" ? payload["action"] : "";
-          if (!targetId || !action || isBlockedBetween(userId, targetId)) return;
+          if (!targetId || !action || (await isBlockedBetween(userId, targetId))) return;
 
           if (action === "accepted") {
             activeCallPeers.set(userId, { callId, peerId: targetId });
