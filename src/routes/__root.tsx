@@ -105,19 +105,27 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
           "width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content",
       },
       { name: "theme-color", content: "#7c3aed" },
-      { title: "Reading Corner — Read • Explore • Imagine" },
+      { title: "Reading Corner" },
       {
         name: "description",
-        content:
-          "A beautiful, mobile-first reading platform. Discover stories, knowledge and new worlds across languages and categories.",
+        content: "Discover, read and explore amazing books. Join Reading Corner today!",
       },
-      { property: "og:title", content: "Reading Corner" },
+      { property: "og:title", content: "Reading Corner – Read • Explore • Imagine" },
+      { property: "og:site_name", content: "Reading Corner" },
       {
         property: "og:description",
-        content: "Discover stories, knowledge and new worlds — across languages and categories.",
+        content: "Discover, read and explore amazing books. Join Reading Corner today!",
       },
       { property: "og:type", content: "website" },
+      { property: "og:url", content: "https://book-chi-jade.vercel.app/" },
+      { property: "og:image", content: "https://book-chi-jade.vercel.app/og-image.png" },
       { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:title", content: "Reading Corner – Read • Explore • Imagine" },
+      {
+        name: "twitter:description",
+        content: "Discover, read and explore amazing books. Join Reading Corner today!",
+      },
+      { name: "twitter:image", content: "https://book-chi-jade.vercel.app/og-image.png" },
     ],
     links: [
       { rel: "manifest", href: "/manifest.webmanifest" },

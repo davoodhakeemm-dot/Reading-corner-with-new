@@ -589,6 +589,7 @@ function connectRealtime() {
         sendWs("ping", {});
       }
     }, 35_000);
+    void Promise.allSettled([loadConversations(), discoverUsers()]);
   };
 
   socket.onmessage = (evt) => {
@@ -863,6 +864,19 @@ function resetLocalSessionState() {
 function bootstrap() {
   if (initialized || typeof window === "undefined") return;
   initialized = true;
+
+  window.addEventListener("online", () => {
+    if (state.me) {
+      connectRealtime();
+      void Promise.allSettled([loadConversations(), discoverUsers()]);
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && state.me) {
+      connectRealtime();
+      void Promise.allSettled([loadConversations(), discoverUsers()]);
+    }
+  });
 
   const savedSound = localStorage.getItem(SOUND_STORAGE_KEY);
   if (savedSound === "false") {

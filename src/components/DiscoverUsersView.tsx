@@ -53,6 +53,10 @@ export function DiscoverUsersView({
   }, []);
 
   useEffect(() => {
+    void loadList("", "all");
+  }, [loadList]);
+
+  useEffect(() => {
     const t = window.setTimeout(
       () => {
         void loadList(query, filter);
