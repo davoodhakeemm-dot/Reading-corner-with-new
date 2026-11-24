@@ -9,6 +9,7 @@ import multer from "multer";
 import {
   MAX_ACCOUNTS_PER_CONTACT,
   checkRateLimit,
+  createSignedMediaUpload,
   clearRateLimit,
   countAccountsByEmail,
   countAccountsByPhone,
@@ -25,6 +26,7 @@ import {
   hashPassword,
   isAdminUser,
   isBlockedBetween,
+  mediaStorageObjectExists,
   normalizeEmail,
   normalizeHandle,
   normalizePhoneE164,
@@ -2986,7 +2988,129 @@ export function createApiRouter() {
     res.json({ ok: true, updated: result.changes, seenAt });
   });
 
-  // Upload private photo / video / audio media (supports both Firebase ID tokens and SQLite sessions)
+  // Issue a signed storage upload so large media bypasses Vercel's request-body limit.
+  router.post("/media/upload-ticket", async (req: AuthedRequest, res) => {
+    const fbUid = await resolveFirebaseUid(req);
+    const resolved = fbUid ? null : await lookupSessionUser(req);
+    if (!fbUid && !resolved) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    const kind = String(req.body?.kind ?? "");
+    const mimeType = String(req.body?.mimeType ?? "");
+    const sizeBytes = Number(req.body?.sizeBytes);
+    const recipientId =
+      typeof req.body?.recipientId === "string" ? req.body.recipientId.trim() : null;
+    if (
+      !(["image", "video", "audio"] as const).includes(kind as "image" | "video" | "audio") ||
+      !mimeType.startsWith(`${kind}/`) ||
+      !Number.isSafeInteger(sizeBytes) ||
+      sizeBytes < 1 ||
+      sizeBytes > MAX_MEDIA_BYTES
+    ) {
+      res
+        .status(400)
+        .json({ error: "Choose a supported image, video, or audio file up to 25 MB." });
+      return;
+    }
+    if (resolved && recipientId && (await isBlockedBetween(resolved.user.id, recipientId))) {
+      res.status(403).json({ error: "Cannot share media with a blocked user." });
+      return;
+    }
+
+    const id = `${fbUid ? "fbm" : "med"}_${crypto.randomUUID()}`;
+    const ownerKey = fbUid ? `firebase/${fbUid}` : `users/${resolved!.user.id}`;
+    const storageKey = `${ownerKey}/${id}`;
+    const uploadToken = await createSignedMediaUpload(storageKey);
+    res.json({
+      id,
+      kind,
+      mimeType,
+      sizeBytes,
+      originalName: String(req.body?.originalName ?? "media")
+        .replace(/[\\r\\n]/g, "_")
+        .slice(0, 255),
+      createdAt: new Date().toISOString(),
+      url: `/api/media/${id}`,
+      mine: true,
+      storageKey,
+      uploadToken,
+      supabaseUrl: process.env["SUPABASE_URL"] ?? process.env["NEXT_PUBLIC_SUPABASE_URL"],
+      anonKey: process.env["SUPABASE_ANON_KEY"] ?? process.env["NEXT_PUBLIC_SUPABASE_ANON_KEY"],
+      recipientId,
+    });
+  });
+
+  // Persist metadata only after the browser confirms its direct-to-storage upload.
+  router.post("/media/complete", async (req: AuthedRequest, res) => {
+    const fbUid = await resolveFirebaseUid(req);
+    const resolved = fbUid ? null : await lookupSessionUser(req);
+    if (!fbUid && !resolved) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    const id = String(req.body?.id ?? "").trim();
+    const kind = String(req.body?.kind ?? "");
+    const mimeType = String(req.body?.mimeType ?? "");
+    const sizeBytes = Number(req.body?.sizeBytes);
+    const originalName = String(req.body?.originalName ?? "media")
+      .replace(/[\\r\\n]/g, "_")
+      .slice(0, 255);
+    const recipientId =
+      typeof req.body?.recipientId === "string" ? req.body.recipientId.trim() : null;
+    if (
+      !id.startsWith(fbUid ? "fbm_" : "med_") ||
+      !(["image", "video", "audio"] as const).includes(kind as "image" | "video" | "audio") ||
+      !mimeType.startsWith(`${kind}/`) ||
+      !Number.isSafeInteger(sizeBytes) ||
+      sizeBytes < 1 ||
+      sizeBytes > MAX_MEDIA_BYTES
+    ) {
+      res.status(400).json({ error: "Invalid media upload details." });
+      return;
+    }
+    if (resolved && recipientId && (await isBlockedBetween(resolved.user.id, recipientId))) {
+      res.status(403).json({ error: "Cannot share media with a blocked user." });
+      return;
+    }
+
+    const ownerId = fbUid ?? resolved!.user.id;
+    const storageKey = `${fbUid ? `firebase/${ownerId}` : `users/${ownerId}`}/${id}`;
+    if (!(await mediaStorageObjectExists(storageKey))) {
+      res.status(400).json({ error: "The file did not finish uploading. Please try again." });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    if (fbUid) {
+      await db
+        .prepare(
+          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(id, fbUid, recipientId, kind, mimeType, originalName, storageKey, sizeBytes, now);
+    } else {
+      await db
+        .prepare(
+          "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+        )
+        .run(id, ownerId, recipientId, kind, mimeType, originalName, storageKey, sizeBytes, now);
+    }
+
+    res.status(201).json({
+      id,
+      kind,
+      mimeType,
+      originalName,
+      sizeBytes,
+      createdAt: now,
+      url: `/api/media/${id}`,
+      mine: true,
+    });
+  });
+
+  // Legacy multipart path remains for older clients.
   router.post("/media", upload.single("file"), async (req: AuthedRequest, res) => {
     const file = req.file;
     const fbUid = await resolveFirebaseUid(req);
