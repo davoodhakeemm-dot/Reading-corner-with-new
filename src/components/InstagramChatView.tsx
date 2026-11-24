@@ -83,6 +83,9 @@ import { requestFeatureMediaPermission } from "@/lib/permissions";
 import { computeChatKeyboardLayout, type ChatKeyboardLayout } from "@/lib/chat-viewport";
 import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
 import {
+  dedupeConversationsByPeerId,
+  dedupeMessagesById,
+  dedupeUsersById,
   filterConversationsByTab,
   isControlSearchTrigger,
   resolveChatEscapeAction,
@@ -582,38 +585,49 @@ export function InstagramChatView({
     };
   }, [activePeerId, threadSearchOpen, threadSearchQuery]);
 
-  const convPeerIds = useMemo(() => new Set(conversations.map((c) => c.peer.id)), [conversations]);
+  const uniqueConversations = useMemo(
+    () => dedupeConversationsByPeerId(conversations, me?.id),
+    [conversations, me?.id],
+  );
+  const convPeerIds = useMemo(
+    () => new Set(uniqueConversations.map((c) => c.peer.id)),
+    [uniqueConversations],
+  );
   const unreadTotal = useMemo(
-    () => conversations.reduce((acc, c) => acc + c.unreadCount, 0),
-    [conversations],
+    () => uniqueConversations.reduce((acc, c) => acc + c.unreadCount, 0),
+    [uniqueConversations],
   );
   const filteredConversations = useMemo(
-    () => filterConversationsByTab(conversations, chatFilterTab),
-    [conversations, chatFilterTab],
+    () => filterConversationsByTab(uniqueConversations, chatFilterTab),
+    [uniqueConversations, chatFilterTab],
+  );
+  const uniqueDiscoveredUsers = useMemo(
+    () => dedupeUsersById(discoveredUsers, me?.id),
+    [discoveredUsers, me?.id],
   );
   const directoryPeers = useMemo(
-    () => splitChatSidebarUsers(discoveredUsers, convPeerIds),
-    [discoveredUsers, convPeerIds],
+    () => splitChatSidebarUsers(uniqueDiscoveredUsers, convPeerIds),
+    [uniqueDiscoveredUsers, convPeerIds],
   );
 
   const activeConv = useMemo(
-    () => conversations.find((c) => c.peer.id === activePeerId) ?? null,
-    [conversations, activePeerId],
+    () => uniqueConversations.find((c) => c.peer.id === activePeerId) ?? null,
+    [uniqueConversations, activePeerId],
   );
   const activePeer = useMemo(
     () =>
       activeConv?.peer ??
-      (activePeerId ? (discoveredUsers.find((u) => u.id === activePeerId) ?? null) : null),
-    [activeConv, activePeerId, discoveredUsers],
+      (activePeerId ? (uniqueDiscoveredUsers.find((u) => u.id === activePeerId) ?? null) : null),
+    [activeConv, activePeerId, uniqueDiscoveredUsers],
   );
   const activeMessages: ChatMessage[] = useMemo(
-    () => (activePeerId ? (threads[activePeerId] ?? []) : []),
+    () => (activePeerId ? dedupeMessagesById(threads[activePeerId] ?? []) : []),
     [activePeerId, threads],
   );
 
   const visibleMessages = useMemo(() => {
     if (threadSearchOpen && threadSearchQuery.trim() && threadSearchResults !== null) {
-      return threadSearchResults;
+      return dedupeMessagesById(threadSearchResults);
     }
     return activeMessages;
   }, [activeMessages, threadSearchOpen, threadSearchQuery, threadSearchResults]);
@@ -1127,7 +1141,7 @@ export function InstagramChatView({
                 <p className={cn("px-2 py-1 text-xs font-bold", theme.mutedText)}>
                   {searching ? "Searching…" : "People"}
                 </p>
-                {searchResults.map((u, idx) => (
+                {dedupeUsersById(searchResults, me.id).map((u, idx) => (
                   <motion.button
                     key={u.id}
                     initial={{ opacity: 0, y: 8 }}
@@ -2422,9 +2436,9 @@ export function InstagramChatView({
             <p className={cn("mt-1.5 max-w-xs text-sm", theme.mutedText)}>
               Select a reader from the left sidebar or pick one below to message in real time.
             </p>
-            {discoveredUsers.length > 0 && (
+            {uniqueDiscoveredUsers.length > 0 && (
               <div className="mt-4 flex max-w-md flex-wrap justify-center gap-2">
-                {discoveredUsers.slice(0, 6).map((u) => (
+                {uniqueDiscoveredUsers.slice(0, 6).map((u) => (
                   <WaterGlowButton
                     key={u.id}
                     type="button"

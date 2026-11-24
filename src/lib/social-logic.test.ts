@@ -220,3 +220,50 @@ test("isControlSearchTrigger matches control and (control) case-insensitively", 
   assert.equal(isControlSearchTrigger("controllers"), false);
   assert.equal(isControlSearchTrigger("the alchemist"), false);
 });
+
+test("dedupe helpers remove duplicate IDs and excluded IDs while preserving order", async () => {
+  const { dedupeByKey, dedupeUsersById, dedupeConversationsByPeerId, dedupeMessagesById } =
+    await import("./social-logic");
+
+  const users = [
+    { id: "fb_GZ7EMJc5U3X7ke6SF6LbS17hMZu2", name: "First" },
+    { id: "u_2", name: "Second" },
+    { id: "fb_GZ7EMJc5U3X7ke6SF6LbS17hMZu2", name: "Duplicate" },
+    { id: "u_self", name: "Self" },
+  ];
+  assert.deepEqual(
+    dedupeUsersById(users, "u_self").map((u) => [u.id, u.name]),
+    [
+      ["fb_GZ7EMJc5U3X7ke6SF6LbS17hMZu2", "First"],
+      ["u_2", "Second"],
+    ],
+  );
+
+  const convs = [
+    { peer: { id: "fb_GZ7EMJc5U3X7ke6SF6LbS17hMZu2" }, unreadCount: 2 },
+    { peer: { id: "fb_GZ7EMJc5U3X7ke6SF6LbS17hMZu2" }, unreadCount: 0 },
+    { peer: { id: "u_2" }, unreadCount: 1 },
+  ];
+  assert.deepEqual(
+    dedupeConversationsByPeerId(convs).map((c) => [c.peer.id, c.unreadCount]),
+    [
+      ["fb_GZ7EMJc5U3X7ke6SF6LbS17hMZu2", 2],
+      ["u_2", 1],
+    ],
+  );
+
+  const msgs = [
+    { id: "m1", text: "hi" },
+    { id: "m1", text: "hi dup" },
+    { id: "m2", text: "bye" },
+  ];
+  assert.deepEqual(
+    dedupeMessagesById(msgs).map((m) => m.id),
+    ["m1", "m2"],
+  );
+
+  assert.deepEqual(
+    dedupeByKey([{ k: "a" }, { k: "" }, { k: "a" }, { k: "b" }], (x) => x.k),
+    [{ k: "a" }, { k: "b" }],
+  );
+});

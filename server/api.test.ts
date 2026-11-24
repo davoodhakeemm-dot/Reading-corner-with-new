@@ -999,3 +999,292 @@ test("Multi-account linking (max 3 per verified Gmail/phone), 3 login modes, sin
   const checkZoyaStillAlive = await api("/auth/me", { token: usernameLogin.data.token });
   assert.equal(checkZoyaStillAlive.status, 200);
 });
+
+test("Account registration with profile photo upload saves avatar without foreign key failure", async () => {
+  const avatarDataUrl =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const reg = await api<{ token: string; user: { id: string; avatarUrl: string | null } }>(
+    "/auth/register",
+    {
+      method: "POST",
+      body: {
+        fullName: "Photo Reader",
+        username: "photo_reader",
+        email: "photo.reader@example.com",
+        password: "Password123!",
+        avatarDataUrl,
+      },
+    },
+  );
+  assert.equal(reg.status, 201);
+  assert.ok(reg.data.user.avatarUrl?.startsWith("/api/media/"));
+
+  const avatarRes = await fetch(`${baseUrl.replace(/\/api$/, "")}${reg.data.user.avatarUrl}`, {
+    headers: { Authorization: `Bearer ${reg.data.token}` },
+  });
+  assert.equal(avatarRes.status, 200);
+  assert.equal(avatarRes.headers.get("content-type"), "image/png");
+});
+
+test("Directory, search, conversations, and linked-accounts return strictly unique user IDs", async () => {
+  const reg = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Unique Directory Checker",
+      username: "unique_dir_check",
+      email: "unique.dir@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(reg.status, 201);
+  const token = reg.data.token;
+  const userId = reg.data.user.id;
+
+  const [controlRes, usersRes, searchRes, convRes, linkedRes] = await Promise.all([
+    api<{ users: Array<{ id: string }> }>("/control/users", { token }),
+    api<{ users: Array<{ id: string }> }>("/users", { token }),
+    api<{ users: Array<{ id: string }> }>("/users/search?q=reader", { token }),
+    api<{ conversations: Array<{ peer: { id: string } }> }>("/conversations", { token }),
+    api<{ accounts: Array<{ id: string }> }>("/auth/linked-accounts", { token }),
+  ]);
+
+  assert.equal(controlRes.status, 200);
+  const controlIds = controlRes.data.users.map((u) => u.id);
+  assert.equal(new Set(controlIds).size, controlIds.length);
+  assert.ok(controlIds.includes(userId));
+
+  assert.equal(usersRes.status, 200);
+  const userIds = usersRes.data.users.map((u) => u.id);
+  assert.equal(new Set(userIds).size, userIds.length);
+  assert.equal(userIds.includes(userId), false);
+
+  assert.equal(searchRes.status, 200);
+  const searchIds = searchRes.data.users.map((u) => u.id);
+  assert.equal(new Set(searchIds).size, searchIds.length);
+  assert.equal(searchIds.includes(userId), false);
+
+  assert.equal(convRes.status, 200);
+  const convPeerIds = convRes.data.conversations.map((c) => c.peer.id);
+  assert.equal(new Set(convPeerIds).size, convPeerIds.length);
+
+  assert.equal(linkedRes.status, 200);
+  const linkedIds = linkedRes.data.accounts.map((a) => a.id);
+  assert.equal(new Set(linkedIds).size, linkedIds.length);
+});
+
+test("POST account removal routes succeed without DELETE body dependency", async () => {
+  const actor = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Post Remove Actor",
+      username: "post_remove_actor",
+      email: "post.remove.actor@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(actor.status, 201);
+  db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(actor.data.user.id);
+
+  const victim = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Post Remove Target",
+      username: "post_remove_target",
+      email: "post.remove.target@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(victim.status, 201);
+
+  const emptyCodeRes = await api(
+    `/control/users/${encodeURIComponent(victim.data.user.id)}/remove`,
+    {
+      method: "POST",
+      token: actor.data.token,
+      body: { code: "" },
+    },
+  );
+  assert.equal(emptyCodeRes.status, 400);
+
+  const wrongCodeRes = await api(
+    `/control/users/${encodeURIComponent(victim.data.user.id)}/remove`,
+    {
+      method: "POST",
+      token: actor.data.token,
+      body: { code: "9999" },
+    },
+  );
+  assert.equal(wrongCodeRes.status, 403);
+
+  const postRemoveRes = await api<{ ok: boolean; deletedUserId: string }>(
+    `/control/users/${encodeURIComponent(victim.data.user.id)}/remove`,
+    {
+      method: "POST",
+      token: actor.data.token,
+      body: { code: "2233" },
+    },
+  );
+  assert.equal(postRemoveRes.status, 200);
+  assert.equal(postRemoveRes.data.ok, true);
+  assert.equal(postRemoveRes.data.deletedUserId, victim.data.user.id);
+
+  const victimAfter = await api("/auth/me", { token: victim.data.token });
+  assert.equal(victimAfter.status, 401);
+
+  // Victim 2 removed using admin's account password instead of 2233
+  const victim2 = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Post Remove Target Two",
+      username: "post_remove_target_2",
+      email: "post.remove.target2@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(victim2.status, 201);
+
+  const adminPassRemoveRes = await api<{ ok: boolean; deletedUserId: string }>(
+    `/control/users/${encodeURIComponent(victim2.data.user.id)}/remove`,
+    {
+      method: "POST",
+      token: actor.data.token,
+      body: { code: "Password123!" },
+    },
+  );
+  assert.equal(adminPassRemoveRes.status, 200);
+  assert.equal(adminPassRemoveRes.data.deletedUserId, victim2.data.user.id);
+
+  const selfDeleteRes = await api<{ ok: boolean; deletedUserId: string }>("/auth/account/delete", {
+    method: "POST",
+    token: actor.data.token,
+    body: {
+      password: "Password123!",
+      securityKey: "2233",
+    },
+  });
+  assert.equal(selfDeleteRes.status, 200);
+  assert.equal(selfDeleteRes.data.deletedUserId, actor.data.user.id);
+});
+
+test("Media upload ticket falls back cleanly and multipart image/video uploads succeed", async () => {
+  const sender = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Media Sender",
+      username: "media_sender",
+      email: "media.sender@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(sender.status, 201);
+
+  const recipient = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Media Recipient",
+      username: "media_recipient",
+      email: "media.recipient@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(recipient.status, 201);
+
+  // 1. Upload ticket returns undefined supabaseUrl when Supabase is unconfigured
+  const ticketRes = await api<{
+    id: string;
+    supabaseUrl?: string;
+    anonKey?: string;
+    url: string;
+  }>("/media/upload-ticket", {
+    method: "POST",
+    token: sender.data.token,
+    body: {
+      kind: "image",
+      mimeType: "image/jpeg",
+      originalName: "photo.jpg",
+      sizeBytes: 1024,
+      recipientId: recipient.data.user.id,
+    },
+  });
+  assert.equal(ticketRes.status, 200);
+  assert.equal(ticketRes.data.supabaseUrl, undefined);
+  assert.equal(ticketRes.data.anonKey, undefined);
+
+  // 2. Direct multipart upload via /media works for image
+  const imgBytes = Buffer.from("fake-jpg-content-for-testing");
+  const imgForm = new FormData();
+  imgForm.append("file", new Blob([imgBytes], { type: "image/jpeg" }), "vacation.jpg");
+  imgForm.append("recipientId", recipient.data.user.id);
+
+  const uploadImgRes = await fetch(`${baseUrl}/media`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${sender.data.token}` },
+    body: imgForm,
+  });
+  assert.equal(uploadImgRes.status, 201);
+  const uploadedImg = (await uploadImgRes.json()) as {
+    id: string;
+    kind: string;
+    mimeType: string;
+    originalName: string;
+    url: string;
+    mine: boolean;
+  };
+  assert.equal(uploadedImg.kind, "image");
+  assert.equal(uploadedImg.mimeType, "image/jpeg");
+  assert.equal(uploadedImg.originalName, "vacation.jpg");
+
+  // 3. Sender can download the image
+  const senderGet = await fetch(`${baseUrl}/media/${uploadedImg.id}`, {
+    headers: { Authorization: `Bearer ${sender.data.token}` },
+  });
+  assert.equal(senderGet.status, 200);
+  assert.equal(senderGet.headers.get("content-type"), "image/jpeg");
+  const senderBytes = Buffer.from(await senderGet.arrayBuffer());
+  assert.deepEqual(senderBytes, imgBytes);
+
+  // 4. Recipient can download the image because recipientId was specified
+  const recipientGet = await fetch(`${baseUrl}/media/${uploadedImg.id}`, {
+    headers: { Authorization: `Bearer ${recipient.data.token}` },
+  });
+  assert.equal(recipientGet.status, 200);
+  assert.equal(recipientGet.headers.get("content-type"), "image/jpeg");
+
+  // 5. Direct multipart upload works for video
+  const vidBytes = Buffer.from("fake-mp4-video-stream-data");
+  const vidForm = new FormData();
+  vidForm.append("file", new Blob([vidBytes], { type: "video/mp4" }), "clip.mp4");
+  vidForm.append("recipientId", recipient.data.user.id);
+
+  const uploadVidRes = await fetch(`${baseUrl}/media`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${sender.data.token}` },
+    body: vidForm,
+  });
+  assert.equal(uploadVidRes.status, 201);
+  const uploadedVid = (await uploadVidRes.json()) as {
+    id: string;
+    kind: string;
+    mimeType: string;
+    originalName: string;
+  };
+  assert.equal(uploadedVid.kind, "video");
+  assert.equal(uploadedVid.mimeType, "video/mp4");
+
+  // 6. Both image and video appear in sender gallery
+  const galleryRes = await api<{ items: { id: string; kind: string }[] }>("/gallery", {
+    token: sender.data.token,
+  });
+  assert.equal(galleryRes.status, 200);
+  const galleryIds = galleryRes.data.items.map((i) => i.id);
+  assert.ok(galleryIds.includes(uploadedImg.id));
+  assert.ok(galleryIds.includes(uploadedVid.id));
+
+  // 7. Owner can delete media
+  const delRes = await api<{ ok: boolean; id: string }>(`/media/${uploadedImg.id}`, {
+    method: "DELETE",
+    token: sender.data.token,
+  });
+  assert.equal(delRes.status, 200);
+  assert.equal(delRes.data.ok, true);
+});

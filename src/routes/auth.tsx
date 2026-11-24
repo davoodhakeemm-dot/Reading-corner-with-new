@@ -46,12 +46,19 @@ import {
   type LoginMode,
 } from "@/lib/chat-store";
 import { resolveWaterButtonVariant, type SecretThemeId } from "@/lib/secret-themes";
+import { dedupeUsersById } from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
 import { playWaterSound } from "@/lib/water-sound";
 
 export const Route = createFileRoute("/auth")({
-  validateSearch: (search: Record<string, unknown>): { next?: string } =>
-    typeof search["next"] === "string" ? { next: search["next"] } : {},
+  validateSearch: (
+    search: Record<string, unknown>,
+  ): { next?: string; mode?: "login" | "register" | "forgot" } => ({
+    ...(typeof search["next"] === "string" ? { next: search["next"] } : {}),
+    ...(search["mode"] === "login" || search["mode"] === "register" || search["mode"] === "forgot"
+      ? { mode: search["mode"] }
+      : {}),
+  }),
   head: () => ({
     meta: [
       { title: "Sign in — Reading Corner" },
@@ -97,10 +104,10 @@ function GoogleIcon() {
 
 function AuthPage() {
   const navigate = useNavigate();
-  const { next } = Route.useSearch();
+  const { next, mode: initialMode } = Route.useSearch();
   const { ready, me, soundEnabled, otpConfigured } = useChat();
 
-  const [mode, setMode] = useState<AuthMode>("login");
+  const [mode, setMode] = useState<AuthMode>(initialMode ?? "login");
   const [loginMethod, setLoginMethod] = useState<ExplicitLoginMethod>("gmail");
   const [backdropTheme, setBackdropTheme] = useState<SecretThemeId>("instagram");
 
@@ -137,7 +144,7 @@ function AuthPage() {
 
   useEffect(() => {
     if (ready && me) {
-      if (next && next.startsWith("/")) {
+      if (next && next.startsWith("/") && !next.startsWith("/auth")) {
         if (next.startsWith("/nfc/")) {
           window.location.assign(next);
         } else {
@@ -184,7 +191,7 @@ function AuthPage() {
   function goAfterLogin() {
     if (next && next.startsWith("/nfc/")) {
       window.location.assign(next);
-    } else if (next && next.startsWith("/")) {
+    } else if (next && next.startsWith("/") && !next.startsWith("/auth")) {
       navigate({ to: next as "/messages", replace: true });
     } else {
       navigate({ to: "/messages", replace: true });
@@ -446,7 +453,7 @@ function AuthPage() {
   return (
     <div
       className={cn(
-        "relative min-h-[100dvh] overflow-x-hidden px-4 pt-6 pb-[calc(5rem+env(safe-area-inset-bottom))] transition-colors duration-500 sm:px-6 sm:pt-10",
+        "relative min-h-[100dvh] overflow-x-hidden px-4 pt-6 pb-[calc(2rem+env(safe-area-inset-bottom))] transition-colors duration-500 sm:px-6 sm:pt-10 lg:pb-16",
         isDark
           ? "bg-gradient-to-b from-[#070b14] via-[#0d1527] to-[#060a12] text-white"
           : isLiquid
@@ -493,7 +500,6 @@ function AuthPage() {
       </div>
 
       <TripleTapExit />
-      <ReadingActions themeId={backdropTheme} />
 
       <div className="relative mx-auto flex min-h-[calc(100dvh-3.5rem)] w-full max-w-5xl flex-col justify-center lg:grid lg:grid-cols-[1fr_480px] lg:items-center lg:gap-12">
         {/* Left Info & Quick Header */}
@@ -1409,7 +1415,7 @@ function AuthPage() {
                   >
                     <p className="text-xs font-bold">Choose which linked profile to open:</p>
                     <div className="space-y-1.5">
-                      {accountChoices.map((acc) => (
+                      {dedupeUsersById(accountChoices).map((acc) => (
                         <button
                           key={acc.id}
                           type="button"
@@ -1534,6 +1540,11 @@ function AuthPage() {
           </AnimatePresence>
         </motion.div>
       </div>
+
+      <ReadingActions
+        themeId={backdropTheme}
+        className="max-lg:static max-lg:mt-5 max-lg:justify-center"
+      />
     </div>
   );
 }

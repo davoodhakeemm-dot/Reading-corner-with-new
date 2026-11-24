@@ -190,3 +190,52 @@ export function isControlSearchTrigger(value: string): boolean {
   const normalized = value.trim().toLowerCase();
   return normalized === "control" || normalized === "(control)";
 }
+
+export function dedupeByKey<T>(items: readonly T[], getKey: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const item of items) {
+    const key = getKey(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+export function dedupeUsersById<T extends { id: string }>(
+  users: readonly T[],
+  excludeUserId?: string | null,
+): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const user of users) {
+    if (!user?.id) continue;
+    if (excludeUserId && user.id === excludeUserId) continue;
+    if (seen.has(user.id)) continue;
+    seen.add(user.id);
+    out.push(user);
+  }
+  return out;
+}
+
+export function dedupeConversationsByPeerId<T extends { peer: { id: string } }>(
+  conversations: readonly T[],
+  excludePeerId?: string | null,
+): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const conv of conversations) {
+    const peerId = conv?.peer?.id;
+    if (!peerId) continue;
+    if (excludePeerId && peerId === excludePeerId) continue;
+    if (seen.has(peerId)) continue;
+    seen.add(peerId);
+    out.push(conv);
+  }
+  return out;
+}
+
+export function dedupeMessagesById<T extends { id: string }>(messages: readonly T[]): T[] {
+  return dedupeByKey(messages, (m) => m.id);
+}

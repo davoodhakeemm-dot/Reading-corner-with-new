@@ -23,7 +23,15 @@ import { createCallClient, type CallSignalMessage } from "./call-client";
 import { isActiveElementTextInput } from "./chat-viewport";
 import { compressAvatarDataUrl, getFirebaseAuth, googleProvider } from "@/lib/firebase";
 import type { SecretThemeId } from "@/lib/secret-themes";
-import { filterAndSortUsers, normalizeEmail, threadKeyFor } from "@/lib/social-logic";
+import {
+  dedupeByKey,
+  dedupeConversationsByPeerId,
+  dedupeMessagesById,
+  dedupeUsersById,
+  filterAndSortUsers,
+  normalizeEmail,
+  threadKeyFor,
+} from "@/lib/social-logic";
 
 export type MediaKind = "image" | "video" | "audio";
 export type LoginMode = "gmail" | "phone" | "username" | "auto";
@@ -260,7 +268,20 @@ const INITIAL: ChatClientState = {
 let state: ChatClientState = INITIAL;
 const listeners = new Set<() => void>();
 let initialized = false;
-let suppressFirebaseSync = false;
+let suppressFirebaseSyncDepth = 0;
+
+function isFirebaseSyncSuppressed(): boolean {
+  return suppressFirebaseSyncDepth > 0;
+}
+
+async function withFirebaseSyncSuppressed<T>(fn: () => Promise<T>): Promise<T> {
+  suppressFirebaseSyncDepth += 1;
+  try {
+    return await fn();
+  } finally {
+    suppressFirebaseSyncDepth = Math.max(0, suppressFirebaseSyncDepth - 1);
+  }
+}
 
 let ws: WebSocket | null = null;
 let wsReconnectTimer: number | null = null;
@@ -322,7 +343,7 @@ async function getBearerHeaders(extra?: Record<string, string>): Promise<Record<
     headers["Authorization"] = `Bearer ${state.sessionToken}`;
   } else if (typeof window !== "undefined") {
     const fbUser = getFirebaseAuth().currentUser;
-    if (fbUser && !state.me) {
+    if (fbUser) {
       const idToken = await fbUser.getIdToken().catch(() => null);
       if (idToken) headers["Authorization"] = `Bearer ${idToken}`;
     }
@@ -449,7 +470,7 @@ function upsertMessageIntoThread(peerId: string, incoming: ChatMessage) {
       m.id !== incoming.id &&
       !(m.id.startsWith("temp_") && m.from === incoming.from && m.text === incoming.text),
   );
-  const next = [...filtered, incoming].sort(
+  const next = dedupeMessagesById([...filtered, incoming]).sort(
     (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
   );
   setState({
@@ -503,7 +524,7 @@ function handleIncomingMessageEvent(msg: ChatMessage, sender?: PublicAccount) {
       };
 
   const rest = state.conversations.filter((c) => c.peer.id !== peerId);
-  const sorted = [nextConv, ...rest].sort((a, b) => {
+  const sorted = dedupeConversationsByPeerId([nextConv, ...rest], myId).sort((a, b) => {
     if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
     return (b.lastMessage?.createdAt ?? "").localeCompare(a.lastMessage?.createdAt ?? "");
   });
@@ -620,7 +641,12 @@ function connectRealtime() {
         const incomingUser = payload["user"] as PublicAccount | undefined;
         if (incomingUser && incomingUser.id !== state.me?.id) {
           const rest = state.discoveredUsers.filter((u) => u.id !== incomingUser.id);
-          setState({ discoveredUsers: filterAndSortUsers([incomingUser, ...rest], "", "all") });
+          setState({
+            discoveredUsers: dedupeUsersById(
+              filterAndSortUsers([incomingUser, ...rest], "", "all"),
+              state.me?.id,
+            ),
+          });
         }
         return;
       }
@@ -885,6 +911,23 @@ function bootstrap() {
 
   let serverCheckResolved = false;
 
+  const bridgeFirebaseUser = async (fbUser: FirebaseUser) => {
+    if (state.me && state.sessionToken) return;
+    try {
+      const idToken = await fbUser.getIdToken();
+      const data = await apiJson<{ token: string; user: PublicAccount }>(
+        "/api/auth/firebase-session",
+        {
+          method: "POST",
+          body: { idToken },
+        },
+      );
+      await hydrateAuthenticatedSession(data.user, data.token);
+    } catch {
+      setState({ ready: true });
+    }
+  };
+
   void (async () => {
     try {
       const [healthRes, sessionRes] = await Promise.all([
@@ -917,16 +960,20 @@ function bootstrap() {
     }
     serverCheckResolved = true;
     const fbUser = getFirebaseAuth().currentUser;
-    if (!fbUser && !state.me) {
+    if (fbUser && !state.me && !isFirebaseSyncSuppressed()) {
+      await bridgeFirebaseUser(fbUser);
+      return;
+    }
+    if (!state.me) {
       setState({ ready: true });
     }
   })();
 
   const auth = getFirebaseAuth();
   onAuthStateChanged(auth, (fbUser) => {
-    if (suppressFirebaseSync) return;
+    if (isFirebaseSyncSuppressed() || !serverCheckResolved) return;
     if (!fbUser) {
-      if (serverCheckResolved && !state.me) {
+      if (!state.me) {
         setState({ ready: true });
       }
       return;
@@ -937,21 +984,7 @@ function bootstrap() {
       return;
     }
 
-    void (async () => {
-      try {
-        const idToken = await fbUser.getIdToken();
-        const data = await apiJson<{ token: string; user: PublicAccount }>(
-          "/api/auth/firebase-session",
-          {
-            method: "POST",
-            body: { idToken },
-          },
-        );
-        await hydrateAuthenticatedSession(data.user, data.token);
-      } catch {
-        setState({ ready: true });
-      }
-    })();
+    void bridgeFirebaseUser(fbUser);
   });
 }
 
@@ -998,29 +1031,46 @@ function mapFirebaseAuthError(err: unknown): Error & { needsProviderConfig?: boo
       "Browser blocked the Google sign-in popup. Please allow popups and try again.",
     );
   }
+  if (code === "auth/unauthorized-domain") {
+    return new Error(
+      "Google sign-in is not authorized on this domain yet. Sign in with Gmail, Phone, or Username below.",
+    );
+  }
+  if (code === "auth/operation-not-allowed") {
+    const e = new Error(
+      "This sign-in method is not enabled in Firebase Authentication.",
+    ) as Error & { needsProviderConfig?: boolean };
+    e.needsProviderConfig = true;
+    return e;
+  }
+  if (code === "auth/network-request-failed") {
+    return new Error("Network error while connecting to authentication service. Please try again.");
+  }
+  if (code === "auth/user-disabled") {
+    return new Error("This account has been disabled.");
+  }
   return err instanceof Error ? err : new Error("Authentication failed.");
 }
 
 export async function signInWithGoogle(): Promise<PublicAccount> {
   const auth = getFirebaseAuth();
-  suppressFirebaseSync = true;
-  try {
-    const cred = await signInWithPopup(auth, googleProvider);
-    const idToken = await cred.user.getIdToken();
-    const data = await apiJson<{ token: string; user: PublicAccount }>(
-      "/api/auth/firebase-session",
-      {
-        method: "POST",
-        body: { idToken },
-      },
-    );
-    await hydrateAuthenticatedSession(data.user, data.token);
-    return data.user;
-  } catch (err) {
-    throw mapFirebaseAuthError(err);
-  } finally {
-    suppressFirebaseSync = false;
-  }
+  return withFirebaseSyncSuppressed(async () => {
+    try {
+      const cred = await signInWithPopup(auth, googleProvider);
+      const idToken = await cred.user.getIdToken();
+      const data = await apiJson<{ token: string; user: PublicAccount }>(
+        "/api/auth/firebase-session",
+        {
+          method: "POST",
+          body: { idToken },
+        },
+      );
+      await hydrateAuthenticatedSession(data.user, data.token);
+      return data.user;
+    } catch (err) {
+      throw mapFirebaseAuthError(err);
+    }
+  });
 }
 
 export async function getFreshGoogleReauthToken(): Promise<string> {
@@ -1146,12 +1196,12 @@ export async function registerAccount(input: {
 
   // Best-effort Firebase mirror for non-linked first email signup so Firebase Forgot Password works out of the box
   if (cleanEmail && !input.linkToExisting) {
-    suppressFirebaseSync = true;
+    suppressFirebaseSyncDepth += 1;
     void createUserWithEmailAndPassword(getFirebaseAuth(), cleanEmail, input.password)
       .then((cred) => updateProfile(cred.user, { displayName: cleanName }))
       .catch(() => {})
       .finally(() => {
-        suppressFirebaseSync = false;
+        suppressFirebaseSyncDepth = Math.max(0, suppressFirebaseSyncDepth - 1);
       });
   }
 
@@ -1194,8 +1244,7 @@ export async function loginAccount(input: {
     );
   }
 
-  suppressFirebaseSync = true;
-  try {
+  return withFirebaseSyncSuppressed(async () => {
     const resp = await fetch("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1259,15 +1308,17 @@ export async function loginAccount(input: {
     }
 
     throw new Error(data.error || "Invalid credentials.");
-  } finally {
-    suppressFirebaseSync = false;
-  }
+  });
 }
 
 export const loginWithPhone = loginAccount;
 
 export async function fetchLinkedAccounts(): Promise<LinkedAccountsInfo> {
-  return apiJson<LinkedAccountsInfo>("/api/auth/linked-accounts");
+  const data = await apiJson<LinkedAccountsInfo>("/api/auth/linked-accounts");
+  return {
+    ...data,
+    accounts: dedupeUsersById(data.accounts ?? []),
+  };
 }
 
 export async function createLinkedAccount(input: {
@@ -1361,8 +1412,7 @@ export async function loginWithPersonalLink(token: string): Promise<PublicAccoun
     throw new Error(data.error || "This link is invalid or was revoked.");
   }
 
-  suppressFirebaseSync = true;
-  try {
+  return withFirebaseSyncSuppressed(async () => {
     await signOut(getFirebaseAuth()).catch(() => {});
     disconnectRealtime();
     clearMediaBlobCache();
@@ -1378,16 +1428,14 @@ export async function loginWithPersonalLink(token: string): Promise<PublicAccoun
     });
     await hydrateAuthenticatedSession(data.user, data.token);
     return data.user;
-  } finally {
-    suppressFirebaseSync = false;
-  }
+  });
 }
 
 export async function searchControlUsers(q = ""): Promise<ControlUserRecord[]> {
   const data = await apiJson<{ users: ControlUserRecord[] }>(
     `/api/control/users?q=${encodeURIComponent(q)}`,
   );
-  return data.users ?? [];
+  return dedupeUsersById(data.users ?? []);
 }
 
 export async function removeControlUser(
@@ -1395,24 +1443,23 @@ export async function removeControlUser(
   code: string,
 ): Promise<{ ok: boolean; deletedUserId: string; selfDeleted: boolean }> {
   const res = await apiJson<{ ok: boolean; deletedUserId: string; selfDeleted: boolean }>(
-    `/api/control/users/${encodeURIComponent(userId)}`,
+    `/api/control/users/${encodeURIComponent(userId)}/remove`,
     {
-      method: "DELETE",
+      method: "POST",
       body: { code },
     },
   );
   if (res.selfDeleted || state.me?.id === userId) {
-    suppressFirebaseSync = true;
-    try {
+    await withFirebaseSyncSuppressed(async () => {
       await signOut(getFirebaseAuth()).catch(() => {});
       resetLocalSessionState();
-    } finally {
-      suppressFirebaseSync = false;
-    }
+    });
   } else {
     setState({
       discoveredUsers: state.discoveredUsers.filter((u) => u.id !== userId),
       conversations: state.conversations.filter((c) => c.peer.id !== userId),
+      blockedUsers: state.blockedUsers.filter((u) => u.id !== userId),
+      activePeerId: state.activePeerId === userId ? null : state.activePeerId,
     });
   }
   return res;
@@ -1454,8 +1501,7 @@ export async function confirmEmailPasswordReset(input: {
 }
 
 export async function logout() {
-  suppressFirebaseSync = true;
-  try {
+  await withFirebaseSyncSuppressed(async () => {
     await fetch("/api/auth/logout", {
       method: "POST",
       headers: await getBearerHeaders(),
@@ -1463,9 +1509,7 @@ export async function logout() {
     }).catch(() => {});
     await signOut(getFirebaseAuth()).catch(() => {});
     resetLocalSessionState();
-  } finally {
-    suppressFirebaseSync = false;
-  }
+  });
 }
 
 export async function deleteAccount(input: {
@@ -1473,16 +1517,18 @@ export async function deleteAccount(input: {
   firebaseIdToken?: string;
   securityKey: string;
 }): Promise<void> {
-  await apiJson("/api/auth/account", {
-    method: "DELETE",
-    body: {
-      password: input.password,
-      firebaseIdToken: input.firebaseIdToken,
-      securityKey: input.securityKey,
-    },
+  await withFirebaseSyncSuppressed(async () => {
+    await apiJson("/api/auth/account/delete", {
+      method: "POST",
+      body: {
+        password: input.password,
+        firebaseIdToken: input.firebaseIdToken,
+        securityKey: input.securityKey,
+      },
+    });
+    await signOut(getFirebaseAuth()).catch(() => {});
+    resetLocalSessionState();
   });
-  await signOut(getFirebaseAuth()).catch(() => {});
-  resetLocalSessionState();
 }
 
 export async function sendOtp(input: {
@@ -1652,10 +1698,11 @@ export async function discoverUsers(
   const data = await apiJson<{ users: PublicAccount[] }>(
     `/api/users?q=${encodeURIComponent(q)}&filter=${encodeURIComponent(filter)}`,
   );
+  const uniqueUsers = dedupeUsersById(data.users ?? [], state.me.id);
   if (!q && filter === "all") {
-    setState({ discoveredUsers: data.users });
+    setState({ discoveredUsers: uniqueUsers });
   }
-  return data.users;
+  return uniqueUsers;
 }
 
 export async function searchUsers(q: string): Promise<PublicAccount[]> {
@@ -1663,7 +1710,7 @@ export async function searchUsers(q: string): Promise<PublicAccount[]> {
   const data = await apiJson<{ users: PublicAccount[] }>(
     `/api/users/search?q=${encodeURIComponent(q)}`,
   );
-  return data.users;
+  return dedupeUsersById(data.users ?? [], state.me.id);
 }
 
 export async function fetchUserProfile(userId: string): Promise<PublicAccount> {
@@ -1710,8 +1757,9 @@ export async function unfollowUser(userId: string) {
 export async function loadConversations(): Promise<ConversationItem[]> {
   if (!state.me) return [];
   const data = await apiJson<{ conversations: ConversationItem[] }>("/api/conversations");
-  setState({ conversations: data.conversations });
-  return data.conversations;
+  const uniqueConversations = dedupeConversationsByPeerId(data.conversations ?? [], state.me.id);
+  setState({ conversations: uniqueConversations });
+  return uniqueConversations;
 }
 
 export function dismissIncomingMessageAlert() {
@@ -1740,11 +1788,12 @@ export async function openThread(peerId: string | null) {
     messages: ChatMessage[];
   }>(`/api/messages/${encodeURIComponent(peerId)}`);
 
-  setState({
-    threads: { ...state.threads, [peerId]: data.messages },
-    conversations: state.conversations.some((c) => c.peer.id === peerId)
+  const resolvedPeerId = data.peer?.id || peerId;
+  const uniqueMessages = dedupeMessagesById(data.messages ?? []);
+  const nextConversations = dedupeConversationsByPeerId(
+    state.conversations.some((c) => c.peer.id === resolvedPeerId || c.peer.id === peerId)
       ? state.conversations.map((c) =>
-          c.peer.id === peerId
+          c.peer.id === resolvedPeerId || c.peer.id === peerId
             ? {
                 ...c,
                 peer: data.peer,
@@ -1764,10 +1813,16 @@ export async function openThread(peerId: string | null) {
             blockedMe: data.blockedMe,
             pinned: data.pinned,
             muted: data.muted,
-            lastMessage: data.messages[data.messages.length - 1] ?? null,
+            lastMessage: uniqueMessages[uniqueMessages.length - 1] ?? null,
             unreadCount: 0,
           },
         ],
+    state.me?.id,
+  );
+
+  setState({
+    threads: { ...state.threads, [peerId]: uniqueMessages },
+    conversations: nextConversations,
   });
 
   await markThreadSeen(peerId);
@@ -1797,6 +1852,50 @@ export async function markThreadSeen(peerId: string) {
   });
 }
 
+async function uploadMediaViaServer(file: File, recipientId?: string) {
+  const formData = new FormData();
+  formData.append("file", file);
+  if (recipientId) {
+    formData.append("recipientId", recipientId);
+  }
+  const headers = await getBearerHeaders();
+  delete headers["Content-Type"];
+
+  const resp = await fetch("/api/media", {
+    method: "POST",
+    headers,
+    credentials: "include",
+    body: formData,
+  });
+  const data = (await resp.json().catch(() => ({}))) as {
+    id?: string;
+    kind?: MediaKind;
+    mimeType?: string;
+    originalName?: string;
+    sizeBytes?: number;
+    createdAt?: string;
+    url?: string;
+    mine?: boolean;
+    error?: string;
+  };
+  if (!resp.ok || !data.id) {
+    throw new Error(data.error || `Could not upload ${file.name} (${resp.status})`);
+  }
+  const kind: MediaKind =
+    data.kind ??
+    (file.type.startsWith("video/") ? "video" : file.type.startsWith("audio/") ? "audio" : "image");
+  return {
+    id: data.id,
+    kind,
+    mimeType: data.mimeType ?? file.type,
+    originalName: data.originalName ?? file.name,
+    sizeBytes: data.sizeBytes ?? file.size,
+    createdAt: data.createdAt ?? new Date().toISOString(),
+    url: data.url ?? `/api/media/${data.id}`,
+    mine: true,
+  };
+}
+
 export async function uploadChatMedia(file: File, recipientId?: string) {
   if (!state.me) throw new Error("Authentication required.");
   const kind: MediaKind | null = file.type.startsWith("image/")
@@ -1808,7 +1907,7 @@ export async function uploadChatMedia(file: File, recipientId?: string) {
         : null;
   if (!kind) throw new Error("Choose a supported image, video, or audio file.");
 
-  const ticket = await apiJson<{
+  let data: {
     id: string;
     kind: MediaKind;
     mimeType: string;
@@ -1817,55 +1916,76 @@ export async function uploadChatMedia(file: File, recipientId?: string) {
     createdAt: string;
     url: string;
     mine: boolean;
-    storageKey: string;
-    uploadToken: string;
-    supabaseUrl: string;
-    anonKey: string;
-    recipientId: string | null;
-  }>("/api/media/upload-ticket", {
-    method: "POST",
-    body: {
-      kind,
-      mimeType: file.type,
-      originalName: file.name,
-      sizeBytes: file.size,
-      ...(recipientId ? { recipientId } : {}),
-    },
-  });
+  } | null = null;
 
-  if (!ticket.supabaseUrl || !ticket.anonKey) {
-    throw new Error("Media storage is not configured for direct uploads.");
+  // 1. Attempt direct signed storage upload if Supabase is configured
+  try {
+    const ticket = await apiJson<{
+      id: string;
+      kind: MediaKind;
+      mimeType: string;
+      originalName: string;
+      sizeBytes: number;
+      createdAt: string;
+      url: string;
+      mine: boolean;
+      storageKey: string;
+      uploadToken: string;
+      supabaseUrl?: string;
+      anonKey?: string;
+      recipientId: string | null;
+    }>("/api/media/upload-ticket", {
+      method: "POST",
+      body: {
+        kind,
+        mimeType: file.type,
+        originalName: file.name,
+        sizeBytes: file.size,
+        ...(recipientId ? { recipientId } : {}),
+      },
+    });
+
+    if (ticket?.supabaseUrl && ticket?.anonKey && ticket?.uploadToken) {
+      const storageClient = createClient(ticket.supabaseUrl, ticket.anonKey);
+      const { error: uploadError } = await storageClient.storage
+        .from("reading-corner-media")
+        .uploadToSignedUrl(ticket.storageKey, ticket.uploadToken, file, {
+          contentType: file.type,
+          upsert: true,
+        });
+
+      if (!uploadError) {
+        data = await apiJson<{
+          id: string;
+          kind: MediaKind;
+          mimeType: string;
+          originalName: string;
+          sizeBytes: number;
+          createdAt: string;
+          url: string;
+          mine: boolean;
+        }>("/api/media/complete", {
+          method: "POST",
+          body: {
+            id: ticket.id,
+            kind: ticket.kind,
+            mimeType: ticket.mimeType,
+            originalName: ticket.originalName,
+            sizeBytes: ticket.sizeBytes,
+            ...(ticket.recipientId ? { recipientId: ticket.recipientId } : {}),
+          },
+        });
+      }
+    }
+  } catch {
+    // If ticket generation or signed URL storage upload fails, smoothly fall through to server upload
+    data = null;
   }
 
-  const storageClient = createClient(ticket.supabaseUrl, ticket.anonKey);
-  const { error: uploadError } = await storageClient.storage
-    .from("reading-corner-media")
-    .uploadToSignedUrl(ticket.storageKey, ticket.uploadToken, file, {
-      contentType: file.type,
-      upsert: true,
-    });
-  if (uploadError) throw new Error(`Could not upload ${file.name}: ${uploadError.message}`);
-
-  const data = await apiJson<{
-    id: string;
-    kind: MediaKind;
-    mimeType: string;
-    originalName: string;
-    sizeBytes: number;
-    createdAt: string;
-    url: string;
-    mine: boolean;
-  }>("/api/media/complete", {
-    method: "POST",
-    body: {
-      id: ticket.id,
-      kind: ticket.kind,
-      mimeType: ticket.mimeType,
-      originalName: ticket.originalName,
-      sizeBytes: ticket.sizeBytes,
-      ...(ticket.recipientId ? { recipientId: ticket.recipientId } : {}),
-    },
-  });
+  // 2. Direct server upload fallback (works across local SQLite, container disk, and server storage)
+  if (!data) {
+    data = await uploadMediaViaServer(file, recipientId);
+  }
 
   primeMediaObjectUrl(data.url, file);
   uploadedMediaMeta.set(data.id, { url: data.url, kind: data.kind, name: data.originalName });
@@ -2035,7 +2155,7 @@ export async function fetchGallery(): Promise<GalleryItem[]> {
   if (!state.me) return [];
   try {
     const data = await apiJson<{ items?: GalleryItem[] }>("/api/gallery");
-    const items = Array.isArray(data.items) ? data.items : [];
+    const items = dedupeByKey(Array.isArray(data.items) ? data.items : [], (item) => item.id);
     for (const item of items) {
       uploadedMediaMeta.set(item.id, {
         url: item.url,
@@ -2069,8 +2189,9 @@ export async function deleteGalleryMedia(mediaId: string): Promise<void> {
 export async function loadBlocks() {
   if (!state.me) return [];
   const data = await apiJson<{ blockedUsers: BlockedUserItem[] }>("/api/blocks");
-  setState({ blockedUsers: data.blockedUsers });
-  return data.blockedUsers;
+  const uniqueBlocked = dedupeUsersById(data.blockedUsers ?? [], state.me.id);
+  setState({ blockedUsers: uniqueBlocked });
+  return uniqueBlocked;
 }
 
 export async function blockUser(targetUserId: string) {

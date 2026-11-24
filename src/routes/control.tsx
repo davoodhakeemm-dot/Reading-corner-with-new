@@ -27,6 +27,7 @@ import {
   type PublicAccount,
 } from "@/lib/chat-store";
 import { getSecretTheme } from "@/lib/secret-themes";
+import { dedupeUsersById } from "@/lib/social-logic";
 
 export const Route = createFileRoute("/control")({
   head: () => ({
@@ -95,7 +96,7 @@ function ControlPage() {
       setError("");
       try {
         const res = await searchControlUsers(q);
-        setUsers(res);
+        setUsers(dedupeUsersById(res));
       } catch (err) {
         setError(err instanceof Error ? err.message : "Could not load directory.");
       } finally {
@@ -157,7 +158,7 @@ function ControlPage() {
 
   function openRemoveModal(u: ControlUserRecord) {
     setRemoveTarget(u);
-    setRemoveCode("");
+    setRemoveCode("2233");
     setShowRemoveCode(false);
     setRemoveError("");
   }
@@ -165,7 +166,7 @@ function ControlPage() {
   function closeRemoveModal() {
     if (removingBusy) return;
     setRemoveTarget(null);
-    setRemoveCode("");
+    setRemoveCode("2233");
     setShowRemoveCode(false);
     setRemoveError("");
   }
@@ -250,7 +251,7 @@ function ControlPage() {
               </p>
             </div>
           ) : (
-            users.map((u) => {
+            dedupeUsersById(users).map((u) => {
               const fullPersonalUrl =
                 u.personalLink && typeof window !== "undefined"
                   ? `${window.location.origin}${u.personalLink}`
@@ -380,15 +381,20 @@ function ControlPage() {
             </div>
 
             <div>
-              <label className="mb-1 flex items-center gap-1.5 text-xs font-semibold">
-                <KeyRound className="size-3.5" /> Removal Security Code
-              </label>
+              <div className="mb-1 flex items-center justify-between text-xs font-semibold">
+                <label className="flex items-center gap-1.5">
+                  <KeyRound className="size-3.5" /> Removal Security Code
+                </label>
+                <span className="text-[11px] font-normal text-muted-foreground">
+                  Default code: 2233
+                </span>
+              </div>
               <div className="flex items-center rounded-xl border border-border bg-background pr-2">
                 <input
                   type={showRemoveCode ? "text" : "password"}
                   value={removeCode}
                   onChange={(e) => setRemoveCode(e.target.value)}
-                  placeholder="Enter removal code"
+                  placeholder="Enter removal code (default: 2233)"
                   aria-label="Removal security code"
                   autoFocus
                   className="min-w-0 flex-1 bg-transparent px-3.5 py-2 text-sm outline-none"

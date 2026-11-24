@@ -2,21 +2,29 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const uploadDir = path.join(os.tmpdir(), "reading-corner-uploads");
+function getDataRoot(): string {
+  return process.env["DATA_DIR"]?.trim() || os.tmpdir();
+}
+
+const uploadDir = path.join(getDataRoot(), "reading-corner-uploads");
 fs.mkdirSync(uploadDir, { recursive: true });
 export const mediaDir = uploadDir;
 
 const MEDIA_BUCKET = "reading-corner-media";
 
 let supabase: SupabaseClient | undefined;
-function getSupabase(): SupabaseClient {
+let localDb: Database.Database | undefined;
+let localDbPath: string | undefined;
+
+function getSupabase(): SupabaseClient | null {
   if (supabase) return supabase;
   const url = process.env["SUPABASE_URL"] ?? process.env["NEXT_PUBLIC_SUPABASE_URL"];
   const serviceKey = process.env["SUPABASE_SERVICE_ROLE_KEY"] ?? process.env["SUPABASE_SECRET_KEY"];
   if (!url || !serviceKey) {
-    throw new Error("Supabase server credentials are required for persistent application storage.");
+    return null;
   }
   supabase = createClient(url, serviceKey, {
     auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false },
@@ -24,23 +32,270 @@ function getSupabase(): SupabaseClient {
   return supabase;
 }
 
+function ensureColumns(
+  dbInstance: Database.Database,
+  table: string,
+  columns: Array<{ name: string; definition: string }>,
+) {
+  const existing = new Set(
+    (dbInstance.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+      (col) => col.name,
+    ),
+  );
+  for (const col of columns) {
+    if (!existing.has(col.name)) {
+      dbInstance.exec(`ALTER TABLE ${table} ADD COLUMN ${col.name} ${col.definition}`);
+    }
+  }
+}
+
+function getLocalDb(): Database.Database {
+  const targetPath = path.join(getDataRoot(), "reading_corner_local.db");
+  if (localDb && localDbPath === targetPath) return localDb;
+  if (localDb) {
+    localDb.close();
+  }
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  localDbPath = targetPath;
+  localDb = new Database(targetPath);
+  localDb.pragma("journal_mode = WAL");
+  localDb.pragma("foreign_keys = ON");
+
+  localDb.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT,
+      email_verified INTEGER NOT NULL DEFAULT 0,
+      phone_e164 TEXT,
+      phone_verified INTEGER NOT NULL DEFAULT 0,
+      role TEXT NOT NULL DEFAULT 'user',
+      full_name TEXT NOT NULL,
+      display_handle TEXT NOT NULL,
+      bio TEXT NOT NULL DEFAULT '',
+      avatar_media_id TEXT,
+      avatar_external_url TEXT,
+      password_hash TEXT NOT NULL,
+      theme TEXT NOT NULL DEFAULT 'instagram',
+      created_at TEXT NOT NULL,
+      last_active_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT UNIQUE NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      user_agent TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS followers (
+      follower_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      following_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (follower_id, following_id)
+    );
+    CREATE TABLE IF NOT EXISTS blocked_users (
+      blocker_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      blocked_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (blocker_id, blocked_id)
+    );
+    CREATE TABLE IF NOT EXISTS media_objects (
+      id TEXT PRIMARY KEY,
+      owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      recipient_id TEXT,
+      kind TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      original_name TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL DEFAULT 0,
+      is_public_avatar INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS firebase_media (
+      id TEXT PRIMARY KEY,
+      owner_uid TEXT NOT NULL,
+      recipient_uid TEXT,
+      kind TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      original_name TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      thread_key TEXT NOT NULL,
+      sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      text TEXT NOT NULL DEFAULT '',
+      media_id TEXT,
+      media_kind TEXT,
+      media_name TEXT,
+      reply_to_id TEXT,
+      edited_at TEXT,
+      deleted_at TEXT,
+      delivered_at TEXT,
+      created_at TEXT NOT NULL,
+      seen_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS message_reactions (
+      message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      emoji TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (message_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS conversation_settings (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      peer_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      muted INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, peer_id)
+    );
+    CREATE TABLE IF NOT EXISTS nfc_links (
+      id TEXT PRIMARY KEY,
+      user_id TEXT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT UNIQUE,
+      token_ciphertext TEXT,
+      revoked INTEGER NOT NULL DEFAULT 0,
+      version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS firebase_nfc_links (
+      id TEXT PRIMARY KEY,
+      uid TEXT UNIQUE NOT NULL,
+      full_name TEXT NOT NULL,
+      display_handle TEXT NOT NULL,
+      token_hash TEXT UNIQUE,
+      token_ciphertext TEXT,
+      revoked INTEGER NOT NULL DEFAULT 0,
+      version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS otp_challenges (
+      id TEXT PRIMARY KEY,
+      phone_e164 TEXT NOT NULL,
+      purpose TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      consumed INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS email_otp_challenges (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      purpose TEXT NOT NULL,
+      user_id TEXT,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      consumed INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS auth_rate_limits (
+      rate_key TEXT PRIMARY KEY,
+      failures INTEGER NOT NULL DEFAULT 0,
+      first_failure_at TEXT NOT NULL,
+      locked_until TEXT
+    );
+    CREATE TABLE IF NOT EXISTS user_reports (
+      id TEXT PRIMARY KEY,
+      reporter_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reported_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reason TEXT NOT NULL,
+      details TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS user_reading_state (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      state_json TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL
+    );
+  `);
+
+  ensureColumns(localDb, "media_objects", [
+    { name: "file_path", definition: "TEXT NOT NULL DEFAULT ''" },
+    { name: "is_public_avatar", definition: "INTEGER NOT NULL DEFAULT 0" },
+  ]);
+
+  const mediaCols = (
+    localDb.prepare("PRAGMA table_info(media_objects)").all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  if (mediaCols.includes("storage_path")) {
+    localDb.pragma("foreign_keys = OFF");
+    try {
+      localDb.transaction(() => {
+        localDb!.exec(`
+          CREATE TABLE media_objects_migrated (
+            id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            recipient_id TEXT,
+            kind TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            is_public_avatar INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+          );
+          INSERT INTO media_objects_migrated (
+            id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at
+          )
+          SELECT
+            id, owner_id, recipient_id, kind, mime_type, original_name,
+            COALESCE(NULLIF(file_path, ''), storage_path, ''),
+            size_bytes, COALESCE(is_public_avatar, 0), created_at
+          FROM media_objects;
+          DROP TABLE media_objects;
+          ALTER TABLE media_objects_migrated RENAME TO media_objects;
+        `);
+      })();
+    } finally {
+      localDb.pragma("foreign_keys = ON");
+    }
+  }
+
+  ensureColumns(localDb, "messages", [
+    { name: "media_kind", definition: "TEXT" },
+    { name: "media_name", definition: "TEXT" },
+    { name: "reply_to_id", definition: "TEXT" },
+    { name: "edited_at", definition: "TEXT" },
+    { name: "deleted_at", definition: "TEXT" },
+    { name: "delivered_at", definition: "TEXT" },
+  ]);
+
+  return localDb;
+}
+
 export async function createSignedMediaUpload(key: string): Promise<string> {
-  const { data, error } = await getSupabase()
-    .storage.from(MEDIA_BUCKET)
-    .createSignedUploadUrl(key, { upsert: true });
-  if (error) throw new Error(`Could not prepare media upload: ${error.message}`);
-  return data.token;
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.storage
+      .from(MEDIA_BUCKET)
+      .createSignedUploadUrl(key, { upsert: true });
+    if (error) throw new Error(`Could not prepare media upload: ${error.message}`);
+    return data.token;
+  }
+  return `local_token_${crypto.randomBytes(16).toString("hex")}`;
 }
 
 export async function mediaStorageObjectExists(key: string): Promise<boolean> {
-  const separator = key.lastIndexOf("/");
-  const folder = separator < 0 ? "" : key.slice(0, separator);
-  const filename = separator < 0 ? key : key.slice(separator + 1);
-  const { data, error } = await getSupabase()
-    .storage.from(MEDIA_BUCKET)
-    .list(folder, { search: filename, limit: 100 });
-  if (error) throw new Error(`Could not verify uploaded media: ${error.message}`);
-  return data.some((item) => item.name === filename);
+  const sb = getSupabase();
+  if (sb) {
+    const separator = key.lastIndexOf("/");
+    const folder = separator < 0 ? "" : key.slice(0, separator);
+    const filename = separator < 0 ? key : key.slice(separator + 1);
+    const { data, error } = await sb.storage
+      .from(MEDIA_BUCKET)
+      .list(folder, { search: filename, limit: 100 });
+    if (error) throw new Error(`Could not verify uploaded media: ${error.message}`);
+    return data.some((item) => item.name === filename);
+  }
+  const filePath = path.join(uploadDir, key);
+  return fs.existsSync(filePath);
 }
 
 export async function uploadMediaStorage(
@@ -48,22 +303,43 @@ export async function uploadMediaStorage(
   file: Buffer,
   contentType: string,
 ): Promise<void> {
-  const { error } = await getSupabase().storage.from(MEDIA_BUCKET).upload(key, file, {
-    contentType,
-    upsert: true,
-  });
-  if (error) throw new Error(`Media upload failed: ${error.message}`);
+  const sb = getSupabase();
+  if (sb) {
+    const { error } = await sb.storage.from(MEDIA_BUCKET).upload(key, file, {
+      contentType,
+      upsert: true,
+    });
+    if (error) throw new Error(`Media upload failed: ${error.message}`);
+    return;
+  }
+  const filePath = path.join(uploadDir, key);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, file);
 }
 
 export async function downloadMediaStorage(key: string): Promise<Buffer | null> {
-  const { data, error } = await getSupabase().storage.from(MEDIA_BUCKET).download(key);
-  if (error || !data) return null;
-  return Buffer.from(await data.arrayBuffer());
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.storage.from(MEDIA_BUCKET).download(key);
+    if (error || !data) return null;
+    return Buffer.from(await data.arrayBuffer());
+  }
+  const filePath = path.join(uploadDir, key);
+  if (!fs.existsSync(filePath)) return null;
+  return fs.readFileSync(filePath);
 }
 
 export async function deleteMediaStorage(key: string): Promise<void> {
-  const { error } = await getSupabase().storage.from(MEDIA_BUCKET).remove([key]);
-  if (error) throw new Error(`Media removal failed: ${error.message}`);
+  const sb = getSupabase();
+  if (sb) {
+    const { error } = await sb.storage.from(MEDIA_BUCKET).remove([key]);
+    if (error) throw new Error(`Media removal failed: ${error.message}`);
+    return;
+  }
+  const filePath = path.join(uploadDir, key);
+  if (fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+  }
 }
 
 async function execute<T>(
@@ -71,15 +347,37 @@ async function execute<T>(
   parameters: unknown[],
   operation: "all" | "one" | "run",
 ): Promise<T> {
-  const { data, error } = await getSupabase().rpc("app_execute_sql", {
-    statement,
-    parameters,
-    operation,
-  });
-  if (error) {
-    throw new Error(`Persistent database request failed: ${error.message}`);
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.rpc("app_execute_sql", {
+      statement,
+      parameters,
+      operation,
+    });
+    if (error) {
+      throw new Error(`Persistent database request failed: ${error.message}`);
+    }
+    return data as T;
   }
-  return data as T;
+
+  const dbInstance = getLocalDb();
+  let sqliteStmt = statement;
+  let paramIdx = 1;
+  while (sqliteStmt.includes(`$${paramIdx}`)) {
+    sqliteStmt = sqliteStmt.replaceAll(`$${paramIdx}`, "?");
+    paramIdx++;
+  }
+  sqliteStmt = sqliteStmt.replace(/NOW\(\)/gi, "datetime('now')");
+
+  const stmt = dbInstance.prepare(sqliteStmt);
+  if (operation === "all") {
+    return stmt.all(...parameters) as T;
+  } else if (operation === "one") {
+    return stmt.get(...parameters) as T;
+  } else {
+    const info = stmt.run(...parameters);
+    return { changes: info.changes } as T;
+  }
 }
 
 type RunResult = { changes: number };
@@ -95,12 +393,47 @@ export const db = {
 
 export const MAX_ACCOUNTS_PER_CONTACT = 3;
 
+const PLACEHOLDER_ENV_RE =
+  /^(?:MY_[A-Z0-9_]+|YOUR_[A-Z0-9_]+|<[^>]+>|\[[^\]]+\]|unset|none|null|undefined|placeholder|changeme|dummy|redacted|\*+)$/i;
+
+function getRuntimeEnvSentinels(env: NodeJS.ProcessEnv = process.env): Set<string> {
+  const sentinels = new Set<string>();
+  const canaryValidators: Array<[string, (v: string) => boolean]> = [
+    ["ADMIN_EMAILS", (v) => v.includes("@")],
+    ["RESEND_API_KEY", (v) => /^re_[a-z0-9_]{10,}$/i.test(v)],
+    ["RESEND_FROM", (v) => v.includes("@")],
+    ["TWILIO_ACCOUNT_SID", (v) => /^AC[a-f0-9]{32}$/i.test(v)],
+    ["TWILIO_VERIFY_SERVICE_SID", (v) => /^VA[a-f0-9]{32}$/i.test(v)],
+    ["APP_URL", (v) => /^https?:\/\//i.test(v)],
+  ];
+  for (const [key, isValid] of canaryValidators) {
+    const raw = env[key]?.trim();
+    if (raw && !isValid(raw)) {
+      sentinels.add(raw);
+    }
+  }
+  return sentinels;
+}
+
+export function readConfiguredEnv(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const raw = env[name]?.trim();
+  if (!raw) return undefined;
+  if (PLACEHOLDER_ENV_RE.test(raw)) return undefined;
+  if (getRuntimeEnvSentinels(env).has(raw)) return undefined;
+  return raw;
+}
+
 export function getAdminEmailSet(): Set<string> {
+  const configured = readConfiguredEnv("ADMIN_EMAILS");
+  const source = configured && configured.includes("@") ? configured : "mohammadakeem22@gmail.com";
   return new Set(
-    (process.env["ADMIN_EMAILS"] ?? "mohammadakeem22@gmail.com")
+    source
       .split(",")
       .map((value) => value.trim().toLowerCase())
-      .filter(Boolean),
+      .filter((value) => value.includes("@")),
   );
 }
 
@@ -139,8 +472,7 @@ export type PublicUser = {
 };
 
 function loadServerSecret(): string {
-  const secret =
-    process.env["SESSION_SECRET"]?.trim() || process.env["SUPABASE_JWT_SECRET"]?.trim();
+  const secret = readConfiguredEnv("SESSION_SECRET") || readConfiguredEnv("SUPABASE_JWT_SECRET");
   if (secret && secret.length >= 16) return secret;
   if (process.env["VERCEL"] === "1") {
     throw new Error("Set a stable SESSION_SECRET for production session signing.");
@@ -421,9 +753,14 @@ export async function getLinkedSiblingAccounts(user: DbUser): Promise<DbUser[]> 
     clauses.push("(phone_e164 = ? AND phone_verified = 1)");
     params.push(user.phone_e164);
   }
-  return (await await db
+  const rows = (await await db
     .prepare(`SELECT * FROM users WHERE ${clauses.join(" OR ")} ORDER BY created_at ASC`)
     .all(...params)) as DbUser[];
+  const byId = new Map<string, DbUser>();
+  for (const row of rows) {
+    if (!byId.has(row.id)) byId.set(row.id, row);
+  }
+  return Array.from(byId.values());
 }
 
 export async function checkRateLimit(

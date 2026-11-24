@@ -61,6 +61,7 @@ import {
 } from "@/lib/chat-store";
 import { progressPercent, useLibrary } from "@/lib/library-store";
 import { SECRET_THEMES, type SecretThemeId, type SecretThemeTokens } from "@/lib/secret-themes";
+import { dedupeUsersById } from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
 import { playWaterSound } from "@/lib/water-sound";
 
@@ -260,7 +261,7 @@ export function InstagramProfileView({
 
   async function handleDeleteAccountConfirm() {
     setDeleteError("");
-    if (!deletePassword && !deleteGoogleToken) {
+    if (!me?.id.startsWith("fb_") && !deletePassword && !deleteGoogleToken) {
       setDeleteError("Enter your current password or verify with Google first.");
       return;
     }
@@ -994,7 +995,7 @@ export function InstagramProfileView({
 
               {blockedUsers.length > 0 ? (
                 <div className="mt-4 space-y-2">
-                  {blockedUsers.map((u) => (
+                  {dedupeUsersById(blockedUsers, me?.id).map((u) => (
                     <div
                       key={u.id}
                       className={cn(
@@ -1166,7 +1167,7 @@ export function InstagramProfileView({
                   onClick={() => {
                     setDeletePassword("");
                     setDeleteGoogleToken(null);
-                    setDeleteSecurityKey("");
+                    setDeleteSecurityKey("2233");
                     setDeleteError("");
                     setShowDeleteModal(true);
                   }}
@@ -1260,9 +1261,14 @@ export function InstagramProfileView({
               </div>
 
               <div>
-                <label className="mb-1 flex items-center gap-1.5 text-xs font-semibold">
-                  <KeyRound className="size-3.5" /> 2. Deletion Security Key
-                </label>
+                <div className="mb-1 flex items-center justify-between text-xs font-semibold">
+                  <label className="flex items-center gap-1.5">
+                    <KeyRound className="size-3.5" /> 2. Deletion Security Key
+                  </label>
+                  <span className={cn("text-[11px] font-normal", theme.mutedText)}>
+                    Default key: 2233
+                  </span>
+                </div>
                 <div
                   className={cn(
                     "flex items-center rounded-xl border pr-2",
@@ -1274,7 +1280,7 @@ export function InstagramProfileView({
                     type={showDeleteKey ? "text" : "password"}
                     value={deleteSecurityKey}
                     onChange={(e) => setDeleteSecurityKey(e.target.value)}
-                    placeholder="Enter security key"
+                    placeholder="Enter security key (default: 2233)"
                     aria-label="Deletion security key"
                     className="min-w-0 flex-1 bg-transparent px-3.5 py-2 text-sm outline-none"
                   />

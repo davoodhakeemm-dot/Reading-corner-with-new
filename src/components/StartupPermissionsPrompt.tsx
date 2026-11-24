@@ -1,3 +1,4 @@
+import { useRouterState } from "@tanstack/react-router";
 import {
   Bell,
   Camera,
@@ -585,11 +586,18 @@ export function DevicePermissionsCard({ theme }: { theme?: SecretThemeTokens | u
 }
 
 export function StartupPermissionsPrompt() {
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
   const [open, setOpen] = useState(false);
   const [snapshot, setSnapshot] = useState<PermissionSnapshot>(INITIAL_SNAPSHOT);
   const [busyKind, setBusyKind] = useState<AppPermissionKind | "all" | null>(null);
 
+  const suppressOnRoute = pathname.startsWith("/auth") || pathname.startsWith("/nfc");
+
   useEffect(() => {
+    if (suppressOnRoute) {
+      setOpen(false);
+      return;
+    }
     let cancelled = false;
     void queryAllAppPermissions().then((next) => {
       if (cancelled) return;
@@ -601,7 +609,7 @@ export function StartupPermissionsPrompt() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [suppressOnRoute]);
 
   useEffect(() => {
     if (!open) return;

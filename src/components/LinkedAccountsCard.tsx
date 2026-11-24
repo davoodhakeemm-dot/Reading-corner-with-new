@@ -24,6 +24,7 @@ import {
   type LinkedAccountsInfo,
 } from "@/lib/chat-store";
 import type { SecretThemeTokens } from "@/lib/secret-themes";
+import { dedupeUsersById } from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
 
 export function LinkedAccountsCard({
@@ -376,7 +377,7 @@ export function LinkedAccountsCard({
             Loading linked accounts…
           </p>
         ) : (
-          (info?.accounts ?? []).map((acc) => (
+          dedupeUsersById(info?.accounts ?? []).map((acc) => (
             <div
               key={acc.id}
               data-testid={`linked-account-${acc.id}`}

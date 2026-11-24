@@ -18,7 +18,7 @@ import {
   type PublicAccount,
 } from "@/lib/chat-store";
 import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
-import { isControlSearchTrigger } from "@/lib/social-logic";
+import { dedupeUsersById, isControlSearchTrigger } from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
 import { playWaterSound } from "@/lib/water-sound";
 
@@ -35,26 +35,27 @@ export function DiscoverUsersView({
   const { me, discoveredUsers, soundEnabled } = useChat();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterMode>("all");
-  const [users, setUsers] = useState<PublicAccount[]>(discoveredUsers);
+  const [users, setUsers] = useState<PublicAccount[]>(() =>
+    dedupeUsersById(discoveredUsers, me?.id),
+  );
   const [loading, setLoading] = useState(true);
   const [selectedUser, setSelectedUser] = useState<PublicAccount | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
 
-  const loadList = useCallback(async (q: string, f: FilterMode) => {
-    setLoading(true);
-    try {
-      const list = await discoverUsers(q, f);
-      setUsers(list);
-    } catch {
-      /* keep previous list on transient error */
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadList("", "all");
-  }, [loadList]);
+  const loadList = useCallback(
+    async (q: string, f: FilterMode) => {
+      setLoading(true);
+      try {
+        const list = await discoverUsers(q, f);
+        setUsers(dedupeUsersById(list, me?.id));
+      } catch {
+        /* keep previous list on transient error */
+      } finally {
+        setLoading(false);
+      }
+    },
+    [me?.id],
+  );
 
   useEffect(() => {
     const t = window.setTimeout(
@@ -69,9 +70,9 @@ export function DiscoverUsersView({
   // Keep live presence / follow updates synchronized when showing full directory
   useEffect(() => {
     if (!query.trim() && filter === "all" && !loading) {
-      setUsers(discoveredUsers);
+      setUsers(dedupeUsersById(discoveredUsers, me?.id));
     }
-  }, [discoveredUsers, query, filter, loading]);
+  }, [discoveredUsers, query, filter, loading, me?.id]);
 
   async function handleFollowToggle(user: PublicAccount) {
     if (busyId) return;
@@ -228,7 +229,7 @@ export function DiscoverUsersView({
           </div>
         ) : users.length > 0 ? (
           <div className="grid gap-3 sm:grid-cols-2">
-            {users.map((u, idx) => (
+            {dedupeUsersById(users, me?.id).map((u, idx) => (
               <motion.div
                 key={u.id}
                 initial={{ opacity: 0, y: 10 }}

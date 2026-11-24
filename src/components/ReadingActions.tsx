@@ -8,10 +8,12 @@ export function ReadingActions({
   personalPath,
   inShell = false,
   themeId,
+  className,
 }: {
   themeId?: SecretThemeId | undefined;
   personalPath?: string | null | undefined;
   inShell?: boolean | undefined;
+  className?: string | undefined;
 }) {
   async function copyLink() {
     if (!personalPath) return;
@@ -26,11 +28,12 @@ export function ReadingActions({
 
   return (
     <div
-      className={
+      className={cn(
         inShell
           ? "relative flex shrink-0 justify-end gap-2 px-4 py-2"
-          : "fixed right-4 bottom-[max(1rem,env(safe-area-inset-bottom))] z-30 flex"
-      }
+          : "fixed right-4 bottom-[max(1rem,env(safe-area-inset-bottom))] z-30 flex",
+        className,
+      )}
     >
       {personalPath && (
         <button

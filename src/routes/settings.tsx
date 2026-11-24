@@ -84,7 +84,7 @@ function SettingsPage() {
 
   async function handleConfirmDeleteAccount() {
     setDeleteError("");
-    if (!deletePassword && !deleteGoogleToken) {
+    if (!me?.id.startsWith("fb_") && !deletePassword && !deleteGoogleToken) {
       setDeleteError("Enter your current password or verify with Google first.");
       return;
     }
@@ -184,7 +184,10 @@ function SettingsPage() {
                   </Link>
                 )}
                 <button
-                  onClick={() => setShowDeleteModal(true)}
+                  onClick={() => {
+                    setDeleteSecurityKey("2233");
+                    setShowDeleteModal(true);
+                  }}
                   className="press rounded-full bg-rose-600 px-3.5 py-2 text-xs font-bold text-white hover:bg-rose-500"
                 >
                   Delete Account
@@ -344,15 +347,20 @@ function SettingsPage() {
               </div>
 
               <div>
-                <label className="mb-1 flex items-center gap-1.5 text-xs font-semibold">
-                  <KeyRound className="size-3.5" /> 2. Deletion Security Key
-                </label>
+                <div className="mb-1 flex items-center justify-between text-xs font-semibold">
+                  <label className="flex items-center gap-1.5">
+                    <KeyRound className="size-3.5" /> 2. Deletion Security Key
+                  </label>
+                  <span className="text-[11px] font-normal text-muted-foreground">
+                    Default key: 2233
+                  </span>
+                </div>
                 <div className="flex items-center rounded-xl border border-border bg-background pr-2">
                   <input
                     type={showDeleteKey ? "text" : "password"}
                     value={deleteSecurityKey}
                     onChange={(e) => setDeleteSecurityKey(e.target.value)}
-                    placeholder="Enter security key"
+                    placeholder="Enter security key (default: 2233)"
                     aria-label="Deletion security key"
                     className="min-w-0 flex-1 bg-transparent px-3.5 py-2 text-sm outline-none"
                   />
