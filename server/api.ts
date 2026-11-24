@@ -1452,9 +1452,11 @@ export function createApiRouter() {
 
     db.prepare("DELETE FROM users WHERE id = ?").run(me.id);
 
+    const resolvedMediaDir = path.resolve(mediaDir);
     for (const m of mediaRows) {
       if (!m.file_path) continue;
-      const diskPath = path.join(mediaDir, m.file_path);
+      const diskPath = path.resolve(resolvedMediaDir, m.file_path);
+      if (!diskPath.startsWith(resolvedMediaDir + path.sep)) continue;
       try {
         if (fs.existsSync(diskPath)) fs.unlinkSync(diskPath);
       } catch {
@@ -2012,6 +2014,72 @@ export function createApiRouter() {
     res.json({ revoked: true, token: null, path: null, updatedAt: now });
   });
 
+  // Instant login via permanent Personal Link (/nfc/<token>) — verifies cryptographic unrevoked token
+  router.post("/nfc/login", (req, res) => {
+    const token = String((req.body as { token?: string })?.token ?? "").trim();
+    if (!token || token.length < 16) {
+      res.status(404).json({ status: "invalid", error: "This link is invalid or was revoked." });
+      return;
+    }
+
+    const tokenHash = sha256(token);
+    const link = db
+      .prepare(
+        `SELECT n.user_id, u.*
+         FROM nfc_links n
+         JOIN users u ON u.id = n.user_id
+         WHERE n.token_hash = ? AND n.revoked = 0
+         LIMIT 1`,
+      )
+      .get(tokenHash) as (DbUser & { user_id: string }) | undefined;
+
+    if (link) {
+      const now = new Date().toISOString();
+      db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, link.user_id);
+      const sessionToken = issueSession(link.user_id, req, res);
+      const updatedUser = db
+        .prepare("SELECT * FROM users WHERE id = ? LIMIT 1")
+        .get(link.user_id) as DbUser;
+      res.json({
+        status: "authorized",
+        token: sessionToken,
+        user: toSelfUser(updatedUser),
+      });
+      return;
+    }
+
+    const fbLink = db
+      .prepare(
+        `SELECT uid, full_name, display_handle
+         FROM firebase_nfc_links
+         WHERE token_hash = ? AND revoked = 0
+         LIMIT 1`,
+      )
+      .get(tokenHash) as { uid: string; full_name: string; display_handle: string } | undefined;
+
+    if (fbLink) {
+      const fbUser = db
+        .prepare("SELECT * FROM users WHERE id = ? OR id = ? LIMIT 1")
+        .get(`fb_${fbLink.uid}`, fbLink.uid) as DbUser | undefined;
+      if (fbUser) {
+        const now = new Date().toISOString();
+        db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, fbUser.id);
+        const sessionToken = issueSession(fbUser.id, req, res);
+        const updatedUser = db
+          .prepare("SELECT * FROM users WHERE id = ? LIMIT 1")
+          .get(fbUser.id) as DbUser;
+        res.json({
+          status: "authorized",
+          token: sessionToken,
+          user: toSelfUser(updatedUser),
+        });
+        return;
+      }
+    }
+
+    res.status(404).json({ status: "invalid", error: "This link is invalid or was revoked." });
+  });
+
   // Resolve NFC tap securely — NEVER exposes passwords, phone numbers, emails, or other user data
   router.get("/nfc/resolve", async (req, res) => {
     const token = String(req.query["token"] ?? "").trim();
@@ -2093,8 +2161,8 @@ export function createApiRouter() {
     });
   });
 
-  // Admin-only CONTROL User Search — strictly public/non-sensitive fields + personal link ONLY
-  router.get("/control/users", requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+  // CONTROL User Search — authenticated directory showing public ID, username, DP, and personal link (no PII)
+  router.get("/control/users", requireAuth, (req: AuthedRequest, res) => {
     const raw = String(req.query["q"] ?? "")
       .trim()
       .toLowerCase();
@@ -2109,7 +2177,7 @@ export function createApiRouter() {
                LEFT JOIN nfc_links n ON n.user_id = u.id
                WHERE LOWER(u.id) LIKE ? OR LOWER(u.display_handle) LIKE ? OR LOWER(u.full_name) LIKE ?
                ORDER BY u.last_active_at DESC
-               LIMIT 100`,
+               LIMIT 500`,
             )
             .all(like, like, like)
         : db
@@ -2118,7 +2186,7 @@ export function createApiRouter() {
                FROM users u
                LEFT JOIN nfc_links n ON n.user_id = u.id
                ORDER BY u.last_active_at DESC
-               LIMIT 100`,
+               LIMIT 500`,
             )
             .all()
     ) as (DbUser & { token_ciphertext: string | null; revoked: number | null })[];
@@ -2147,6 +2215,81 @@ export function createApiRouter() {
     });
 
     res.json({ users });
+  });
+
+  // Remove a user from CONTROL directory — authenticated + rate-limited server-side removal code check
+  router.delete("/control/users/:userId", requireAuth, (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const targetId = String(req.params["userId"] ?? "").trim();
+    if (!targetId) {
+      res.status(400).json({ error: "Target user ID is required." });
+      return;
+    }
+
+    const rateKey = `control-remove:${me.id}:${getClientIp(req)}`;
+    const limit = checkRateLimit(rateKey);
+    if (!limit.allowed) {
+      res.status(429).json({
+        error: `Too many invalid removal code attempts. Wait ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s).`,
+      });
+      return;
+    }
+
+    const body = (req.body ?? {}) as { code?: string; securityKey?: string };
+    const suppliedCode =
+      typeof body.code === "string"
+        ? body.code.trim()
+        : typeof body.securityKey === "string"
+          ? body.securityKey.trim()
+          : "";
+    const expectedKey = process.env["CONTROL_REMOVE_CODE"]?.trim() || "2233";
+
+    if (!suppliedCode || !timingSafeEqualStrings(suppliedCode, expectedKey)) {
+      const failRes = recordRateLimitFailure(rateKey, 5, 15 * 60 * 1000, 15 * 60 * 1000);
+      if (failRes.locked) {
+        res.status(429).json({
+          error: "Too many invalid removal code attempts. Try again in 15 minutes.",
+        });
+        return;
+      }
+      res.status(403).json({ error: "Invalid removal code." });
+      return;
+    }
+
+    clearRateLimit(rateKey);
+
+    const target = db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(targetId) as
+      { id: string } | undefined;
+    if (!target) {
+      res.status(404).json({ error: "User account not found." });
+      return;
+    }
+
+    const mediaRows = db
+      .prepare("SELECT file_path FROM media_objects WHERE owner_id = ?")
+      .all(targetId) as { file_path: string }[];
+
+    db.prepare("DELETE FROM users WHERE id = ?").run(targetId);
+
+    const resolvedMediaDir = path.resolve(mediaDir);
+    for (const m of mediaRows) {
+      if (!m.file_path) continue;
+      const diskPath = path.resolve(resolvedMediaDir, m.file_path);
+      if (!diskPath.startsWith(resolvedMediaDir + path.sep)) continue;
+      try {
+        if (fs.existsSync(diskPath)) fs.unlinkSync(diskPath);
+      } catch {
+        /* ignore file cleanup errors */
+      }
+    }
+
+    const selfDeleted = targetId === me.id;
+    if (selfDeleted) {
+      res.clearCookie("rc_session", { path: "/" });
+      res.clearCookie("rc_fb_session", { path: "/" });
+    }
+    broadcastEvent("user:deleted", { userId: targetId }, targetId);
+    res.json({ ok: true, deletedUserId: targetId, selfDeleted });
   });
 
   // Discover Users — lists ALL registered non-blocked users (strictly public fields only)

@@ -7,6 +7,7 @@ import { BookGrid } from "@/components/Sections";
 import { EmptyState } from "@/components/EmptyState";
 import { searchBooks } from "@/lib/books";
 import { CATEGORIES, LANGUAGES } from "@/lib/catalog";
+import { isControlSearchTrigger } from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
 
 const SORTS = [
@@ -87,6 +88,9 @@ function SearchPage() {
                 if (value.trim().toLowerCase() === "hi") {
                   setQ("");
                   navigate({ to: "/chat" });
+                } else if (isControlSearchTrigger(value)) {
+                  setQ("");
+                  navigate({ to: "/control" });
                 }
               }}
               placeholder="Search books, authors or categories..."

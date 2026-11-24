@@ -185,3 +185,8 @@ export function resolveChatEscapeAction(input: {
   if (input.hasActivePeer) return "closeThread";
   return null;
 }
+
+export function isControlSearchTrigger(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "control" || normalized === "(control)";
+}

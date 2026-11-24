@@ -436,7 +436,28 @@ test("Personal NFC link generation, verification, regeneration, revocation, and 
   assert.equal(newResolve.status, 200);
   assert.equal(newResolve.data.status, "authorized");
 
-  // Revoking disables token
+  // Direct instant login via valid Personal Link (/nfc/login) without credentials
+  const instantLogin = await api<{
+    status: string;
+    token: string;
+    user: { id: string; displayHandle: string };
+  }>("/nfc/login", {
+    method: "POST",
+    body: { token: regen.data.token },
+  });
+  assert.equal(instantLogin.status, 200);
+  assert.equal(instantLogin.data.status, "authorized");
+  assert.equal(instantLogin.data.user.id, regA.data.user.id);
+  assert.ok(instantLogin.data.token.startsWith("rc_sess_"));
+
+  // Instant session from personal link works on authenticated endpoints immediately
+  const nfcMeCheck = await api<{ user: { id: string } }>("/auth/me", {
+    token: instantLogin.data.token,
+  });
+  assert.equal(nfcMeCheck.status, 200);
+  assert.equal(nfcMeCheck.data.user.id, regA.data.user.id);
+
+  // Revoking disables both /nfc/resolve and /nfc/login
   const revoke = await api<{ revoked: boolean; token: string | null }>("/nfc/revoke", {
     method: "POST",
     token: tokenA,
@@ -444,6 +465,12 @@ test("Personal NFC link generation, verification, regeneration, revocation, and 
   assert.equal(revoke.status, 200);
   assert.equal(revoke.data.revoked, true);
   assert.equal(revoke.data.token, null);
+
+  const revokedLogin = await api("/nfc/login", {
+    method: "POST",
+    body: { token: regen.data.token },
+  });
+  assert.equal(revokedLogin.status, 404);
 
   const revokedResolve = await api(`/nfc/resolve?token=${encodeURIComponent(regen.data.token)}`, {
     token: tokenA,
@@ -907,33 +934,17 @@ test("Multi-account linking (max 3 per verified Gmail/phone), 3 login modes, sin
   });
   assert.equal(lockedAttempt.status, 429);
 
-  // 7. CONTROL User Search — strictly denied (403) for non-admin, allowed (200) for verified admin with zero PII
-  const nonAdminControl = await api("/control/users?q=zoya", {
-    token: usernameLogin.data.token,
-  });
-  assert.equal(nonAdminControl.status, 403);
+  // 7. CONTROL User Directory & Removal — requires login, exposes public ID/handle/DP/personalLink only,
+  //    and DELETE /api/control/users/:userId verifies removal code on server with rate-limiting
+  const anonControl = await api("/control/users?q=zoya");
+  assert.equal(anonControl.status, 401);
 
-  const adminReg = await api<{ token: string; user: { id: string } }>("/auth/register", {
-    method: "POST",
-    body: {
-      fullName: "Admin Account",
-      username: "admin_control_test",
-      email: "mohammadakeem22@gmail.com",
-      password: "AdminPassword123!",
-    },
-  });
-  assert.equal(adminReg.status, 201);
-  // Promote verified admin email
-  db.prepare("UPDATE users SET email_verified = 1, role = 'admin' WHERE id = ?").run(
-    adminReg.data.user.id,
-  );
-
-  const adminControl = await api<{ users: Array<Record<string, unknown>> }>(
+  const signedControl = await api<{ users: Array<Record<string, unknown>> }>(
     "/control/users?q=zoya_one",
-    { token: adminReg.data.token },
+    { token: usernameLogin.data.token },
   );
-  assert.equal(adminControl.status, 200);
-  const foundZoya = adminControl.data.users.find((u) => u["id"] === primary.data.user.id);
+  assert.equal(signedControl.status, 200);
+  const foundZoya = signedControl.data.users.find((u) => u["id"] === primary.data.user.id);
   assert.ok(foundZoya);
   assert.equal(foundZoya["displayHandle"], "@zoya_one");
   assert.match(String(foundZoya["personalLink"]), /^\/nfc\//);
@@ -942,4 +953,49 @@ test("Multi-account linking (max 3 per verified Gmail/phone), 3 login modes, sin
   assert.equal(foundZoya["phone_e164"], undefined);
   assert.equal(foundZoya["phoneE164"], undefined);
   assert.equal(foundZoya["password_hash"], undefined);
+
+  // Create a disposable target account to test removal from CONTROL
+  const disposable = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Disposable Target",
+      username: "disp_target",
+      email: "disp_target@example.com",
+      password: "DispPassword123!",
+    },
+  });
+  assert.equal(disposable.status, 201);
+
+  const anonDelete = await api(`/control/users/${encodeURIComponent(disposable.data.user.id)}`, {
+    method: "DELETE",
+    body: { code: process.env["CONTROL_REMOVE_CODE"] || "2233" },
+  });
+  assert.equal(anonDelete.status, 401);
+
+  const wrongCodeDelete = await api(
+    `/control/users/${encodeURIComponent(disposable.data.user.id)}`,
+    {
+      method: "DELETE",
+      token: usernameLogin.data.token,
+      body: { code: "0000" },
+    },
+  );
+  assert.equal(wrongCodeDelete.status, 403);
+
+  const validCodeDelete = await api<{ ok: boolean; deletedUserId: string }>(
+    `/control/users/${encodeURIComponent(disposable.data.user.id)}`,
+    {
+      method: "DELETE",
+      token: usernameLogin.data.token,
+      body: { code: process.env["CONTROL_REMOVE_CODE"] || "2233" },
+    },
+  );
+  assert.equal(validCodeDelete.status, 200);
+  assert.equal(validCodeDelete.data.deletedUserId, disposable.data.user.id);
+
+  // Target is permanently gone; Zoya Account 1 & 3 remain intact
+  const checkDispGone = await api("/auth/me", { token: disposable.data.token });
+  assert.equal(checkDispGone.status, 401);
+  const checkZoyaStillAlive = await api("/auth/me", { token: usernameLogin.data.token });
+  assert.equal(checkZoyaStillAlive.status, 200);
 });

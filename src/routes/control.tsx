@@ -1,12 +1,16 @@
-import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import {
+  AlertTriangle,
   Check,
   Copy,
   ExternalLink,
+  Eye,
+  EyeOff,
+  KeyRound,
   Link2,
   Search,
-  ShieldAlert,
   ShieldCheck,
+  Trash2,
   UserCheck,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
@@ -16,18 +20,18 @@ import { AppShell, PageHeader } from "@/components/AppShell";
 import { UserProfileModal } from "@/components/UserProfileModal";
 import {
   initialsOf,
+  removeControlUser,
   searchControlUsers,
   useChat,
   type ControlUserRecord,
   type PublicAccount,
 } from "@/lib/chat-store";
 import { getSecretTheme } from "@/lib/secret-themes";
-import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/control")({
   head: () => ({
     meta: [
-      { title: "CONTROL — Admin Directory — Reading Corner" },
+      { title: "CONTROL — User Directory — Reading Corner" },
       { name: "robots", content: "noindex" },
     ],
   }),
@@ -71,15 +75,22 @@ function ControlPage() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [selectedUser, setSelectedUser] = useState<PublicAccount | null>(null);
 
+  const [removeTarget, setRemoveTarget] = useState<ControlUserRecord | null>(null);
+  const [removeCode, setRemoveCode] = useState("");
+  const [showRemoveCode, setShowRemoveCode] = useState(false);
+  const [removeError, setRemoveError] = useState("");
+  const [removingBusy, setRemovingBusy] = useState(false);
+
   useEffect(() => {
     if (ready && !me) {
-      navigate({ to: "/auth", replace: true });
+      toast("Sign in to open the CONTROL directory.");
+      navigate({ to: "/auth", search: { next: "/control" }, replace: true });
     }
   }, [ready, me, navigate]);
 
   const runSearch = useCallback(
     async (q: string) => {
-      if (!me?.isAdmin) return;
+      if (!me) return;
       setLoading(true);
       setError("");
       try {
@@ -91,16 +102,16 @@ function ControlPage() {
         setLoading(false);
       }
     },
-    [me?.isAdmin],
+    [me],
   );
 
   useEffect(() => {
-    if (!ready || !me?.isAdmin) return;
+    if (!ready || !me) return;
     const t = window.setTimeout(() => {
       void runSearch(query);
-    }, 220);
+    }, 200);
     return () => window.clearTimeout(t);
-  }, [ready, me?.isAdmin, query, runSearch]);
+  }, [ready, me, query, runSearch]);
 
   useEffect(() => {
     if (!copiedId) return;
@@ -110,36 +121,6 @@ function ControlPage() {
 
   if (!ready || !me) {
     return null;
-  }
-
-  if (!me.isAdmin) {
-    return (
-      <AppShell>
-        <div className="mx-auto max-w-xl px-4 py-12 sm:px-6">
-          <div className="rounded-3xl bg-card p-6 text-center shadow-soft space-y-4">
-            <ShieldAlert className="mx-auto size-10 text-rose-500" />
-            <h1 className="font-display text-xl font-bold">Administrator Access Required</h1>
-            <p className="text-sm text-muted-foreground">
-              The CONTROL user search directory is restricted to authorized administrators only.
-            </p>
-            <div className="flex justify-center gap-2">
-              <Link
-                to="/home"
-                className="press rounded-full bg-brand px-4 py-2 text-xs font-bold text-primary-foreground"
-              >
-                Return Home
-              </Link>
-              <Link
-                to="/settings"
-                className="press rounded-full bg-secondary px-4 py-2 text-xs font-bold text-secondary-foreground"
-              >
-                Settings
-              </Link>
-            </div>
-          </div>
-        </div>
-      </AppShell>
-    );
   }
 
   const theme = getSecretTheme(me.theme);
@@ -174,15 +155,55 @@ function ControlPage() {
     }
   }
 
+  function openRemoveModal(u: ControlUserRecord) {
+    setRemoveTarget(u);
+    setRemoveCode("");
+    setShowRemoveCode(false);
+    setRemoveError("");
+  }
+
+  function closeRemoveModal() {
+    if (removingBusy) return;
+    setRemoveTarget(null);
+    setRemoveCode("");
+    setShowRemoveCode(false);
+    setRemoveError("");
+  }
+
+  async function handleConfirmRemove(e: React.FormEvent) {
+    e.preventDefault();
+    if (!removeTarget) return;
+    setRemoveError("");
+    if (!removeCode.trim()) {
+      setRemoveError("Enter the removal security code.");
+      return;
+    }
+    setRemovingBusy(true);
+    try {
+      const res = await removeControlUser(removeTarget.id, removeCode.trim());
+      setUsers((prev) => prev.filter((item) => item.id !== removeTarget.id));
+      toast.success(`Removed ${removeTarget.fullName} (${removeTarget.displayHandle})`);
+      setRemoveTarget(null);
+      setRemoveCode("");
+      if (res.selfDeleted) {
+        navigate({ to: "/auth", replace: true });
+      }
+    } catch (err) {
+      setRemoveError(err instanceof Error ? err.message : "Could not remove user.");
+    } finally {
+      setRemovingBusy(false);
+    }
+  }
+
   return (
     <AppShell>
       <div className="mx-auto max-w-4xl space-y-6 px-4 py-5 sm:px-6">
         <PageHeader
           title="CONTROL"
-          subtitle="Admin user search & permanent personal link lookup (no sensitive PII exposed)."
+          subtitle="View registered users' ID, username, DP, and permanent personal link, or remove an account with the security code."
           action={
             <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-3 py-1.5 text-xs font-bold text-emerald-600">
-              <ShieldCheck className="size-4" /> Admin Access
+              <ShieldCheck className="size-4" /> Directory ({users.length})
             </span>
           }
         />
@@ -281,10 +302,11 @@ function ControlPage() {
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <div className="flex shrink-0 flex-wrap items-center gap-2">
                     <button
                       type="button"
                       disabled={!u.personalLink}
+                      aria-label={`Copy personal link for ${u.displayHandle}`}
                       onClick={() => void handleCopyPersonalLink(u)}
                       className="press inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-secondary px-3.5 text-xs font-bold text-secondary-foreground disabled:opacity-50"
                     >
@@ -294,26 +316,37 @@ function ControlPage() {
                         </>
                       ) : (
                         <>
-                          <Copy className="size-3.5" /> Copy Personal Link
+                          <Copy className="size-3.5" /> Copy Link
                         </>
                       )}
                     </button>
                     <button
                       type="button"
+                      aria-label={`View ${u.fullName} (${u.displayHandle})`}
                       onClick={() => setSelectedUser(toPublicModalTarget(u))}
                       className="press inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-brand px-3.5 text-xs font-bold text-primary-foreground"
                     >
-                      <UserCheck className="size-3.5" /> View Profile
+                      <UserCheck className="size-3.5" /> View
                     </button>
                     {u.personalLink && (
                       <a
                         href={u.personalLink}
                         className="press inline-flex min-h-[38px] items-center gap-1 rounded-xl border border-border px-3 text-xs font-semibold hover:bg-secondary/70"
                         title="Open personal link"
+                        aria-label={`Open personal link for ${u.displayHandle}`}
                       >
                         <ExternalLink className="size-3.5" />
                       </a>
                     )}
+                    <button
+                      type="button"
+                      aria-label={`Remove ${u.fullName} (${u.displayHandle})`}
+                      onClick={() => openRemoveModal(u)}
+                      data-testid={`control-remove-${u.id}`}
+                      className="press inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-rose-600 px-3.5 text-xs font-bold text-white hover:bg-rose-500"
+                    >
+                      <Trash2 className="size-3.5" /> Remove
+                    </button>
                   </div>
                 </div>
               );
@@ -321,6 +354,85 @@ function ControlPage() {
           )}
         </div>
       </div>
+
+      {removeTarget && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm">
+          <form
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirm Remove User"
+            onSubmit={handleConfirmRemove}
+            className="w-full max-w-md space-y-4 rounded-3xl bg-card p-6 shadow-2xl"
+          >
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="mt-0.5 size-6 shrink-0 text-rose-600" />
+              <div className="min-w-0">
+                <h2 className="text-lg font-bold text-rose-600">Remove User Account?</h2>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  This permanently deletes <strong>{removeTarget.fullName}</strong> (
+                  {removeTarget.displayHandle}) and their messages, media gallery, and personal
+                  link.
+                </p>
+                <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
+                  ID: {removeTarget.id}
+                </p>
+              </div>
+            </div>
+
+            <div>
+              <label className="mb-1 flex items-center gap-1.5 text-xs font-semibold">
+                <KeyRound className="size-3.5" /> Removal Security Code
+              </label>
+              <div className="flex items-center rounded-xl border border-border bg-background pr-2">
+                <input
+                  type={showRemoveCode ? "text" : "password"}
+                  value={removeCode}
+                  onChange={(e) => setRemoveCode(e.target.value)}
+                  placeholder="Enter removal code"
+                  aria-label="Removal security code"
+                  autoFocus
+                  className="min-w-0 flex-1 bg-transparent px-3.5 py-2 text-sm outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowRemoveCode((s) => !s)}
+                  aria-label={showRemoveCode ? "Hide removal code" : "Show removal code"}
+                  className="grid size-8 place-items-center opacity-70 hover:opacity-100"
+                >
+                  {showRemoveCode ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                </button>
+              </div>
+            </div>
+
+            {removeError && (
+              <p
+                role="alert"
+                className="rounded-xl bg-rose-500/15 px-3 py-2 text-xs font-semibold text-rose-600"
+              >
+                {removeError}
+              </p>
+            )}
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                disabled={removingBusy}
+                onClick={closeRemoveModal}
+                className="press rounded-full bg-secondary px-4 py-2 text-xs font-bold"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={removingBusy}
+                className="press rounded-full bg-rose-600 px-4 py-2 text-xs font-bold text-white disabled:opacity-50"
+              >
+                {removingBusy ? "Removing…" : "Confirm Remove"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       <UserProfileModal
         user={selectedUser}

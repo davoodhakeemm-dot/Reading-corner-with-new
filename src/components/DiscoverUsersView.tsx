@@ -1,3 +1,4 @@
+import { useNavigate } from "@tanstack/react-router";
 import { MessageCircle, Moon, Search, Sun, UserCheck, UserPlus, Users, X } from "lucide-react";
 import { motion } from "motion/react";
 import { useCallback, useEffect, useState } from "react";
@@ -17,6 +18,7 @@ import {
   type PublicAccount,
 } from "@/lib/chat-store";
 import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
+import { isControlSearchTrigger } from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
 import { playWaterSound } from "@/lib/water-sound";
 
@@ -29,6 +31,7 @@ export function DiscoverUsersView({
   theme: SecretThemeTokens;
   onStartMessage: (userId: string) => void;
 }) {
+  const navigate = useNavigate();
   const { me, discoveredUsers, soundEnabled } = useChat();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterMode>("all");
@@ -136,7 +139,15 @@ export function DiscoverUsersView({
             <input
               type="text"
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              onChange={(e) => {
+                const val = e.target.value;
+                if (isControlSearchTrigger(val)) {
+                  setQuery("");
+                  navigate({ to: "/control" });
+                  return;
+                }
+                setQuery(val);
+              }}
               placeholder="Search users by name or @username…"
               aria-label="Search registered users"
               className={cn(

@@ -11,6 +11,7 @@ import {
   SectionHeader,
 } from "@/components/Sections";
 import { BOOKS, bookById, byTag } from "@/lib/books";
+import { initialsOf, useChat } from "@/lib/chat-store";
 import { useLibrary, progressPercent } from "@/lib/library-store";
 import heroBooks from "@/assets/hero-books.jpg";
 
@@ -35,6 +36,7 @@ export const Route = createFileRoute("/home")({
 
 function HomePage() {
   const { state } = useLibrary();
+  const { me } = useChat();
 
   const continueReading = state.history
     .map((h) => ({ book: bookById(h.bookId), p: state.progress[h.bookId] }))
@@ -77,9 +79,14 @@ function HomePage() {
           </Link>
           <Link
             to="/profile"
-            className="press grid size-10 shrink-0 place-items-center rounded-full bg-brand text-sm font-bold text-primary-foreground"
+            aria-label={me ? `${me.fullName} profile` : "Profile"}
+            className="press grid size-10 shrink-0 place-items-center overflow-hidden rounded-full bg-brand text-sm font-bold text-primary-foreground"
           >
-            {state.profile.name.slice(0, 1).toUpperCase()}
+            {me?.avatarUrl ? (
+              <img src={me.avatarUrl} alt={me.fullName} className="size-full object-cover" />
+            ) : (
+              initialsOf(me?.fullName ?? state.profile.name)
+            )}
           </Link>
         </div>
 

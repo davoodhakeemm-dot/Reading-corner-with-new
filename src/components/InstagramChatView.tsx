@@ -38,6 +38,7 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
+import { useNavigate } from "@tanstack/react-router";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
@@ -81,6 +82,7 @@ import { computeChatKeyboardLayout, type ChatKeyboardLayout } from "@/lib/chat-v
 import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
 import {
   filterConversationsByTab,
+  isControlSearchTrigger,
   resolveChatEscapeAction,
   splitChatSidebarUsers,
 } from "@/lib/social-logic";
@@ -292,6 +294,7 @@ export function InstagramChatView({
   onOpenDiscover?: () => void;
   onThreadOpenChange?: (open: boolean) => void;
 }) {
+  const navigate = useNavigate();
   const {
     me,
     conversations,
@@ -1072,7 +1075,15 @@ export function InstagramChatView({
               <input
                 ref={searchInputRef}
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (isControlSearchTrigger(val)) {
+                    setQuery("");
+                    navigate({ to: "/control" });
+                    return;
+                  }
+                  setQuery(val);
+                }}
                 placeholder="Search readers by name or @username…"
                 className={cn(
                   "w-full rounded-full py-2.5 pl-11 pr-9 text-sm outline-none transition focus:ring-2 focus:ring-sky-400/40",

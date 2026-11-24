@@ -1322,11 +1322,85 @@ export async function switchLinkedAccount(targetUserId: string): Promise<PublicA
   return data.user;
 }
 
+export async function loginWithPersonalLink(token: string): Promise<PublicAccount> {
+  const clean = token.trim();
+  if (!clean || clean.length < 16) {
+    throw new Error("This link is invalid or was revoked.");
+  }
+  const resp = await fetch("/api/nfc/login", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Requested-With": "XMLHttpRequest",
+    },
+    credentials: "include",
+    body: JSON.stringify({ token: clean }),
+  });
+  const data = (await resp.json().catch(() => ({}))) as {
+    status?: string;
+    token?: string;
+    user?: PublicAccount;
+    error?: string;
+  };
+  if (!resp.ok || data.status !== "authorized" || !data.user) {
+    throw new Error(data.error || "This link is invalid or was revoked.");
+  }
+
+  suppressFirebaseSync = true;
+  try {
+    await signOut(getFirebaseAuth()).catch(() => {});
+    disconnectRealtime();
+    clearMediaBlobCache();
+    setState({
+      conversations: [],
+      threads: {},
+      activePeerId: null,
+      typingByPeer: {},
+      blockedUsers: [],
+      gallery: [],
+      nfc: null,
+      incomingMessageAlert: null,
+    });
+    await hydrateAuthenticatedSession(data.user, data.token);
+    return data.user;
+  } finally {
+    suppressFirebaseSync = false;
+  }
+}
+
 export async function searchControlUsers(q = ""): Promise<ControlUserRecord[]> {
   const data = await apiJson<{ users: ControlUserRecord[] }>(
     `/api/control/users?q=${encodeURIComponent(q)}`,
   );
   return data.users ?? [];
+}
+
+export async function removeControlUser(
+  userId: string,
+  code: string,
+): Promise<{ ok: boolean; deletedUserId: string; selfDeleted: boolean }> {
+  const res = await apiJson<{ ok: boolean; deletedUserId: string; selfDeleted: boolean }>(
+    `/api/control/users/${encodeURIComponent(userId)}`,
+    {
+      method: "DELETE",
+      body: { code },
+    },
+  );
+  if (res.selfDeleted || state.me?.id === userId) {
+    suppressFirebaseSync = true;
+    try {
+      await signOut(getFirebaseAuth()).catch(() => {});
+      resetLocalSessionState();
+    } finally {
+      suppressFirebaseSync = false;
+    }
+  } else {
+    setState({
+      discoveredUsers: state.discoveredUsers.filter((u) => u.id !== userId),
+      conversations: state.conversations.filter((c) => c.peer.id !== userId),
+    });
+  }
+  return res;
 }
 
 export async function sendPasswordReset(

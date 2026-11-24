@@ -211,3 +211,12 @@ test("resolveChatEscapeAction prioritizes topmost overlay before backing out of 
   assert.equal(resolveChatEscapeAction(base), "closeThread");
   assert.equal(resolveChatEscapeAction({ ...base, hasActivePeer: false }), null);
 });
+
+test("isControlSearchTrigger matches control and (control) case-insensitively", async () => {
+  const { isControlSearchTrigger } = await import("./social-logic");
+  assert.equal(isControlSearchTrigger("control"), true);
+  assert.equal(isControlSearchTrigger("  (Control)  "), true);
+  assert.equal(isControlSearchTrigger("CONTROL"), true);
+  assert.equal(isControlSearchTrigger("controllers"), false);
+  assert.equal(isControlSearchTrigger("the alchemist"), false);
+});
