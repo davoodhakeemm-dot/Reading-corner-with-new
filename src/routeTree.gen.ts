@@ -14,6 +14,7 @@ import { Route as AuthRouteImport } from './routes/auth'
 import { Route as CategoriesRouteImport } from './routes/categories'
 import { Route as ChatRouteImport } from './routes/chat'
 import { Route as ChatSettingsRouteImport } from './routes/chat-settings'
+import { Route as ControlRouteImport } from './routes/control'
 import { Route as DiscoverUsersRouteImport } from './routes/discover-users'
 import { Route as ExploreRouteImport } from './routes/explore'
 import { Route as FavoritesRouteImport } from './routes/favorites'
@@ -56,6 +57,11 @@ const ChatRoute = ChatRouteImport.update({
 const ChatSettingsRoute = ChatSettingsRouteImport.update({
   id: '/chat-settings',
   path: '/chat-settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ControlRoute = ControlRouteImport.update({
+  id: '/control',
+  path: '/control',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DiscoverUsersRoute = DiscoverUsersRouteImport.update({
@@ -155,6 +161,7 @@ export interface FileRoutesByFullPath {
   '/categories': typeof CategoriesRoute
   '/chat': typeof ChatRoute
   '/chat-settings': typeof ChatSettingsRoute
+  '/control': typeof ControlRoute
   '/discover-users': typeof DiscoverUsersRoute
   '/explore': typeof ExploreRoute
   '/favorites': typeof FavoritesRoute
@@ -180,6 +187,7 @@ export interface FileRoutesByTo {
   '/categories': typeof CategoriesRoute
   '/chat': typeof ChatRoute
   '/chat-settings': typeof ChatSettingsRoute
+  '/control': typeof ControlRoute
   '/discover-users': typeof DiscoverUsersRoute
   '/explore': typeof ExploreRoute
   '/favorites': typeof FavoritesRoute
@@ -206,6 +214,7 @@ export interface FileRoutesById {
   '/categories': typeof CategoriesRoute
   '/chat': typeof ChatRoute
   '/chat-settings': typeof ChatSettingsRoute
+  '/control': typeof ControlRoute
   '/discover-users': typeof DiscoverUsersRoute
   '/explore': typeof ExploreRoute
   '/favorites': typeof FavoritesRoute
@@ -233,6 +242,7 @@ export interface FileRouteTypes {
     | '/categories'
     | '/chat'
     | '/chat-settings'
+    | '/control'
     | '/discover-users'
     | '/explore'
     | '/favorites'
@@ -258,6 +268,7 @@ export interface FileRouteTypes {
     | '/categories'
     | '/chat'
     | '/chat-settings'
+    | '/control'
     | '/discover-users'
     | '/explore'
     | '/favorites'
@@ -283,6 +294,7 @@ export interface FileRouteTypes {
     | '/categories'
     | '/chat'
     | '/chat-settings'
+    | '/control'
     | '/discover-users'
     | '/explore'
     | '/favorites'
@@ -309,6 +321,7 @@ export interface RootRouteChildren {
   CategoriesRoute: typeof CategoriesRoute
   ChatRoute: typeof ChatRoute
   ChatSettingsRoute: typeof ChatSettingsRoute
+  ControlRoute: typeof ControlRoute
   DiscoverUsersRoute: typeof DiscoverUsersRoute
   ExploreRoute: typeof ExploreRoute
   FavoritesRoute: typeof FavoritesRoute
@@ -364,6 +377,13 @@ declare module '@tanstack/react-router' {
       path: '/chat-settings'
       fullPath: '/chat-settings'
       preLoaderRoute: typeof ChatSettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/control': {
+      id: '/control'
+      path: '/control'
+      fullPath: '/control'
+      preLoaderRoute: typeof ControlRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/discover-users': {
@@ -501,6 +521,7 @@ const rootRouteChildren: RootRouteChildren = {
   CategoriesRoute: CategoriesRoute,
   ChatRoute: ChatRoute,
   ChatSettingsRoute: ChatSettingsRoute,
+  ControlRoute: ControlRoute,
   DiscoverUsersRoute: DiscoverUsersRoute,
   ExploreRoute: ExploreRoute,
   FavoritesRoute: FavoritesRoute,
