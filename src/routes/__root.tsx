@@ -106,25 +106,13 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       },
       { name: "theme-color", content: "#7c3aed" },
       { title: "Reading Corner" },
-      {
-        name: "description",
-        content: "Discover, read and explore amazing books. Join Reading Corner today!",
-      },
-      { property: "og:title", content: "Reading Corner – Read • Explore • Imagine" },
+      { property: "og:title", content: "Reading Corner" },
       { property: "og:site_name", content: "Reading Corner" },
-      {
-        property: "og:description",
-        content: "Discover, read and explore amazing books. Join Reading Corner today!",
-      },
       { property: "og:type", content: "website" },
       { property: "og:url", content: "https://book-chi-jade.vercel.app/" },
       { property: "og:image", content: "https://book-chi-jade.vercel.app/og-image.png" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:title", content: "Reading Corner – Read • Explore • Imagine" },
-      {
-        name: "twitter:description",
-        content: "Discover, read and explore amazing books. Join Reading Corner today!",
-      },
+      { name: "twitter:title", content: "Reading Corner" },
       { name: "twitter:image", content: "https://book-chi-jade.vercel.app/og-image.png" },
     ],
     links: [
