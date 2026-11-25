@@ -251,17 +251,29 @@ export const MAX_CHAT_MEDIA_BYTES = 25 * 1024 * 1024;
 export function validateMediaFile(input: {
   size: number;
   type: string;
+  name?: string;
   maxBytes?: number;
 }): { ok: true; kind: "image" | "video" | "audio" } | { ok: false; error: string } {
   const maxBytes = input.maxBytes ?? MAX_CHAT_MEDIA_BYTES;
   const mime = String(input.type ?? "").toLowerCase();
-  const kind = mime.startsWith("video/")
+  let kind: "image" | "video" | "audio" | null = mime.startsWith("video/")
     ? "video"
     : mime.startsWith("audio/")
       ? "audio"
       : mime.startsWith("image/")
         ? "image"
         : null;
+
+  if (!kind && input.name) {
+    const ext = (input.name.split(".").pop() ?? "").toLowerCase();
+    if (["mp4", "webm", "mov", "m4v", "mkv", "3gp", "ogv"].includes(ext)) {
+      kind = "video";
+    } else if (["jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "bmp", "svg"].includes(ext)) {
+      kind = "image";
+    } else if (["mp3", "wav", "ogg", "m4a", "aac", "weba"].includes(ext)) {
+      kind = "audio";
+    }
+  }
 
   if (!kind) {
     return { ok: false, error: "Only image, video, and audio files are supported." };

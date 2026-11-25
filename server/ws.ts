@@ -22,40 +22,80 @@ type ClientSocket = WebSocket & {
 
 const userSockets = new Map<string, Set<ClientSocket>>();
 const activeCallPeers = new Map<string, { callId: string; peerId: string }>();
+const pendingCallOffers = new Map<
+  string,
+  {
+    callId: string;
+    callType: "audio" | "video";
+    caller: DbUser;
+    targetId: string;
+    createdAt: number;
+  }
+>();
+
+export function getUserAliases(userId: string): string[] {
+  if (!userId) return [];
+  const list = [userId];
+  if (userId.startsWith("fb_")) {
+    const raw = userId.slice(3);
+    if (raw && !list.includes(raw)) list.push(raw);
+  } else {
+    const fbKey = `fb_${userId}`;
+    if (!list.includes(fbKey)) list.push(fbKey);
+  }
+  return list;
+}
 
 export function isUserConnected(userId: string): boolean {
-  const set = userSockets.get(userId);
-  return Boolean(set && set.size > 0);
+  for (const alias of getUserAliases(userId)) {
+    const set = userSockets.get(alias);
+    if (set) {
+      for (const ws of set) {
+        if (ws.readyState === WebSocket.OPEN) return true;
+      }
+    }
+  }
+  return false;
 }
 
 export function isUserViewingThread(userId: string, peerId: string): boolean {
-  const set = userSockets.get(userId);
-  if (!set) return false;
-  for (const ws of set) {
-    if (ws.readyState === WebSocket.OPEN && ws.activePeerId === peerId) {
-      return true;
+  const peerAliases = new Set(getUserAliases(peerId));
+  for (const alias of getUserAliases(userId)) {
+    const set = userSockets.get(alias);
+    if (!set) continue;
+    for (const ws of set) {
+      if (ws.readyState === WebSocket.OPEN && ws.activePeerId && peerAliases.has(ws.activePeerId)) {
+        return true;
+      }
     }
   }
   return false;
 }
 
 export function sendToUser(userId: string, event: string, payload: unknown) {
-  const set = userSockets.get(userId);
-  if (!set) return;
   const serialized = JSON.stringify({ event, payload });
-  for (const ws of set) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(serialized);
+  const sentSockets = new Set<ClientSocket>();
+  for (const alias of getUserAliases(userId)) {
+    const set = userSockets.get(alias);
+    if (!set) continue;
+    for (const ws of set) {
+      if (ws.readyState === WebSocket.OPEN && !sentSockets.has(ws)) {
+        sentSockets.add(ws);
+        ws.send(serialized);
+      }
     }
   }
 }
 
 export function broadcastEvent(event: string, payload: unknown, excludeUserId?: string) {
+  const excludedAliases = excludeUserId ? new Set(getUserAliases(excludeUserId)) : null;
   const serialized = JSON.stringify({ event, payload });
+  const sentSockets = new Set<ClientSocket>();
   for (const [connectedUserId, set] of userSockets.entries()) {
-    if (excludeUserId && connectedUserId === excludeUserId) continue;
+    if (excludedAliases?.has(connectedUserId)) continue;
     for (const ws of set) {
-      if (ws.readyState === WebSocket.OPEN) {
+      if (ws.readyState === WebSocket.OPEN && !sentSockets.has(ws)) {
+        sentSockets.add(ws);
         ws.send(serialized);
       }
     }
@@ -220,16 +260,41 @@ export function attachWebSocketServer(httpServer: HttpServer) {
       return;
     }
 
-    let set = userSockets.get(userId);
-    if (!set) {
-      set = new Set();
-      userSockets.set(userId, set);
+    const aliases = getUserAliases(userId);
+    for (const alias of aliases) {
+      let set = userSockets.get(alias);
+      if (!set) {
+        set = new Set();
+        userSockets.set(alias, set);
+      }
+      set.add(ws);
     }
-    set.add(ws);
+
     broadcastPresence(userId, true);
     markPendingDeliveredForUser(userId);
 
     ws.send(JSON.stringify({ event: "connected", payload: { userId } }));
+
+    // Check if there is an active pending incoming call for this user (<35s old)
+    for (const alias of aliases) {
+      const pending = pendingCallOffers.get(alias);
+      if (pending && Date.now() - pending.createdAt < 35_000) {
+        pendingCallOffers.delete(alias);
+        void toPublicUser(pending.caller, true, alias).then((fromPub) => {
+          sendToUser(alias, "call:incoming", {
+            callId: pending.callId,
+            callType: pending.callType,
+            from: fromPub,
+          });
+          sendToUser(pending.caller.id, "call:ringing", {
+            callId: pending.callId,
+            targetId: alias,
+            callType: pending.callType,
+            recipientOnline: true,
+          });
+        });
+      }
+    }
 
     ws.on("pong", () => {
       ws.isAlive = true;
@@ -285,24 +350,25 @@ export function attachWebSocketServer(httpServer: HttpServer) {
         }
 
         if (event === "call:initiate") {
-          const targetId = typeof payload["targetId"] === "string" ? payload["targetId"] : "";
+          const rawTarget =
+            typeof payload["targetId"] === "string" ? payload["targetId"].trim() : "";
           const callType = payload["callType"] === "video" ? "video" : "audio";
-          if (!targetId || targetId === userId) return;
-          if (await isBlockedBetween(userId, targetId)) {
-            ws.send(
-              JSON.stringify({
-                event: "call:error",
-                payload: { error: "Cannot initiate call. This user is blocked." },
-              }),
-            );
-            return;
-          }
+          if (!rawTarget) return;
+
+          const targetAliases = getUserAliases(rawTarget);
+          const callerAliases = getUserAliases(userId);
+          if (targetAliases.some((t) => callerAliases.includes(t))) return;
+
+          const callerPlaceholders = callerAliases.map(() => "?").join(",");
+          const targetPlaceholders = targetAliases.map(() => "?").join(",");
+
           const caller = (await db
-            .prepare("SELECT * FROM users WHERE id = ? LIMIT 1")
-            .get(userId)) as DbUser | undefined;
+            .prepare(`SELECT * FROM users WHERE id IN (${callerPlaceholders}) LIMIT 1`)
+            .get(...callerAliases)) as DbUser | undefined;
           const target = (await db
-            .prepare("SELECT id FROM users WHERE id = ? LIMIT 1")
-            .get(targetId)) as { id: string } | undefined;
+            .prepare(`SELECT * FROM users WHERE id IN (${targetPlaceholders}) LIMIT 1`)
+            .get(...targetAliases)) as DbUser | undefined;
+
           if (!caller || !target) {
             ws.send(
               JSON.stringify({
@@ -312,17 +378,39 @@ export function attachWebSocketServer(httpServer: HttpServer) {
             );
             return;
           }
+
+          if (await isBlockedBetween(caller.id, target.id)) {
+            ws.send(
+              JSON.stringify({
+                event: "call:error",
+                payload: { error: "Cannot initiate call. This user is blocked." },
+              }),
+            );
+            return;
+          }
+
           const rawCallId = typeof payload["callId"] === "string" ? payload["callId"].trim() : "";
           const callId =
             rawCallId && /^[a-zA-Z0-9_-]{4,64}$/.test(rawCallId)
               ? rawCallId
               : `call_${crypto.randomUUID()}`;
-          const recipientOnline = isUserConnected(targetId);
 
-          const existingTargetCall = activeCallPeers.get(targetId);
+          const canonicalCallerId = caller.id;
+          const canonicalTargetId = target.id;
+          const recipientOnline = isUserConnected(canonicalTargetId);
+
+          let existingTargetCall: { callId: string; peerId: string } | undefined;
+          for (const tAlias of getUserAliases(canonicalTargetId)) {
+            const hit = activeCallPeers.get(tAlias);
+            if (hit) {
+              existingTargetCall = hit;
+              break;
+            }
+          }
+
           if (existingTargetCall && existingTargetCall.callId !== callId) {
-            sendToUser(userId, "call:signal", {
-              fromUserId: targetId,
+            sendToUser(canonicalCallerId, "call:signal", {
+              fromUserId: canonicalTargetId,
               callId,
               action: "busy",
               sdp: null,
@@ -331,17 +419,34 @@ export function attachWebSocketServer(httpServer: HttpServer) {
             return;
           }
 
-          activeCallPeers.set(userId, { callId, peerId: targetId });
+          for (const cAlias of getUserAliases(canonicalCallerId)) {
+            activeCallPeers.set(cAlias, { callId, peerId: canonicalTargetId });
+          }
+          for (const tAlias of getUserAliases(canonicalTargetId)) {
+            activeCallPeers.set(tAlias, { callId, peerId: canonicalCallerId });
+          }
+
+          const callPayload = {
+            callId,
+            callType,
+            from: await toPublicUser(caller, true, canonicalTargetId),
+          };
+
           if (recipientOnline) {
-            sendToUser(targetId, "call:incoming", {
+            sendToUser(canonicalTargetId, "call:incoming", callPayload);
+          } else {
+            pendingCallOffers.set(canonicalTargetId, {
               callId,
               callType,
-              from: await toPublicUser(caller, true, targetId),
+              caller,
+              targetId: canonicalTargetId,
+              createdAt: Date.now(),
             });
           }
-          sendToUser(userId, "call:ringing", {
+
+          sendToUser(canonicalCallerId, "call:ringing", {
             callId,
-            targetId,
+            targetId: canonicalTargetId,
             callType,
             recipientOnline,
           });
@@ -349,19 +454,35 @@ export function attachWebSocketServer(httpServer: HttpServer) {
         }
 
         if (event === "call:signal") {
-          const targetId = typeof payload["targetId"] === "string" ? payload["targetId"] : "";
-          const callId = typeof payload["callId"] === "string" ? payload["callId"] : "";
-          const action = typeof payload["action"] === "string" ? payload["action"] : "";
+          const targetId =
+            typeof payload["targetId"] === "string" ? payload["targetId"].trim() : "";
+          const callId = typeof payload["callId"] === "string" ? payload["callId"].trim() : "";
+          const action = typeof payload["action"] === "string" ? payload["action"].trim() : "";
           if (!targetId || !action || (await isBlockedBetween(userId, targetId))) return;
 
+          const userAliases = getUserAliases(userId);
+          const targetAliases = getUserAliases(targetId);
+
           if (action === "accepted") {
-            activeCallPeers.set(userId, { callId, peerId: targetId });
-            activeCallPeers.set(targetId, { callId, peerId: userId });
+            for (const uAlias of userAliases) {
+              activeCallPeers.set(uAlias, { callId, peerId: targetId });
+              pendingCallOffers.delete(uAlias);
+            }
+            for (const tAlias of targetAliases) {
+              activeCallPeers.set(tAlias, { callId, peerId: userId });
+              pendingCallOffers.delete(tAlias);
+            }
           } else if (action === "declined" || action === "ended" || action === "busy") {
-            const mine = activeCallPeers.get(userId);
-            if (!mine || mine.callId === callId) activeCallPeers.delete(userId);
-            const theirs = activeCallPeers.get(targetId);
-            if (theirs && theirs.callId === callId) activeCallPeers.delete(targetId);
+            for (const uAlias of userAliases) {
+              const mine = activeCallPeers.get(uAlias);
+              if (!mine || mine.callId === callId) activeCallPeers.delete(uAlias);
+              pendingCallOffers.delete(uAlias);
+            }
+            for (const tAlias of targetAliases) {
+              const theirs = activeCallPeers.get(tAlias);
+              if (theirs && theirs.callId === callId) activeCallPeers.delete(tAlias);
+              pendingCallOffers.delete(tAlias);
+            }
           }
 
           sendToUser(targetId, "call:signal", {
@@ -382,17 +503,30 @@ export function attachWebSocketServer(httpServer: HttpServer) {
     });
 
     ws.on("close", () => {
-      const current = userSockets.get(userId);
-      if (current) {
-        current.delete(ws);
-        if (current.size === 0) {
-          userSockets.delete(userId);
-          const activeCall = activeCallPeers.get(userId);
+      const aliases = getUserAliases(userId);
+      let wasLast = false;
+      for (const alias of aliases) {
+        const current = userSockets.get(alias);
+        if (current) {
+          current.delete(ws);
+          if (current.size === 0) {
+            userSockets.delete(alias);
+            wasLast = true;
+          }
+        }
+      }
+
+      if (wasLast && !isUserConnected(userId)) {
+        for (const alias of aliases) {
+          const activeCall = activeCallPeers.get(alias);
           if (activeCall) {
-            activeCallPeers.delete(userId);
-            const peerActive = activeCallPeers.get(activeCall.peerId);
-            if (peerActive && peerActive.callId === activeCall.callId) {
-              activeCallPeers.delete(activeCall.peerId);
+            activeCallPeers.delete(alias);
+            const peerAliases = getUserAliases(activeCall.peerId);
+            for (const pAlias of peerAliases) {
+              const peerActive = activeCallPeers.get(pAlias);
+              if (peerActive && peerActive.callId === activeCall.callId) {
+                activeCallPeers.delete(pAlias);
+              }
             }
             sendToUser(activeCall.peerId, "call:signal", {
               fromUserId: userId,
@@ -402,8 +536,9 @@ export function attachWebSocketServer(httpServer: HttpServer) {
               candidate: null,
             });
           }
-          broadcastPresence(userId, false);
+          pendingCallOffers.delete(alias);
         }
+        broadcastPresence(userId, false);
       }
     });
   });

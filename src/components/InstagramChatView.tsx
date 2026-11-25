@@ -769,7 +769,7 @@ export function InstagramChatView({
     e.target.value = "";
     if (!file || !activePeerId) return;
 
-    const validation = validateMediaFile({ size: file.size, type: file.type });
+    const validation = validateMediaFile({ size: file.size, type: file.type, name: file.name });
     if (!validation.ok) {
       toast.error(validation.error);
       return;
@@ -777,13 +777,23 @@ export function InstagramChatView({
 
     if (validation.kind === "image") {
       try {
-        const compressedFile = await compressImageFile(file);
-        const previewUrl = URL.createObjectURL(compressedFile);
+        let targetFile = file;
+        let wasCompressed = false;
+        try {
+          const compressed = await compressImageFile(file);
+          if (compressed) {
+            targetFile = compressed;
+            wasCompressed = compressed !== file;
+          }
+        } catch {
+          // If compression fails, use original file cleanly
+        }
+        const previewUrl = URL.createObjectURL(targetFile);
         setPendingImageGalleryPrompt({
-          file: compressedFile,
+          file: targetFile,
           previewUrl,
           peerId: activePeerId,
-          compressed: compressedFile !== file,
+          compressed: wasCompressed,
         });
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Could not prepare photo.");
@@ -800,6 +810,11 @@ export function InstagramChatView({
         kind: uploaded.kind,
         name: uploaded.originalName || file.name,
       });
+      toast.success(
+        uploaded.kind === "video"
+          ? "Video attached · Add a caption or tap send"
+          : "Media attached · Ready to send",
+      );
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not upload media.");
     } finally {
@@ -978,16 +993,16 @@ export function InstagramChatView({
     if (!activePeer) return;
     try {
       const microphone = await requestFeatureMediaPermission("microphone");
-      if (microphone !== "granted") {
+      if (microphone === "denied") {
         toast.info(
-          "Microphone access is needed for calls. Enable it in Android Settings → Apps → Chrome → Permissions and retry.",
+          "Microphone access is blocked in site settings. Allow microphone access in your browser and retry.",
         );
         return;
       }
       if (callType === "video") {
         const camera = await requestFeatureMediaPermission("camera");
-        if (camera !== "granted") {
-          toast.info("Camera access is needed for video calls. You can still place an audio call.");
+        if (camera === "denied") {
+          toast.info("Camera access is blocked. You can still place an audio call.");
           return;
         }
       }

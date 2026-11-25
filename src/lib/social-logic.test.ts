@@ -329,6 +329,19 @@ test("parseGalleryScope, validateMediaFile, and buildNotificationChatPath enforc
     ok: true,
     kind: "video",
   });
+  // Filename extension inference for mobile or generic octet-stream uploads:
+  assert.deepEqual(validateMediaFile({ size: 5000, type: "", name: "vacation_clip.mp4" }), {
+    ok: true,
+    kind: "video",
+  });
+  assert.deepEqual(
+    validateMediaFile({ size: 5000, type: "application/octet-stream", name: "recording.mov" }),
+    { ok: true, kind: "video" },
+  );
+  assert.deepEqual(validateMediaFile({ size: 5000, type: "", name: "sunset.jpg" }), {
+    ok: true,
+    kind: "image",
+  });
   assert.equal(validateMediaFile({ size: 30 * 1024 * 1024, type: "video/mp4" }).ok, false);
   assert.equal(validateMediaFile({ size: 100, type: "application/pdf" }).ok, false);
 

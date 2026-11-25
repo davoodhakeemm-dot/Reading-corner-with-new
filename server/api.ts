@@ -2946,11 +2946,23 @@ export function createApiRouter() {
     let validMediaId: string | null = null;
 
     if (mediaId) {
-      const mediaRow = (await db
+      const candidateOwnerIds = new Set<string>([me.id]);
+      if (me.id.startsWith("fb_")) candidateOwnerIds.add(me.id.slice(3));
+      else candidateOwnerIds.add(`fb_${me.id}`);
+      const fbUid = await resolveFirebaseUid(req);
+      if (fbUid) {
+        candidateOwnerIds.add(fbUid);
+        candidateOwnerIds.add(`fb_${fbUid}`);
+      }
+      const ownerIdList = Array.from(candidateOwnerIds);
+      const ownerPlaceholders = ownerIdList.map(() => "?").join(",");
+
+      let mediaRow = (await db
         .prepare(
-          "SELECT * FROM media_objects WHERE id = ? AND (owner_id = ? OR recipient_id = ?) LIMIT 1",
+          `SELECT id, owner_id, recipient_id, kind, original_name FROM media_objects
+           WHERE id = ? AND (owner_id IN (${ownerPlaceholders}) OR recipient_id IN (${ownerPlaceholders})) LIMIT 1`,
         )
-        .get(mediaId, me.id, me.id)) as
+        .get(mediaId, ...ownerIdList, ...ownerIdList)) as
         | {
             id: string;
             owner_id: string;
@@ -2959,6 +2971,47 @@ export function createApiRouter() {
             original_name: string;
           }
         | undefined;
+
+      if (!mediaRow) {
+        const fbRow = (await db
+          .prepare(
+            `SELECT id, owner_uid, recipient_uid, kind, original_name FROM firebase_media
+             WHERE id = ? AND (owner_uid IN (${ownerPlaceholders}) OR recipient_uid IN (${ownerPlaceholders})) LIMIT 1`,
+          )
+          .get(mediaId, ...ownerIdList, ...ownerIdList)) as
+          | {
+              id: string;
+              owner_uid: string;
+              recipient_uid: string | null;
+              kind: string;
+              original_name: string;
+            }
+          | undefined;
+
+        if (fbRow) {
+          mediaRow = {
+            id: fbRow.id,
+            owner_id: fbRow.owner_uid,
+            recipient_id: fbRow.recipient_uid,
+            kind: fbRow.kind,
+            original_name: fbRow.original_name,
+          };
+          await db
+            .prepare(
+              "INSERT OR IGNORE INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, gallery_scope, created_at) VALUES (?, ?, ?, ?, 'application/octet-stream', ?, ?, 0, 0, 'normal', ?)",
+            )
+            .run(
+              fbRow.id,
+              me.id,
+              peer.id,
+              fbRow.kind,
+              fbRow.original_name,
+              `firebase/${fbRow.owner_uid}/${fbRow.id}`,
+              new Date().toISOString(),
+            );
+        }
+      }
+
       if (!mediaRow) {
         res.status(403).json({ error: "Invalid media attachment." });
         return;
@@ -2966,11 +3019,12 @@ export function createApiRouter() {
       validMediaId = mediaRow.id;
       mediaKind = mediaRow.kind;
       mediaName = mediaRow.original_name;
-      if (!mediaRow.recipient_id && mediaRow.owner_id === me.id) {
-        await db
-          .prepare("UPDATE media_objects SET recipient_id = ? WHERE id = ?")
-          .run(peer.id, mediaRow.id);
-      }
+      await db
+        .prepare("UPDATE media_objects SET recipient_id = ? WHERE id = ?")
+        .run(peer.id, mediaRow.id);
+      await db
+        .prepare("UPDATE firebase_media SET recipient_uid = ? WHERE id = ?")
+        .run(peer.id, mediaRow.id);
     }
 
     if (!cleanText && !validMediaId) {
@@ -3430,7 +3484,7 @@ export function createApiRouter() {
   });
 
   // Multipart media upload handler (works for photos, videos, and audio)
-  router.post("/media", upload.single("file"), async (req: AuthedRequest, res) => {
+  const handleMultipartMediaUpload = async (req: AuthedRequest, res: Response) => {
     const file = req.file;
     const fbUid = await resolveFirebaseUid(req);
     const resolved = await lookupSessionUser(req);
@@ -3454,7 +3508,7 @@ export function createApiRouter() {
       return;
     }
 
-    const kind = file.mimetype.startsWith("video/")
+    let kind = file.mimetype.startsWith("video/")
       ? "video"
       : file.mimetype.startsWith("audio/")
         ? "audio"
@@ -3463,9 +3517,31 @@ export function createApiRouter() {
           : null;
 
     if (!kind) {
+      const ext = (file.originalname.split(".").pop() ?? "").toLowerCase();
+      if (["mp4", "webm", "mov", "m4v", "mkv", "3gp", "ogv"].includes(ext)) {
+        kind = "video";
+      } else if (
+        ["jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "bmp", "svg"].includes(ext)
+      ) {
+        kind = "image";
+      } else if (["mp3", "wav", "ogg", "m4a", "aac", "weba"].includes(ext)) {
+        kind = "audio";
+      }
+    }
+
+    if (!kind) {
       res.status(400).json({ error: "Only image, video, and audio files are supported." });
       return;
     }
+
+    const resolvedMime =
+      file.mimetype && file.mimetype !== "application/octet-stream"
+        ? file.mimetype
+        : kind === "video"
+          ? "video/mp4"
+          : kind === "audio"
+            ? "audio/webm"
+            : "image/jpeg";
 
     const mediaId = `${fbUid ? "fbm" : "med"}_${crypto.randomUUID()}`;
     const resolvedUser =
@@ -3482,30 +3558,25 @@ export function createApiRouter() {
     const now = new Date().toISOString();
     const originalName = file.originalname || `${kind}.${kind === "video" ? "mp4" : "jpg"}`;
 
-    await uploadMediaStorage(storageKey, file.buffer, file.mimetype);
+    await uploadMediaStorage(storageKey, file.buffer, resolvedMime);
 
-    const userInDb = Boolean(
-      await db.prepare("SELECT 1 FROM users WHERE id = ? LIMIT 1").get(ownerId),
-    );
-
-    if (userInDb) {
-      await db
-        .prepare(
-          "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, gallery_scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-        )
-        .run(
-          mediaId,
-          ownerId,
-          recipientId || null,
-          kind,
-          file.mimetype,
-          originalName,
-          storageKey,
-          file.size,
-          galleryScope,
-          now,
-        );
-    }
+    // Always persist to media_objects so chat message validations and direct media fetches succeed
+    await db
+      .prepare(
+        "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, gallery_scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+      )
+      .run(
+        mediaId,
+        ownerId,
+        recipientId || null,
+        kind,
+        resolvedMime,
+        originalName,
+        storageKey,
+        file.size,
+        galleryScope,
+        now,
+      );
 
     if (fbUid || ownerId.startsWith("fb_")) {
       await db
@@ -3517,7 +3588,7 @@ export function createApiRouter() {
           ownerUid,
           recipientId || null,
           kind,
-          file.mimetype,
+          resolvedMime,
           originalName,
           storageKey,
           file.size,
@@ -3529,7 +3600,7 @@ export function createApiRouter() {
     res.status(201).json({
       id: mediaId,
       kind,
-      mimeType: file.mimetype,
+      mimeType: resolvedMime,
       originalName,
       sizeBytes: file.size,
       galleryScope,
@@ -3537,7 +3608,24 @@ export function createApiRouter() {
       url: `/api/media/${mediaId}`,
       mine: true,
     });
-  });
+  };
+
+  const uploadSingleMiddleware = (req: Request, res: Response, next: NextFunction) => {
+    upload.single("file")(req, res, (err) => {
+      if (err) {
+        const msg =
+          err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE"
+            ? "File exceeds the 25 MB limit."
+            : err.message || "Failed to parse upload.";
+        res.status(400).json({ error: msg });
+        return;
+      }
+      next();
+    });
+  };
+
+  router.post("/media", uploadSingleMiddleware, handleMultipartMediaUpload);
+  router.post("/media/upload", uploadSingleMiddleware, handleMultipartMediaUpload);
 
   // Grant recipient access when sharing an existing gallery item into a Firebase chat
   router.post("/media/:id/share", async (req: AuthedRequest, res) => {
@@ -3954,12 +4042,32 @@ export function createApiRouter() {
       return;
     }
 
+    const total = file.length;
+    res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Content-Type", mimeType);
     res.setHeader("Cache-Control", "private, max-age=3600");
     if (req.query["download"] === "1") {
       const safeName = originalName.replace(/["\r\n]/g, "_");
       res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
     }
+
+    const range = req.headers.range;
+    if (range && range.startsWith("bytes=")) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+      if (!Number.isNaN(start) && start < total && end >= start) {
+        const safeEnd = Math.min(end, total - 1);
+        const chunk = file.subarray(start, safeEnd + 1);
+        res.status(206);
+        res.setHeader("Content-Range", `bytes ${start}-${safeEnd}/${total}`);
+        res.setHeader("Content-Length", chunk.length);
+        res.end(chunk);
+        return;
+      }
+    }
+
+    res.setHeader("Content-Length", total);
     res.send(file);
   });
 

@@ -62,6 +62,30 @@ async function detectCanSwitchCamera(kind: Kind): Promise<boolean> {
   return /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent ?? "");
 }
 
+function createSilentAudioStream(): MediaStream {
+  try {
+    const AudioCtx =
+      typeof window !== "undefined"
+        ? window.AudioContext ||
+          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+        : undefined;
+    if (AudioCtx) {
+      const ctx = new AudioCtx();
+      const dest = ctx.createMediaStreamDestination();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      gain.gain.value = 0;
+      osc.connect(gain);
+      gain.connect(dest);
+      osc.start();
+      return dest.stream;
+    }
+  } catch {
+    /* ignore audio synthesis error */
+  }
+  return new MediaStream();
+}
+
 async function acquireInitialMedia(kind: Kind, facingMode: FacingMode): Promise<MediaStream> {
   const audioConstraints: MediaTrackConstraints = {
     echoCancellation: true,
@@ -90,6 +114,21 @@ async function acquireInitialMedia(kind: Kind, facingMode: FacingMode): Promise<
         audio: true,
         video: kind === "video",
       });
+    }
+    if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+      if (kind === "video") {
+        try {
+          const videoOnly = await navigator.mediaDevices.getUserMedia({ video: true });
+          const silent = createSilentAudioStream();
+          silent.getAudioTracks().forEach((t) => videoOnly.addTrack(t));
+          return videoOnly;
+        } catch {
+          // Fall through to error
+        }
+      } else {
+        const silent = createSilentAudioStream();
+        if (silent.getAudioTracks().length > 0) return silent;
+      }
     }
     throw err;
   }
@@ -416,14 +455,18 @@ export function createCallClient(
     }) {
       const s = current;
       if (!s || s.callId !== payload.callId) return;
+      s.status = "ringing";
       if (!payload.recipientOnline) {
-        finish(s, undefined, `${s.target?.fullName ?? "User"} is offline right now.`);
-        return;
+        // Keep ringing for up to 30s to allow target's WebSocket to reconnect or page to focus
+        timeout(
+          s,
+          30000,
+          `${s.target?.fullName ?? "User"} is not answering or unreachable right now.`,
+        );
+      } else {
+        timeout(s, 45000, "No answer.");
       }
-      if (s.status === "preparing") {
-        s.status = "ringing";
-        display(s);
-      }
+      display(s);
     },
 
     handleCallError(payload: { error?: string }) {
@@ -570,11 +613,21 @@ export function createCallClient(
         }
         await prepare(s);
         if (current !== s) return;
-        const sent = sendWs("call:initiate", {
+        let sent = sendWs("call:initiate", {
           callId: s.callId,
           targetId: target.id,
           callType: kind,
         });
+        if (!sent) {
+          for (let i = 0; i < 8 && !sent && current === s; i++) {
+            await new Promise((r) => setTimeout(r, 250));
+            sent = sendWs("call:initiate", {
+              callId: s.callId,
+              targetId: target.id,
+              callType: kind,
+            });
+          }
+        }
         if (!sent) {
           throw new Error("Realtime connection is offline. Reconnect and try again.");
         }
@@ -608,11 +661,21 @@ export function createCallClient(
       try {
         const pc = await prepare(s);
         if (current !== s) return;
-        sendWs("call:signal", {
+        let sent = sendWs("call:signal", {
           targetId: s.targetId,
           callId: s.callId,
           action: "accepted",
         });
+        if (!sent) {
+          for (let i = 0; i < 8 && !sent && current === s; i++) {
+            await new Promise((r) => setTimeout(r, 250));
+            sent = sendWs("call:signal", {
+              targetId: s.targetId,
+              callId: s.callId,
+              action: "accepted",
+            });
+          }
+        }
         sendMediaState(s);
         if (s.pendingOffer) {
           const offer = s.pendingOffer;

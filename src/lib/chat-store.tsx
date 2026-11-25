@@ -2126,14 +2126,35 @@ export async function uploadChatMedia(
 ) {
   if (!state.me) throw new Error("Authentication required.");
   const scope = parseGalleryScope(galleryScope);
-  const kind: MediaKind | null = file.type.startsWith("image/")
+  let kind: MediaKind | null = file.type.startsWith("image/")
     ? "image"
     : file.type.startsWith("video/")
       ? "video"
       : file.type.startsWith("audio/")
         ? "audio"
         : null;
+
+  if (!kind) {
+    const ext = (file.name.split(".").pop() ?? "").toLowerCase();
+    if (["mp4", "webm", "mov", "m4v", "mkv", "3gp", "ogv"].includes(ext)) {
+      kind = "video";
+    } else if (["jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "bmp", "svg"].includes(ext)) {
+      kind = "image";
+    } else if (["mp3", "wav", "ogg", "m4a", "aac", "weba"].includes(ext)) {
+      kind = "audio";
+    }
+  }
+
   if (!kind) throw new Error("Choose a supported image, video, or audio file.");
+
+  const effectiveMimeType =
+    file.type && file.type !== "application/octet-stream"
+      ? file.type
+      : kind === "video"
+        ? "video/mp4"
+        : kind === "audio"
+          ? "audio/webm"
+          : "image/jpeg";
 
   let data: {
     id: string;
@@ -2168,7 +2189,7 @@ export async function uploadChatMedia(
       method: "POST",
       body: {
         kind,
-        mimeType: file.type,
+        mimeType: effectiveMimeType,
         originalName: file.name,
         sizeBytes: file.size,
         galleryScope: scope,

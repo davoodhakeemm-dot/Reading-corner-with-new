@@ -300,11 +300,14 @@ function getLocalDb(): Database.Database {
 export async function createSignedMediaUpload(key: string): Promise<string> {
   const sb = getSupabase();
   if (sb) {
-    const { data, error } = await sb.storage
-      .from(MEDIA_BUCKET)
-      .createSignedUploadUrl(key, { upsert: true });
-    if (error) throw new Error(`Could not prepare media upload: ${error.message}`);
-    return data.token;
+    try {
+      const { data, error } = await sb.storage
+        .from(MEDIA_BUCKET)
+        .createSignedUploadUrl(key, { upsert: true });
+      if (!error && data?.token) return data.token;
+    } catch {
+      // Fall through to local token
+    }
   }
   return `local_token_${crypto.randomBytes(16).toString("hex")}`;
 }
@@ -312,14 +315,19 @@ export async function createSignedMediaUpload(key: string): Promise<string> {
 export async function mediaStorageObjectExists(key: string): Promise<boolean> {
   const sb = getSupabase();
   if (sb) {
-    const separator = key.lastIndexOf("/");
-    const folder = separator < 0 ? "" : key.slice(0, separator);
-    const filename = separator < 0 ? key : key.slice(separator + 1);
-    const { data, error } = await sb.storage
-      .from(MEDIA_BUCKET)
-      .list(folder, { search: filename, limit: 100 });
-    if (error) throw new Error(`Could not verify uploaded media: ${error.message}`);
-    return data.some((item) => item.name === filename);
+    try {
+      const separator = key.lastIndexOf("/");
+      const folder = separator < 0 ? "" : key.slice(0, separator);
+      const filename = separator < 0 ? key : key.slice(separator + 1);
+      const { data, error } = await sb.storage
+        .from(MEDIA_BUCKET)
+        .list(folder, { search: filename, limit: 100 });
+      if (!error && data && data.some((item) => item.name === filename)) {
+        return true;
+      }
+    } catch {
+      // Fall through to local check
+    }
   }
   const filePath = path.join(uploadDir, key);
   return fs.existsSync(filePath);
@@ -332,12 +340,15 @@ export async function uploadMediaStorage(
 ): Promise<void> {
   const sb = getSupabase();
   if (sb) {
-    const { error } = await sb.storage.from(MEDIA_BUCKET).upload(key, file, {
-      contentType,
-      upsert: true,
-    });
-    if (error) throw new Error(`Media upload failed: ${error.message}`);
-    return;
+    try {
+      const { error } = await sb.storage.from(MEDIA_BUCKET).upload(key, file, {
+        contentType,
+        upsert: true,
+      });
+      if (!error) return;
+    } catch {
+      // Fall through to local disk
+    }
   }
   const filePath = path.join(uploadDir, key);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -347,9 +358,14 @@ export async function uploadMediaStorage(
 export async function downloadMediaStorage(key: string): Promise<Buffer | null> {
   const sb = getSupabase();
   if (sb) {
-    const { data, error } = await sb.storage.from(MEDIA_BUCKET).download(key);
-    if (error || !data) return null;
-    return Buffer.from(await data.arrayBuffer());
+    try {
+      const { data, error } = await sb.storage.from(MEDIA_BUCKET).download(key);
+      if (!error && data) {
+        return Buffer.from(await data.arrayBuffer());
+      }
+    } catch {
+      // Fall through to local check
+    }
   }
   const filePath = path.join(uploadDir, key);
   if (!fs.existsSync(filePath)) return null;
