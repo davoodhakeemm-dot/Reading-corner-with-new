@@ -10,19 +10,7 @@ import { resolveLandingDestination } from "@/lib/social-logic";
 
 export const Route = createFileRoute("/")({
   head: () => ({
-    meta: [
-      { title: "Reading Corner — Read • Explore • Imagine" },
-      {
-        name: "description",
-        content:
-          "Discover stories, knowledge and new worlds. A beautiful mobile-first reading platform with books in English, Malayalam, Kannada, Hindi, Tamil, Telugu and Arabic.",
-      },
-      { property: "og:title", content: "Reading Corner — Read • Explore • Imagine" },
-      {
-        property: "og:description",
-        content: "Discover stories, knowledge and new worlds across languages and categories.",
-      },
-    ],
+    meta: [{ title: "Reading Corner" }, { property: "og:title", content: "Reading Corner" }],
   }),
   component: Welcome,
 });
