@@ -100,6 +100,7 @@ export function createCallClient(
   profile: (id: string) => Promise<PublicAccount>,
   render: (value: { incomingCall: IncomingCall | null; outgoingCall: OutgoingCall | null }) => void,
   notify: (message: string) => void,
+  waitForConnection: () => Promise<boolean>,
 ) {
   let current: Session | undefined;
 
@@ -562,6 +563,11 @@ export function createCallClient(
       timeout(s, 45000, "No answer.");
 
       try {
+        if (!(await waitForConnection())) {
+          throw new Error(
+            "Could not reconnect to real-time services. Check your connection and try again.",
+          );
+        }
         await prepare(s);
         if (current !== s) return;
         const sent = sendWs("call:initiate", {

@@ -298,6 +298,7 @@ let ws: WebSocket | null = null;
 let wsReconnectTimer: number | null = null;
 let wsPingTimer: number | null = null;
 let wsReconnectAttempt = 0;
+let wsConnectTimer: number | null = null;
 let callClient: ReturnType<typeof createCallClient> | undefined;
 
 const uploadedMediaMeta = new Map<string, { url: string; kind: MediaKind; name: string }>();
@@ -520,6 +521,10 @@ function disconnectRealtime() {
     window.clearInterval(wsPingTimer);
     wsPingTimer = null;
   }
+  if (wsConnectTimer) {
+    window.clearTimeout(wsConnectTimer);
+    wsConnectTimer = null;
+  }
   callClient?.dispose();
   callClient = undefined;
   if (ws) {
@@ -535,9 +540,27 @@ function disconnectRealtime() {
   setState({ wsConnected: false });
 }
 
+async function waitForRealtimeConnection(timeoutMs = 10_000): Promise<boolean> {
+  if (state.wsConnected && ws?.readyState === WebSocket.OPEN) return true;
+  connectRealtime();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (state.wsConnected && ws?.readyState === WebSocket.OPEN) return true;
+    if (!state.me) return false;
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  return false;
+}
+
 function ensureCallClient() {
   if (!callClient) {
-    callClient = createCallClient(sendWs, fetchUserProfile, setState, (message) => toast(message));
+    callClient = createCallClient(
+      sendWs,
+      fetchUserProfile,
+      setState,
+      (message) => toast(message),
+      waitForRealtimeConnection,
+    );
   }
   return callClient;
 }
@@ -688,8 +711,16 @@ function connectRealtime() {
       : "";
   const socket = new WebSocket(`${proto}//${window.location.host}/ws${tokenQuery}`);
   ws = socket;
+  if (wsConnectTimer) window.clearTimeout(wsConnectTimer);
+  wsConnectTimer = window.setTimeout(() => {
+    if (ws === socket && socket.readyState === WebSocket.CONNECTING) socket.close();
+  }, 12_000);
 
   socket.onopen = () => {
+    if (wsConnectTimer) {
+      window.clearTimeout(wsConnectTimer);
+      wsConnectTimer = null;
+    }
     wsReconnectAttempt = 0;
     setState({ wsConnected: true });
     if (wsPingTimer) window.clearInterval(wsPingTimer);
@@ -941,17 +972,23 @@ function connectRealtime() {
   };
 
   socket.onclose = () => {
-    if (ws === socket) {
-      ws = null;
-      setState({ wsConnected: false });
-      if (state.me) {
-        const delay = Math.min(10_000, 1500 * Math.pow(1.6, wsReconnectAttempt));
-        wsReconnectAttempt += 1;
-        wsReconnectTimer = window.setTimeout(() => {
-          if (state.me) connectRealtime();
-        }, delay);
-      }
+    if (ws !== socket) return;
+    ws = null;
+    if (wsConnectTimer) {
+      window.clearTimeout(wsConnectTimer);
+      wsConnectTimer = null;
     }
+    setState({ wsConnected: false });
+    if (wsPingTimer) {
+      window.clearInterval(wsPingTimer);
+      wsPingTimer = null;
+    }
+    const delay = Math.min(30_000, 750 * 2 ** wsReconnectAttempt++);
+    wsReconnectTimer = window.setTimeout(() => {
+      wsReconnectTimer = null;
+      if (!state.me) return;
+      void tryRefreshAuthSession().finally(connectRealtime);
+    }, delay);
   };
 }
 
