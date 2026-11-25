@@ -29,8 +29,11 @@ import {
   dedupeMessagesById,
   dedupeUsersById,
   filterAndSortUsers,
+  mergePaginatedMessages,
   normalizeEmail,
+  parseGalleryScope,
   threadKeyFor,
+  type GalleryScope,
 } from "@/lib/social-logic";
 
 export type MediaKind = "image" | "video" | "audio";
@@ -144,6 +147,13 @@ export type ChatMessage = {
   deliveredAt: string | null;
   createdAt: string;
   seenAt: string | null;
+  localStatus?: "sending" | "sent" | "failed";
+  sendError?: string;
+  pendingRetry?: {
+    text: string;
+    mediaId: string | null;
+    replyToId: string | null;
+  };
 };
 
 export type ConversationItem = {
@@ -170,6 +180,7 @@ export type GalleryItem = {
   mimeType: string;
   originalName: string;
   sizeBytes: number;
+  galleryScope?: GalleryScope;
   createdAt: string;
   url: string;
   mine: boolean;
@@ -292,6 +303,10 @@ let callClient: ReturnType<typeof createCallClient> | undefined;
 const uploadedMediaMeta = new Map<string, { url: string; kind: MediaKind; name: string }>();
 const mediaBlobUrlCache = new Map<string, string>();
 const inFlightMediaFetches = new Map<string, Promise<string>>();
+const typingTimers = new Map<string, number>();
+const cursorByPeer = new Map<string, { before: string; beforeId: string } | null>();
+const hasOlderByPeer = new Map<string, boolean>();
+let sessionRefreshPromise: Promise<string | null> | null = null;
 
 function emit() {
   listeners.forEach((l) => l());
@@ -337,7 +352,9 @@ export function getCachedMediaObjectUrl(url: string | null | undefined): string 
   return mediaBlobUrlCache.get(url) ?? null;
 }
 
-async function getBearerHeaders(extra?: Record<string, string>): Promise<Record<string, string>> {
+export async function getBearerHeaders(
+  extra?: Record<string, string>,
+): Promise<Record<string, string>> {
   const headers: Record<string, string> = { ...(extra ?? {}) };
   if (state.sessionToken && state.sessionToken.startsWith("rc_sess_")) {
     headers["Authorization"] = `Bearer ${state.sessionToken}`;
@@ -351,21 +368,83 @@ async function getBearerHeaders(extra?: Record<string, string>): Promise<Record<
   return headers;
 }
 
+async function tryRefreshAuthSession(): Promise<string | null> {
+  if (typeof window === "undefined") return null;
+  if (sessionRefreshPromise) return sessionRefreshPromise;
+
+  sessionRefreshPromise = (async () => {
+    try {
+      const sessRes = await fetch("/api/auth/session", { credentials: "include" });
+      if (sessRes.ok) {
+        const sess = (await sessRes.json().catch(() => ({}))) as {
+          authenticated?: boolean;
+          token?: string | null;
+          user?: PublicAccount | null;
+        };
+        if (sess.authenticated && sess.user) {
+          const nextToken = sess.token ?? state.sessionToken ?? "__cookie__";
+          setState({ me: sess.user, sessionToken: nextToken });
+          return nextToken;
+        }
+      }
+
+      const fbUser = getFirebaseAuth().currentUser;
+      if (fbUser) {
+        const freshIdToken = await fbUser.getIdToken(true).catch(() => null);
+        if (freshIdToken) {
+          const fbRes = await fetch("/api/auth/firebase-session", {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ idToken: freshIdToken }),
+          });
+          if (fbRes.ok) {
+            const data = (await fbRes.json().catch(() => ({}))) as {
+              token?: string;
+              user?: PublicAccount;
+            };
+            if (data.token && data.user) {
+              setState({ me: data.user, sessionToken: data.token });
+              return data.token;
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore transient refresh error */
+    }
+    return null;
+  })().finally(() => {
+    sessionRefreshPromise = null;
+  });
+
+  return sessionRefreshPromise;
+}
+
 async function apiJson<T>(
   url: string,
   options: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
 ): Promise<T> {
-  const headers = await getBearerHeaders(options.headers);
-  if (options.body !== undefined) {
-    headers["Content-Type"] = "application/json";
-  }
-  const init: RequestInit = {
-    method: options.method ?? "GET",
-    headers,
-    credentials: "include",
-    ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+  const buildInit = async (): Promise<RequestInit> => {
+    const headers = await getBearerHeaders(options.headers);
+    if (options.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+    }
+    return {
+      method: options.method ?? "GET",
+      headers,
+      credentials: "include",
+      ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+    };
   };
-  const resp = await fetch(url, init);
+
+  let resp = await fetch(url, await buildInit());
+  if (resp.status === 401 && !url.startsWith("/api/auth/")) {
+    const refreshed = await tryRefreshAuthSession();
+    if (refreshed) {
+      resp = await fetch(url, await buildInit());
+    }
+  }
   const data = (await resp.json().catch(() => ({}))) as T & { error?: string };
   if (!resp.ok) {
     throw new Error(data.error || `Request failed (${resp.status})`);
@@ -482,6 +561,15 @@ function handleIncomingMessageEvent(msg: ChatMessage, sender?: PublicAccount) {
   const myId = state.me?.id;
   if (!myId) return;
   const peerId = msg.from === myId ? msg.to : msg.from;
+
+  const typingTimer = typingTimers.get(peerId);
+  if (typingTimer) {
+    window.clearTimeout(typingTimer);
+    typingTimers.delete(peerId);
+  }
+  if (state.typingByPeer[peerId]) {
+    setState({ typingByPeer: { ...state.typingByPeer, [peerId]: false } });
+  }
 
   upsertMessageIntoThread(peerId, msg);
 
@@ -610,6 +698,10 @@ function connectRealtime() {
         sendWs("ping", {});
       }
     }, 35_000);
+    if (state.activePeerId) {
+      sendWs("thread:active", { peerId: state.activePeerId });
+      void openThread(state.activePeerId);
+    }
     void Promise.allSettled([loadConversations(), discoverUsers()]);
   };
 
@@ -664,6 +756,22 @@ function connectRealtime() {
         const fromUserId = String(payload["fromUserId"] ?? "");
         const active = Boolean(payload["active"]);
         if (fromUserId) {
+          const prevTimer = typingTimers.get(fromUserId);
+          if (prevTimer) {
+            window.clearTimeout(prevTimer);
+            typingTimers.delete(fromUserId);
+          }
+          if (active && typeof window !== "undefined") {
+            const timeoutId = window.setTimeout(() => {
+              typingTimers.delete(fromUserId);
+              if (state.typingByPeer[fromUserId]) {
+                setState({
+                  typingByPeer: { ...state.typingByPeer, [fromUserId]: false },
+                });
+              }
+            }, 4500);
+            typingTimers.set(fromUserId, timeoutId);
+          }
           setState({
             typingByPeer: { ...state.typingByPeer, [fromUserId]: active },
           });
@@ -867,6 +975,12 @@ async function hydrateAuthenticatedSession(user: PublicAccount, token?: string |
 function resetLocalSessionState() {
   clearMediaBlobCache();
   disconnectRealtime();
+  cursorByPeer.clear();
+  hasOlderByPeer.clear();
+  for (const timer of typingTimers.values()) {
+    window.clearTimeout(timer);
+  }
+  typingTimers.clear();
   setState({
     ready: true,
     me: null,
@@ -943,7 +1057,11 @@ function bootstrap() {
       ]);
 
       const health = healthRes as { otpConfigured?: boolean; emailOtpConfigured?: boolean };
-      const sess = sessionRes as { authenticated?: boolean; user?: PublicAccount | null };
+      const sess = sessionRes as {
+        authenticated?: boolean;
+        token?: string | null;
+        user?: PublicAccount | null;
+      };
 
       setState({
         otpConfigured: Boolean(health.otpConfigured),
@@ -952,7 +1070,10 @@ function bootstrap() {
 
       if (sess.authenticated && sess.user) {
         serverCheckResolved = true;
-        await hydrateAuthenticatedSession(sess.user, state.sessionToken ?? "__cookie__");
+        await hydrateAuthenticatedSession(
+          sess.user,
+          sess.token ?? state.sessionToken ?? "__cookie__",
+        );
         return;
       }
     } catch {
@@ -1769,9 +1890,10 @@ export function dismissIncomingMessageAlert() {
 }
 
 export async function openThread(peerId: string | null) {
+  sendWs("thread:active", { peerId: peerId ?? "" });
   setState({
     activePeerId: peerId,
-    hasOlderMessages: false,
+    hasOlderMessages: peerId ? Boolean(hasOlderByPeer.get(peerId)) : false,
     loadingOlderMessages: false,
     ...(peerId && state.incomingMessageAlert?.peer.id === peerId
       ? { incomingMessageAlert: null }
@@ -1785,11 +1907,24 @@ export async function openThread(peerId: string | null) {
     blockedMe: boolean;
     pinned: boolean;
     muted: boolean;
+    hasMore?: boolean;
+    nextCursor?: { before: string; beforeId: string } | null;
     messages: ChatMessage[];
-  }>(`/api/messages/${encodeURIComponent(peerId)}`);
+  }>(`/api/messages/${encodeURIComponent(peerId)}?limit=40`);
 
   const resolvedPeerId = data.peer?.id || peerId;
-  const uniqueMessages = dedupeMessagesById(data.messages ?? []);
+  hasOlderByPeer.set(peerId, Boolean(data.hasMore));
+  cursorByPeer.set(peerId, data.nextCursor ?? null);
+
+  const existingLocal = (state.threads[peerId] ?? []).filter(
+    (m) => m.localStatus === "failed" || m.localStatus === "sending",
+  );
+  const existingRest = (state.threads[peerId] ?? []).filter((m) => !m.id.startsWith("temp_"));
+  const mergedMessages = [
+    ...mergePaginatedMessages(existingRest, data.messages ?? []),
+    ...existingLocal,
+  ];
+  const uniqueMessages = dedupeMessagesById(mergedMessages);
   const nextConversations = dedupeConversationsByPeerId(
     state.conversations.some((c) => c.peer.id === resolvedPeerId || c.peer.id === peerId)
       ? state.conversations.map((c) =>
@@ -1823,14 +1958,47 @@ export async function openThread(peerId: string | null) {
   setState({
     threads: { ...state.threads, [peerId]: uniqueMessages },
     conversations: nextConversations,
+    ...(state.activePeerId === peerId ? { hasOlderMessages: Boolean(data.hasMore) } : {}),
   });
 
   await markThreadSeen(peerId);
 }
 
-export async function loadOlderMessages(_peerId: string): Promise<void> {
-  // Up to 300 most recent messages are loaded directly via /api/messages/:peerId
-  setState({ hasOlderMessages: false, loadingOlderMessages: false });
+export async function loadOlderMessages(peerId: string): Promise<void> {
+  if (!state.me || !peerId || state.loadingOlderMessages) return;
+  const cursor = cursorByPeer.get(peerId);
+  if (!hasOlderByPeer.get(peerId) || !cursor) {
+    setState({ hasOlderMessages: false, loadingOlderMessages: false });
+    return;
+  }
+
+  setState({ loadingOlderMessages: true });
+  try {
+    const data = await apiJson<{
+      hasMore?: boolean;
+      nextCursor?: { before: string; beforeId: string } | null;
+      messages: ChatMessage[];
+    }>(
+      `/api/messages/${encodeURIComponent(peerId)}?limit=40&before=${encodeURIComponent(cursor.before)}&beforeId=${encodeURIComponent(cursor.beforeId)}`,
+    );
+
+    hasOlderByPeer.set(peerId, Boolean(data.hasMore));
+    cursorByPeer.set(peerId, data.nextCursor ?? null);
+
+    const current = state.threads[peerId] ?? [];
+    const localPending = current.filter(
+      (m) => m.localStatus === "failed" || m.localStatus === "sending",
+    );
+    const serverCurrent = current.filter((m) => !m.id.startsWith("temp_"));
+    const merged = [...mergePaginatedMessages(data.messages ?? [], serverCurrent), ...localPending];
+
+    setState({
+      threads: { ...state.threads, [peerId]: dedupeMessagesById(merged) },
+      ...(state.activePeerId === peerId ? { hasOlderMessages: Boolean(data.hasMore) } : {}),
+    });
+  } finally {
+    setState({ loadingOlderMessages: false });
+  }
 }
 
 export async function searchThreadMessages(peerId: string, q: string): Promise<ChatMessage[]> {
@@ -1852,27 +2020,42 @@ export async function markThreadSeen(peerId: string) {
   });
 }
 
-async function uploadMediaViaServer(file: File, recipientId?: string) {
+async function uploadMediaViaServer(
+  file: File,
+  recipientId?: string,
+  galleryScope: GalleryScope = "normal",
+) {
   const formData = new FormData();
   formData.append("file", file);
+  formData.append("galleryScope", parseGalleryScope(galleryScope));
   if (recipientId) {
     formData.append("recipientId", recipientId);
   }
-  const headers = await getBearerHeaders();
-  delete headers["Content-Type"];
+  const sendUpload = async () => {
+    const headers = await getBearerHeaders();
+    delete headers["Content-Type"];
+    return fetch("/api/media", {
+      method: "POST",
+      headers,
+      credentials: "include",
+      body: formData,
+    });
+  };
 
-  const resp = await fetch("/api/media", {
-    method: "POST",
-    headers,
-    credentials: "include",
-    body: formData,
-  });
+  let resp = await sendUpload();
+  if (resp.status === 401) {
+    const refreshed = await tryRefreshAuthSession();
+    if (refreshed) {
+      resp = await sendUpload();
+    }
+  }
   const data = (await resp.json().catch(() => ({}))) as {
     id?: string;
     kind?: MediaKind;
     mimeType?: string;
     originalName?: string;
     sizeBytes?: number;
+    galleryScope?: GalleryScope;
     createdAt?: string;
     url?: string;
     mine?: boolean;
@@ -1890,14 +2073,20 @@ async function uploadMediaViaServer(file: File, recipientId?: string) {
     mimeType: data.mimeType ?? file.type,
     originalName: data.originalName ?? file.name,
     sizeBytes: data.sizeBytes ?? file.size,
+    galleryScope: parseGalleryScope(data.galleryScope ?? galleryScope),
     createdAt: data.createdAt ?? new Date().toISOString(),
     url: data.url ?? `/api/media/${data.id}`,
     mine: true,
   };
 }
 
-export async function uploadChatMedia(file: File, recipientId?: string) {
+export async function uploadChatMedia(
+  file: File,
+  recipientId?: string,
+  galleryScope: GalleryScope = "normal",
+) {
   if (!state.me) throw new Error("Authentication required.");
+  const scope = parseGalleryScope(galleryScope);
   const kind: MediaKind | null = file.type.startsWith("image/")
     ? "image"
     : file.type.startsWith("video/")
@@ -1913,6 +2102,7 @@ export async function uploadChatMedia(file: File, recipientId?: string) {
     mimeType: string;
     originalName: string;
     sizeBytes: number;
+    galleryScope?: GalleryScope;
     createdAt: string;
     url: string;
     mine: boolean;
@@ -1926,6 +2116,7 @@ export async function uploadChatMedia(file: File, recipientId?: string) {
       mimeType: string;
       originalName: string;
       sizeBytes: number;
+      galleryScope?: GalleryScope;
       createdAt: string;
       url: string;
       mine: boolean;
@@ -1941,6 +2132,7 @@ export async function uploadChatMedia(file: File, recipientId?: string) {
         mimeType: file.type,
         originalName: file.name,
         sizeBytes: file.size,
+        galleryScope: scope,
         ...(recipientId ? { recipientId } : {}),
       },
     });
@@ -1961,6 +2153,7 @@ export async function uploadChatMedia(file: File, recipientId?: string) {
           mimeType: string;
           originalName: string;
           sizeBytes: number;
+          galleryScope?: GalleryScope;
           createdAt: string;
           url: string;
           mine: boolean;
@@ -1972,6 +2165,7 @@ export async function uploadChatMedia(file: File, recipientId?: string) {
             mimeType: ticket.mimeType,
             originalName: ticket.originalName,
             sizeBytes: ticket.sizeBytes,
+            galleryScope: scope,
             ...(ticket.recipientId ? { recipientId: ticket.recipientId } : {}),
           },
         });
@@ -1984,7 +2178,7 @@ export async function uploadChatMedia(file: File, recipientId?: string) {
 
   // 2. Direct server upload fallback (works across local SQLite, container disk, and server storage)
   if (!data) {
-    data = await uploadMediaViaServer(file, recipientId);
+    data = await uploadMediaViaServer(file, recipientId, scope);
   }
 
   primeMediaObjectUrl(data.url, file);
@@ -1996,6 +2190,7 @@ export async function uploadChatMedia(file: File, recipientId?: string) {
       mimeType: data.mimeType || file.type,
       originalName: data.originalName || file.name,
       sizeBytes: data.sizeBytes,
+      galleryScope: parseGalleryScope(data.galleryScope ?? scope),
       createdAt: data.createdAt,
       url: data.url,
       mine: true,
@@ -2010,6 +2205,7 @@ export async function sendChatMessage(
   text: string,
   mediaId?: string | null,
   replyToId?: string | null,
+  existingTempId?: string,
 ): Promise<ChatMessage> {
   if (!state.me) throw new Error("Authentication required.");
 
@@ -2029,25 +2225,32 @@ export async function sendChatMessage(
     throw new Error("Message text or media is required.");
   }
 
-  const tempId = `temp_${crypto.randomUUID()}`;
+  const tempId = existingTempId ?? `temp_${crypto.randomUUID()}`;
+  const existingFailed = (state.threads[peerId] ?? []).find((m) => m.id === tempId);
   const optimistic: ChatMessage = {
     id: tempId,
     threadKey: threadKeyFor(state.me.id, peerId),
     from: state.me.id,
     to: peerId,
-    text: optimisticText,
-    mediaUrl: mediaMeta?.url ?? null,
-    mediaId: mediaId ?? null,
-    mediaKind: mediaMeta?.kind ?? null,
-    mediaName: mediaMeta?.name ?? null,
+    text: existingFailed?.text || optimisticText,
+    mediaUrl: existingFailed?.mediaUrl ?? mediaMeta?.url ?? null,
+    mediaId: mediaId ?? existingFailed?.mediaId ?? null,
+    mediaKind: existingFailed?.mediaKind ?? mediaMeta?.kind ?? null,
+    mediaName: existingFailed?.mediaName ?? mediaMeta?.name ?? null,
     replyToId: replyToId ?? null,
     replyTo: null,
     reactions: [],
     editedAt: null,
     deletedAt: null,
     deliveredAt: null,
-    createdAt: new Date().toISOString(),
+    createdAt: existingFailed?.createdAt ?? new Date().toISOString(),
     seenAt: null,
+    localStatus: "sending",
+    pendingRetry: {
+      text: cleanText,
+      mediaId: mediaId ?? null,
+      replyToId: replyToId ?? null,
+    },
   };
   upsertMessageIntoThread(peerId, optimistic);
 
@@ -2061,10 +2264,39 @@ export async function sendChatMessage(
     handleIncomingMessageEvent(res.message, res.sender);
     return res.message;
   } catch (err) {
-    const cleaned = (state.threads[peerId] ?? []).filter((m) => m.id !== tempId);
-    setState({ threads: { ...state.threads, [peerId]: cleaned } });
+    const errMsg = err instanceof Error ? err.message : "Could not send message.";
+    const failedList = (state.threads[peerId] ?? []).map((m) =>
+      m.id === tempId
+        ? {
+            ...m,
+            localStatus: "failed" as const,
+            sendError: errMsg,
+          }
+        : m,
+    );
+    setState({ threads: { ...state.threads, [peerId]: failedList } });
     throw err;
   }
+}
+
+export async function retryChatMessage(
+  peerId: string,
+  tempId: string,
+): Promise<ChatMessage | null> {
+  const msg = (state.threads[peerId] ?? []).find((m) => m.id === tempId);
+  if (!msg?.pendingRetry) return null;
+  return sendChatMessage(
+    peerId,
+    msg.pendingRetry.text,
+    msg.pendingRetry.mediaId,
+    msg.pendingRetry.replyToId,
+    tempId,
+  );
+}
+
+export function dismissFailedMessage(peerId: string, tempId: string) {
+  const next = (state.threads[peerId] ?? []).filter((m) => m.id !== tempId);
+  setState({ threads: { ...state.threads, [peerId]: next } });
 }
 
 export async function editChatMessage(messageId: string, text: string): Promise<ChatMessage> {
@@ -2170,10 +2402,16 @@ export async function fetchGallery(): Promise<GalleryItem[]> {
   }
 }
 
-export async function saveMediaToGallery(url: string): Promise<void> {
+export async function saveMediaToGallery(
+  url: string,
+  galleryScope: GalleryScope = "normal",
+): Promise<void> {
   const mediaId = url.match(/\/api\/media\/([^/?#]+)/)?.[1];
   if (!mediaId) throw new Error("This media cannot be saved to your gallery.");
-  await apiJson(`/api/media/${encodeURIComponent(mediaId)}/save`, { method: "POST" });
+  await apiJson(`/api/media/${encodeURIComponent(mediaId)}/save`, {
+    method: "POST",
+    body: { galleryScope: parseGalleryScope(galleryScope) },
+  });
   await fetchGallery();
 }
 

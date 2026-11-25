@@ -21,9 +21,10 @@ let localDbPath: string | undefined;
 
 function getSupabase(): SupabaseClient | null {
   if (supabase) return supabase;
-  const url = process.env["SUPABASE_URL"] ?? process.env["NEXT_PUBLIC_SUPABASE_URL"];
-  const serviceKey = process.env["SUPABASE_SERVICE_ROLE_KEY"] ?? process.env["SUPABASE_SECRET_KEY"];
-  if (!url || !serviceKey) {
+  const url = readConfiguredEnv("SUPABASE_URL") ?? readConfiguredEnv("NEXT_PUBLIC_SUPABASE_URL");
+  const serviceKey =
+    readConfiguredEnv("SUPABASE_SERVICE_ROLE_KEY") ?? readConfiguredEnv("SUPABASE_SECRET_KEY");
+  if (!url || !serviceKey || !/^https?:\/\/[^/\s]+/i.test(url)) {
     return null;
   }
   supabase = createClient(url, serviceKey, {
@@ -109,6 +110,7 @@ function getLocalDb(): Database.Database {
       file_path TEXT NOT NULL,
       size_bytes INTEGER NOT NULL DEFAULT 0,
       is_public_avatar INTEGER NOT NULL DEFAULT 0,
+      gallery_scope TEXT NOT NULL DEFAULT 'normal',
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS firebase_media (
@@ -120,6 +122,7 @@ function getLocalDb(): Database.Database {
       original_name TEXT NOT NULL,
       file_path TEXT NOT NULL,
       size_bytes INTEGER NOT NULL DEFAULT 0,
+      gallery_scope TEXT NOT NULL DEFAULT 'normal',
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS messages (
@@ -138,6 +141,7 @@ function getLocalDb(): Database.Database {
       created_at TEXT NOT NULL,
       seen_at TEXT
     );
+    CREATE INDEX IF NOT EXISTS idx_messages_thread_created ON messages(thread_key, created_at, id);
     CREATE TABLE IF NOT EXISTS message_reactions (
       message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -214,11 +218,33 @@ function getLocalDb(): Database.Database {
       state_json TEXT NOT NULL DEFAULT '{}',
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS notification_tokens (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token TEXT NOT NULL,
+      platform TEXT NOT NULL DEFAULT 'web',
+      user_agent TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (user_id, token)
+    );
+    CREATE TABLE IF NOT EXISTS notification_preferences (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      push_enabled INTEGER NOT NULL DEFAULT 1,
+      message_preview INTEGER NOT NULL DEFAULT 1,
+      call_alerts INTEGER NOT NULL DEFAULT 1,
+      quiet_hours_enabled INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    );
   `);
 
   ensureColumns(localDb, "media_objects", [
     { name: "file_path", definition: "TEXT NOT NULL DEFAULT ''" },
     { name: "is_public_avatar", definition: "INTEGER NOT NULL DEFAULT 0" },
+    { name: "gallery_scope", definition: "TEXT NOT NULL DEFAULT 'normal'" },
+  ]);
+  ensureColumns(localDb, "firebase_media", [
+    { name: "gallery_scope", definition: "TEXT NOT NULL DEFAULT 'normal'" },
   ]);
 
   const mediaCols = (
@@ -239,15 +265,16 @@ function getLocalDb(): Database.Database {
             file_path TEXT NOT NULL,
             size_bytes INTEGER NOT NULL DEFAULT 0,
             is_public_avatar INTEGER NOT NULL DEFAULT 0,
+            gallery_scope TEXT NOT NULL DEFAULT 'normal',
             created_at TEXT NOT NULL
           );
           INSERT INTO media_objects_migrated (
-            id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at
+            id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, gallery_scope, created_at
           )
           SELECT
             id, owner_id, recipient_id, kind, mime_type, original_name,
             COALESCE(NULLIF(file_path, ''), storage_path, ''),
-            size_bytes, COALESCE(is_public_avatar, 0), created_at
+            size_bytes, COALESCE(is_public_avatar, 0), COALESCE(NULLIF(gallery_scope, ''), 'normal'), created_at
           FROM media_objects;
           DROP TABLE media_objects;
           ALTER TABLE media_objects_migrated RENAME TO media_objects;
@@ -405,6 +432,9 @@ function getRuntimeEnvSentinels(env: NodeJS.ProcessEnv = process.env): Set<strin
     ["TWILIO_ACCOUNT_SID", (v) => /^AC[a-f0-9]{32}$/i.test(v)],
     ["TWILIO_VERIFY_SERVICE_SID", (v) => /^VA[a-f0-9]{32}$/i.test(v)],
     ["APP_URL", (v) => /^https?:\/\//i.test(v)],
+    ["SUPABASE_URL", (v) => /^https?:\/\/[^/\s]+/i.test(v)],
+    ["NEXT_PUBLIC_SUPABASE_URL", (v) => /^https?:\/\/[^/\s]+/i.test(v)],
+    ["FIREBASE_SERVICE_ACCOUNT", (v) => v.trim().startsWith("{")],
   ];
   for (const [key, isValid] of canaryValidators) {
     const raw = env[key]?.trim();

@@ -1,4 +1,5 @@
 import {
+  AlertCircle,
   ArrowLeft,
   Ban,
   Bell,
@@ -14,6 +15,7 @@ import {
   Flag,
   Grid3X3,
   ImagePlus,
+  Lock,
   MessageCircle,
   Mic,
   Moon,
@@ -23,6 +25,7 @@ import {
   Phone,
   Pin,
   PinOff,
+  RefreshCw,
   Search,
   Send,
   ShieldAlert,
@@ -52,6 +55,7 @@ import { WaterGlowButton } from "@/components/WaterGlowButton";
 import {
   blockUser,
   deleteChatMessage,
+  dismissFailedMessage,
   downloadProtectedMedia,
   editChatMessage,
   fetchGallery,
@@ -63,6 +67,7 @@ import {
   loadOlderMessages,
   openThread,
   reactToMessage,
+  retryChatMessage,
   searchThreadMessages,
   searchUsers,
   saveMediaToGallery,
@@ -79,6 +84,7 @@ import {
   type PublicAccount,
 } from "@/lib/chat-store";
 import { stopVibration } from "@/lib/alerts";
+import { compressImageFile } from "@/lib/media-compress";
 import { requestFeatureMediaPermission } from "@/lib/permissions";
 import { computeChatKeyboardLayout, type ChatKeyboardLayout } from "@/lib/chat-viewport";
 import { resolveWaterButtonVariant, type SecretThemeTokens } from "@/lib/secret-themes";
@@ -87,9 +93,12 @@ import {
   dedupeMessagesById,
   dedupeUsersById,
   filterConversationsByTab,
+  groupMessagesWithDateSeparators,
   isControlSearchTrigger,
   resolveChatEscapeAction,
   splitChatSidebarUsers,
+  validateMediaFile,
+  type GalleryScope,
 } from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
 import { playWaterSound } from "@/lib/water-sound";
@@ -288,7 +297,7 @@ export function MediaLightbox({
         name={media.name}
         saveable={media.kind === "image" || media.kind === "video"}
         onOpenChange={setSaveOptionsOpen}
-        onSaveToGallery={() => saveMediaToGallery(media.url)}
+        onSaveToGallery={(scope) => saveMediaToGallery(media.url, scope)}
         onDownloadToPhone={() => downloadProtectedMedia(media.url, media.name)}
       />
     </>
@@ -359,6 +368,12 @@ export function InstagramChatView({
     url: string;
     kind: MediaKind;
     name: string;
+  } | null>(null);
+  const [pendingImageGalleryPrompt, setPendingImageGalleryPrompt] = useState<{
+    file: File;
+    previewUrl: string;
+    peerId: string;
+    compressed: boolean;
   } | null>(null);
 
   // Mobile keyboard viewport tracking so input & chat text are NEVER covered or jittering
@@ -632,6 +647,11 @@ export function InstagramChatView({
     return activeMessages;
   }, [activeMessages, threadSearchOpen, threadSearchQuery, threadSearchResults]);
 
+  const timelineEntries = useMemo(
+    () => groupMessagesWithDateSeparators(visibleMessages),
+    [visibleMessages],
+  );
+
   const lastSeenOutgoingId = useMemo(() => {
     if (!me) return null;
     for (let i = activeMessages.length - 1; i >= 0; i -= 1) {
@@ -673,13 +693,76 @@ export function InstagramChatView({
     }, 1500);
   }
 
+  useEffect(() => {
+    return () => {
+      if (pendingImageGalleryPrompt?.previewUrl) {
+        URL.revokeObjectURL(pendingImageGalleryPrompt.previewUrl);
+      }
+    };
+  }, [pendingImageGalleryPrompt]);
+
+  function closeImageGalleryPrompt() {
+    if (pendingImageGalleryPrompt?.previewUrl) {
+      URL.revokeObjectURL(pendingImageGalleryPrompt.previewUrl);
+    }
+    setPendingImageGalleryPrompt(null);
+  }
+
+  async function confirmImageGalleryUpload(scope: GalleryScope) {
+    if (!pendingImageGalleryPrompt) return;
+    const { file, peerId } = pendingImageGalleryPrompt;
+    closeImageGalleryPrompt();
+    setUploading(true);
+    try {
+      const uploaded = await uploadChatMedia(file, peerId, scope);
+      setPendingMedia({
+        id: uploaded.id,
+        url: uploaded.url,
+        kind: uploaded.kind,
+        name: uploaded.originalName || file.name,
+      });
+      toast.success(
+        scope === "secret"
+          ? "Ready to send · saved to Secret Gallery"
+          : "Ready to send · saved to Normal Gallery",
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not upload media.");
+    } finally {
+      setUploading(false);
+    }
+  }
+
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file || !activePeerId) return;
+
+    const validation = validateMediaFile({ size: file.size, type: file.type });
+    if (!validation.ok) {
+      toast.error(validation.error);
+      return;
+    }
+
+    if (validation.kind === "image") {
+      try {
+        const compressedFile = await compressImageFile(file);
+        const previewUrl = URL.createObjectURL(compressedFile);
+        setPendingImageGalleryPrompt({
+          file: compressedFile,
+          previewUrl,
+          peerId: activePeerId,
+          compressed: compressedFile !== file,
+        });
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Could not prepare photo.");
+      }
+      return;
+    }
+
     setUploading(true);
     try {
-      const uploaded = await uploadChatMedia(file, activePeerId);
+      const uploaded = await uploadChatMedia(file, activePeerId, "normal");
       setPendingMedia({
         id: uploaded.id,
         url: uploaded.url,
@@ -1112,7 +1195,7 @@ export function InstagramChatView({
                   }
                   setQuery(val);
                 }}
-                placeholder="Search readers by name or @username…"
+                placeholder="Search by name or @username"
                 className={cn(
                   "w-full rounded-full py-2.5 pl-11 pr-9 text-sm outline-none transition focus:ring-2 focus:ring-sky-400/40",
                   theme.isDark
@@ -1736,7 +1819,7 @@ export function InstagramChatView({
                   theme.glassSheet,
                 )}
               >
-                {visibleMessages.length > 0 && (
+                {threadSearchQuery.trim() && (
                   <div className="pointer-events-none absolute inset-x-0 -top-3.5 z-10 flex justify-center">
                     <span
                       className={cn(
@@ -1744,9 +1827,7 @@ export function InstagramChatView({
                         theme.glassPill,
                       )}
                     >
-                      {threadSearchQuery.trim()
-                        ? `${visibleMessages.length} ${visibleMessages.length === 1 ? "match" : "matches"}`
-                        : "Today"}
+                      {`${visibleMessages.length} ${visibleMessages.length === 1 ? "match" : "matches"}`}
                     </span>
                   </div>
                 )}
@@ -1777,11 +1858,28 @@ export function InstagramChatView({
                       </button>
                     </div>
                   )}
-                  {visibleMessages.map((m) => {
+                  {timelineEntries.map((entry) => {
+                    if (entry.type === "date") {
+                      return (
+                        <div key={entry.key} className="flex justify-center py-1.5">
+                          <span
+                            className={cn(
+                              "rounded-full border px-3.5 py-1 text-[11px] font-bold tracking-wide",
+                              theme.glassPill,
+                            )}
+                          >
+                            {entry.label}
+                          </span>
+                        </div>
+                      );
+                    }
+                    const m = entry.message;
                     const mine = m.from === me.id;
                     const isLastSeen = mine && m.id === lastSeenOutgoingId;
                     const isDeleted = Boolean(m.deletedAt);
                     const pickerOpen = reactionPickerForId === m.id;
+                    const isSending = mine && m.localStatus === "sending";
+                    const isFailed = mine && m.localStatus === "failed";
                     return (
                       <motion.div
                         id={`msg-${m.id}`}
@@ -1997,9 +2095,11 @@ export function InstagramChatView({
 
                             <div className="mt-1 flex items-center justify-end gap-1 text-[10px] opacity-80 tabular-nums">
                               {m.editedAt && !isDeleted && <span>(edited)</span>}
-                              <span>{formatTime(m.createdAt)}</span>
+                              <span>{isSending ? "Sending…" : formatTime(m.createdAt)}</span>
                               {mine &&
                                 !isDeleted &&
+                                !isSending &&
+                                !isFailed &&
                                 (m.seenAt ? (
                                   <CheckCheck className="size-3.5 text-sky-300" aria-label="Seen" />
                                 ) : m.deliveredAt ? (
@@ -2011,6 +2111,37 @@ export function InstagramChatView({
                                   <Check className="size-3.5 opacity-70" aria-label="Sent" />
                                 ))}
                             </div>
+
+                            {isFailed && (
+                              <div className="mt-2 flex flex-wrap items-center justify-end gap-1.5 border-t border-rose-300/30 pt-1.5 text-[11px]">
+                                <span className="inline-flex items-center gap-1 font-semibold text-rose-200">
+                                  <AlertCircle className="size-3.5" /> Failed to send
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (!activePeerId) return;
+                                    void retryChatMessage(activePeerId, m.id).catch((err) =>
+                                      toast.error(
+                                        err instanceof Error ? err.message : "Retry failed.",
+                                      ),
+                                    );
+                                  }}
+                                  className="inline-flex items-center gap-1 rounded-full bg-white/20 px-2.5 py-0.5 font-bold text-white hover:bg-white/30"
+                                >
+                                  <RefreshCw className="size-3" /> Retry
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    activePeerId && dismissFailedMessage(activePeerId, m.id)
+                                  }
+                                  className="rounded-full bg-black/25 px-2.5 py-0.5 font-semibold text-white/85 hover:bg-black/40"
+                                >
+                                  Discard
+                                </button>
+                              </div>
+                            )}
                           </div>
 
                           {/* Quick action buttons on right for incoming messages */}
@@ -2563,13 +2694,107 @@ export function InstagramChatView({
         onStartMessage={(userId) => void openThread(userId)}
       />
 
+      {/* Prompt user when sending a photo: 1. Secret Gallery vs 2. Normal Gallery */}
+      <AnimatePresence>
+        {pendingImageGalleryPrompt && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={closeImageGalleryPrompt}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md"
+          >
+            <motion.div
+              initial={{ scale: 0.94, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.94, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              aria-label="Choose gallery destination for photo"
+              className={cn(
+                "w-full max-w-sm space-y-4 rounded-[28px] border p-5 backdrop-blur-2xl",
+                theme.surfaceGlass,
+                theme.border,
+              )}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <h3 className="font-display text-base font-extrabold">Save photo to gallery</h3>
+                  <p className={cn("mt-0.5 text-xs", theme.mutedText)}>
+                    Choose where this photo is organized before sending.
+                    {pendingImageGalleryPrompt.compressed
+                      ? " Compressed for fast mobile delivery."
+                      : ""}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeImageGalleryPrompt}
+                  aria-label="Cancel photo upload"
+                  className={cn(
+                    "grid size-8 shrink-0 place-items-center rounded-full",
+                    theme.surfaceMuted,
+                  )}
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+
+              <div className="overflow-hidden rounded-2xl bg-black/15">
+                <img
+                  src={pendingImageGalleryPrompt.previewUrl}
+                  alt={pendingImageGalleryPrompt.file.name}
+                  className="max-h-52 w-full object-contain"
+                />
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={() => void confirmImageGalleryUpload("secret")}
+                  className={cn(
+                    "flex min-h-[46px] w-full items-center gap-2.5 rounded-2xl border px-4 text-left text-xs font-bold transition hover:scale-[1.01]",
+                    theme.glassRow,
+                  )}
+                >
+                  <Lock className="size-4 shrink-0 text-amber-500" />
+                  <span className="flex-1">
+                    <span className="block">1. Secret Gallery</span>
+                    <span className={cn("block text-[11px] font-normal", theme.mutedText)}>
+                      Saved under your Secret Gallery filter
+                    </span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void confirmImageGalleryUpload("normal")}
+                  className={cn(
+                    "flex min-h-[46px] w-full items-center gap-2.5 rounded-2xl px-4 text-left text-xs font-bold shadow-sm transition hover:scale-[1.01]",
+                    theme.accentBg,
+                  )}
+                >
+                  <Grid3X3 className="size-4 shrink-0" />
+                  <span className="flex-1">
+                    <span className="block">2. Normal Gallery</span>
+                    <span className="block text-[11px] font-normal opacity-85">
+                      Saved under your standard personal gallery
+                    </span>
+                  </span>
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <MediaLightbox media={lightbox} onClose={() => setLightbox(null)} />
       <MediaSaveOptionsDialog
         open={Boolean(saveOptions)}
         name={saveOptions?.name ?? "media"}
         saveable={saveOptions?.kind === "image" || saveOptions?.kind === "video"}
         onOpenChange={(open) => !open && setSaveOptions(null)}
-        onSaveToGallery={() => saveMediaToGallery(saveOptions?.url ?? "")}
+        onSaveToGallery={(scope) => saveMediaToGallery(saveOptions?.url ?? "", scope)}
         onDownloadToPhone={() =>
           downloadProtectedMedia(saveOptions?.url ?? "", saveOptions?.name ?? "media")
         }

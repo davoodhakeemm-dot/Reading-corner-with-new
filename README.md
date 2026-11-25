@@ -377,7 +377,6 @@ Buttons:
 
 Read Now
 
-
 Add to Library
 
 Favorite
@@ -835,16 +834,15 @@ Fix console errors
 Remove placeholder content where possible
 
 Optimize loading speed
-When we tap 3 times to logo what to open new login page 
-To creat a account with username and password 
-And what to show login button 
-If they click login what to open new space with 3 sape. 1 setting, 2chat space, 3special library to upload photos and vedios. 
-Add a feature they can login there account in any other phone using there username and password 
-In 2space when the click they can live caht to friends who all login thise website 
-They can message and send images and vedios and voice chat they can vedio call and voice call 
-In setting they can add DP 
+When we tap 3 times to logo what to open new login page
+To creat a account with username and password
+And what to show login button
+If they click login what to open new space with 3 sape. 1 setting, 2chat space, 3special library to upload photos and vedios.
+Add a feature they can login there account in any other phone using there username and password
+In 2space when the click they can live caht to friends who all login thise website
+They can message and send images and vedios and voice chat they can vedio call and voice call
+In setting they can add DP
 All users can view there Dp and username in that secrate page they can message to all useres
-
 
 The final result should feel like a professional, premium digital library and reading application, with a large collection of books organized beautifully by language and category.
 

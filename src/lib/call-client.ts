@@ -297,7 +297,7 @@ export function createCallClient(
           finish(
             s,
             "ended",
-            "Call could not connect. Check your network or configure a TURN relay server.",
+            "Call could not connect direct P2P (symmetric NAT or mobile firewall may block STUN). Configure a free/custom TURN relay via VITE_ICE_SERVERS_JSON or try Wi-Fi.",
           );
           return;
         }

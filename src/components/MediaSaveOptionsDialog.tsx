@@ -1,4 +1,4 @@
-import { FolderPlus, Smartphone } from "lucide-react";
+import { FolderPlus, Lock, Smartphone } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import type { GalleryScope } from "@/lib/social-logic";
 
 export function MediaSaveOptionsDialog({
   open,
@@ -23,7 +24,7 @@ export function MediaSaveOptionsDialog({
   name: string;
   saveable: boolean;
   onOpenChange: (open: boolean) => void;
-  onSaveToGallery: () => Promise<void>;
+  onSaveToGallery: (scope: GalleryScope) => Promise<void>;
   onDownloadToPhone: () => Promise<void>;
 }) {
   const [saving, setSaving] = useState(false);
@@ -50,15 +51,31 @@ export function MediaSaveOptionsDialog({
         </DialogHeader>
         <div className="flex flex-col gap-2">
           {saveable && (
-            <Button
-              type="button"
-              className="min-h-12 justify-start"
-              disabled={saving}
-              onClick={() => void runAction(onSaveToGallery, "Saved to your personal gallery")}
-            >
-              <FolderPlus data-icon="inline-start" />
-              Save to Personal Gallery
-            </Button>
+            <>
+              <Button
+                type="button"
+                variant="secondary"
+                className="min-h-12 justify-start"
+                disabled={saving}
+                onClick={() =>
+                  void runAction(() => onSaveToGallery("secret"), "Saved to your Secret Gallery")
+                }
+              >
+                <Lock data-icon="inline-start" />
+                1. Save to Secret Gallery
+              </Button>
+              <Button
+                type="button"
+                className="min-h-12 justify-start"
+                disabled={saving}
+                onClick={() =>
+                  void runAction(() => onSaveToGallery("normal"), "Saved to your Normal Gallery")
+                }
+              >
+                <FolderPlus data-icon="inline-start" />
+                2. Save to Normal Gallery
+              </Button>
+            </>
           )}
           <Button
             type="button"
@@ -71,8 +88,7 @@ export function MediaSaveOptionsDialog({
             Download to phone
           </Button>
           <p className="text-xs text-muted-foreground">
-            Downloads are saved by your browser. Choose a photo or video file to add it to your
-            personal gallery.
+            Saved items stay private to your account. Downloads save a local copy via your browser.
           </p>
         </div>
       </DialogContent>

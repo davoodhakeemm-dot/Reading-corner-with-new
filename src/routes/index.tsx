@@ -74,7 +74,7 @@ function Welcome() {
     return () => clearTimeout(t);
   }, []);
 
-  if (splash || !chatReady || !libraryReady || destination) return <Splash />;
+  if (splash) return <Splash />;
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-hero">

@@ -239,3 +239,115 @@ export function dedupeConversationsByPeerId<T extends { peer: { id: string } }>(
 export function dedupeMessagesById<T extends { id: string }>(messages: readonly T[]): T[] {
   return dedupeByKey(messages, (m) => m.id);
 }
+
+export type GalleryScope = "normal" | "secret";
+
+export function parseGalleryScope(raw: unknown): GalleryScope {
+  return raw === "secret" ? "secret" : "normal";
+}
+
+export const MAX_CHAT_MEDIA_BYTES = 25 * 1024 * 1024;
+
+export function validateMediaFile(input: {
+  size: number;
+  type: string;
+  maxBytes?: number;
+}): { ok: true; kind: "image" | "video" | "audio" } | { ok: false; error: string } {
+  const maxBytes = input.maxBytes ?? MAX_CHAT_MEDIA_BYTES;
+  const mime = String(input.type ?? "").toLowerCase();
+  const kind = mime.startsWith("video/")
+    ? "video"
+    : mime.startsWith("audio/")
+      ? "audio"
+      : mime.startsWith("image/")
+        ? "image"
+        : null;
+
+  if (!kind) {
+    return { ok: false, error: "Only image, video, and audio files are supported." };
+  }
+  if (!Number.isFinite(input.size) || input.size <= 0) {
+    return { ok: false, error: "Selected media file is empty." };
+  }
+  if (input.size > maxBytes) {
+    const maxMb = Math.round(maxBytes / (1024 * 1024));
+    return { ok: false, error: `File exceeds the ${maxMb} MB limit.` };
+  }
+  return { ok: true, kind };
+}
+
+export function getLocalDayKey(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "unknown";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+export function formatChatDateLabel(iso: string, now: Date = new Date()): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "Today";
+
+  const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const targetMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diffDays = Math.round((todayMidnight - targetMidnight) / 86_400_000);
+
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+
+  const sameYear = d.getFullYear() === now.getFullYear();
+  return d.toLocaleDateString("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    ...(sameYear ? {} : { year: "numeric" }),
+  });
+}
+
+export type ChatTimelineEntry<T> =
+  { type: "date"; key: string; label: string } | { type: "message"; message: T };
+
+export function groupMessagesWithDateSeparators<T extends { createdAt: string }>(
+  messages: readonly T[],
+  now: Date = new Date(),
+): ChatTimelineEntry<T>[] {
+  const entries: ChatTimelineEntry<T>[] = [];
+  let lastDayKey = "";
+  for (const message of messages) {
+    const dayKey = getLocalDayKey(message.createdAt);
+    if (dayKey !== lastDayKey) {
+      lastDayKey = dayKey;
+      entries.push({
+        type: "date",
+        key: `date_${dayKey}`,
+        label: formatChatDateLabel(message.createdAt, now),
+      });
+    }
+    entries.push({ type: "message", message });
+  }
+  return entries;
+}
+
+export function mergePaginatedMessages<T extends { id: string; createdAt: string }>(
+  older: readonly T[],
+  current: readonly T[],
+): T[] {
+  const merged = new Map<string, T>();
+  for (const item of older) {
+    if (item?.id) merged.set(item.id, item);
+  }
+  for (const item of current) {
+    if (item?.id) merged.set(item.id, item);
+  }
+  return Array.from(merged.values()).sort((a, b) => {
+    const cmp = a.createdAt.localeCompare(b.createdAt);
+    return cmp !== 0 ? cmp : a.id.localeCompare(b.id);
+  });
+}
+
+export function buildNotificationChatPath(peerId?: string | null): string {
+  const clean = typeof peerId === "string" ? peerId.trim() : "";
+  if (!clean) return "/messages";
+  return `/messages?peer=${encodeURIComponent(clean)}`;
+}

@@ -1,6 +1,7 @@
 # Security Specification & Hardened Rules Audit (Phase 0)
 
 ## 1. Data Invariants
+
 1. **PII Isolation**: `email` never appears in `users_public`. Only `users_private/{uid}` stores `email`, readable and writable exclusively by `request.auth.uid == uid`.
 2. **Identity Ownership**: Every `create` document (`users_public`, `users_private`, `handles`, `reading_state`, `follows`, `blocks`, `reports`, `messages`) must bind its owner/author field (`uid`, `followerId`, `blockerId`, `reporterId`, `senderId`) strictly to `request.auth.uid`.
 3. **Immutable Provenance**: `uid`, `createdAt`, `senderId`, `recipientId`, `threadKey`, `participantA`, `participantB` are immutable after document creation.
@@ -10,6 +11,7 @@
 7. **Block Enforcement**: Creating a message fails if either participant has a block record against the other.
 
 ## 2. The "Dirty Dozen" Attack Payloads (All Must Fail with PERMISSION_DENIED)
+
 1. **Unauthenticated Read/Write**: Read `users_public` or create `conversations/{t}` with `request.auth == null`.
 2. **PII Cross-Read**: Authenticated User A reads `users_private/{userB}` to steal User B's email.
 3. **Shadow Field Injection on Profile**: User A updates `users_public/{userA}` adding `{ "isAdmin": true }` or `{ "followerCount": 9999 }`.

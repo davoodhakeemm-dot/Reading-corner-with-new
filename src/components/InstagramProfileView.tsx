@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   ArrowLeft,
   Ban,
+  Bell,
+  BellOff,
   BookOpen,
   Camera,
   Check,
@@ -14,6 +16,7 @@ import {
   Grid3X3,
   KeyRound,
   Library,
+  Lock,
   LogOut,
   MessageCircle,
   Nfc,
@@ -45,6 +48,7 @@ import {
   deleteGalleryMedia,
   fetchGallery,
   fetchNfcLink,
+  getBearerHeaders,
   getFreshGoogleReauthToken,
   initialsOf,
   loadBlocks,
@@ -60,8 +64,18 @@ import {
   verifyMyPhoneOtp,
 } from "@/lib/chat-store";
 import { progressPercent, useLibrary } from "@/lib/library-store";
+import { compressImageFile } from "@/lib/media-compress";
+import {
+  fetchPushDiagnostics,
+  getNotificationPreferences,
+  registerDevicePushToken,
+  unregisterDevicePushToken,
+  updateNotificationPreferences,
+  type NotificationPreferences,
+  type PushRegistrationStatus,
+} from "@/lib/push-notifications";
 import { SECRET_THEMES, type SecretThemeId, type SecretThemeTokens } from "@/lib/secret-themes";
-import { dedupeUsersById } from "@/lib/social-logic";
+import { dedupeUsersById, parseGalleryScope, type GalleryScope } from "@/lib/social-logic";
 import { cn } from "@/lib/utils";
 import { playWaterSound } from "@/lib/water-sound";
 
@@ -97,8 +111,18 @@ export function InstagramProfileView({
     mine: boolean;
   } | null>(null);
   const [uploadingGallery, setUploadingGallery] = useState(false);
+  const [galleryFilter, setGalleryFilter] = useState<"all" | GalleryScope>("all");
+  const [uploadGalleryScope, setUploadGalleryScope] = useState<GalleryScope>("normal");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deletingMediaId, setDeletingMediaId] = useState<string | null>(null);
+  const [pushStatus, setPushStatus] = useState<PushRegistrationStatus | null>(null);
+  const [notifPrefs, setNotifPrefs] = useState<NotificationPreferences>({
+    pushEnabled: true,
+    messagePreview: true,
+    callAlerts: true,
+    quietHoursEnabled: false,
+  });
+  const [pushBusy, setPushBusy] = useState(false);
 
   const [currentPwd, setCurrentPwd] = useState("");
   const [newPwd, setNewPwd] = useState("");
@@ -133,7 +157,24 @@ export function InstagramProfileView({
 
   useEffect(() => {
     void Promise.all([fetchNfcLink(), fetchGallery(), loadBlocks()]);
+    let active = true;
+    void fetchPushDiagnostics().then((status) => {
+      if (active) setPushStatus(status);
+    });
+    void getBearerHeaders().then((headers) =>
+      getNotificationPreferences(headers).then((prefs) => {
+        if (active) setNotifPrefs(prefs);
+      }),
+    );
+    return () => {
+      active = false;
+    };
   }, []);
+
+  const filteredGallery = useMemo(() => {
+    if (galleryFilter === "all") return gallery;
+    return gallery.filter((item) => parseGalleryScope(item.galleryScope) === galleryFilter);
+  }, [gallery, galleryFilter]);
 
   const continueBook = useMemo(() => {
     const entries = Object.entries(libraryState.progress).sort((a, b) =>
@@ -179,7 +220,8 @@ export function InstagramProfileView({
     try {
       for (const file of validFiles) {
         try {
-          await uploadChatMedia(file);
+          const readyFile = file.type.startsWith("image/") ? await compressImageFile(file) : file;
+          await uploadChatMedia(readyFile, undefined, uploadGalleryScope);
           uploadedCount += 1;
         } catch (error) {
           failures.push(error instanceof Error ? error.message : `Could not upload ${file.name}.`);
@@ -187,10 +229,11 @@ export function InstagramProfileView({
       }
       if (uploadedCount > 0) await fetchGallery();
       if (failures.length === 0) {
+        const label = uploadGalleryScope === "secret" ? "Secret Gallery" : "Normal Gallery";
         toast.success(
           uploadedCount === 1
-            ? "Added to your personal gallery"
-            : `Added ${uploadedCount} items to your personal gallery`,
+            ? `Added to your ${label}`
+            : `Added ${uploadedCount} items to your ${label}`,
         );
       } else if (uploadedCount > 0) {
         toast.warning(`${uploadedCount} item(s) added. ${failures.length} could not be uploaded.`);
@@ -731,11 +774,59 @@ export function InstagramProfileView({
               />
             </div>
 
-            {gallery.length > 0 ? (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="inline-flex rounded-full border p-1">
+                {(
+                  [
+                    { id: "all", label: `All (${gallery.length})` },
+                    {
+                      id: "normal",
+                      label: `Normal (${gallery.filter((i) => parseGalleryScope(i.galleryScope) === "normal").length})`,
+                    },
+                    {
+                      id: "secret",
+                      label: `Secret (${gallery.filter((i) => parseGalleryScope(i.galleryScope) === "secret").length})`,
+                    },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setGalleryFilter(opt.id)}
+                    className={cn(
+                      "rounded-full px-3 py-1 text-[11px] font-bold transition",
+                      galleryFilter === opt.id ? theme.accentBg : theme.mutedText,
+                    )}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-1.5 text-[11px]">
+                <span className={cn("font-semibold", theme.mutedText)}>Upload to:</span>
+                {(["normal", "secret"] as const).map((sc) => (
+                  <button
+                    key={sc}
+                    type="button"
+                    onClick={() => setUploadGalleryScope(sc)}
+                    className={cn(
+                      "inline-flex items-center gap-1 rounded-full border px-2.5 py-1 font-bold",
+                      uploadGalleryScope === sc ? theme.accentBg : theme.surfaceMuted,
+                    )}
+                  >
+                    {sc === "secret" && <Lock className="size-3" />}
+                    {sc === "secret" ? "Secret" : "Normal"}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {filteredGallery.length > 0 ? (
               <div className="mt-4 grid grid-cols-3 gap-1.5 sm:gap-2.5">
-                {gallery.map((item) => {
+                {filteredGallery.map((item) => {
                   const confirming = confirmDeleteId === item.id;
                   const deleting = deletingMediaId === item.id;
+                  const isSecret = parseGalleryScope(item.galleryScope) === "secret";
                   return (
                     <div
                       key={item.id}
@@ -771,6 +862,15 @@ export function InstagramProfileView({
                           </>
                         )}
                       </button>
+
+                      {isSecret && (
+                        <span
+                          title="Secret Gallery"
+                          className="pointer-events-none absolute bottom-1.5 left-1.5 z-10 inline-flex items-center gap-1 rounded-full bg-black/75 px-2 py-0.5 text-[10px] font-bold text-amber-300 backdrop-blur-sm"
+                        >
+                          <Lock className="size-2.5" /> Secret
+                        </span>
+                      )}
 
                       {item.mine && !confirming && (
                         <button
@@ -1030,10 +1130,10 @@ export function InstagramProfileView({
               )}
             </div>
 
-            {/* Notification Sound */}
+            {/* Notification Sound & Push Notifications */}
             <div
               className={cn(
-                "rounded-3xl border p-5 backdrop-blur-xl",
+                "space-y-4 rounded-3xl border p-5 backdrop-blur-xl",
                 theme.surfaceGlass,
                 theme.border,
                 theme.cardShadow,
@@ -1067,6 +1167,114 @@ export function InstagramProfileView({
                   />
                 </span>
               </button>
+
+              <div className={cn("space-y-3 border-t pt-4", theme.border)}>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-bold">Push Notifications (Firebase FCM)</p>
+                    <p className={cn("text-xs", theme.mutedText)}>
+                      {pushStatus?.activeToken
+                        ? `Registered on this device (${pushStatus.registeredDevices} device(s)). Tapping a notification opens that chat directly.`
+                        : "Get notified for incoming chats & calls. Tapping opens the specific chat thread."}
+                    </p>
+                  </div>
+                  {pushStatus?.activeToken ? (
+                    <button
+                      type="button"
+                      disabled={pushBusy}
+                      onClick={async () => {
+                        setPushBusy(true);
+                        try {
+                          const headers = await getBearerHeaders();
+                          await unregisterDevicePushToken(headers);
+                          setPushStatus(await fetchPushDiagnostics());
+                          toast.success("Device push registration removed");
+                        } finally {
+                          setPushBusy(false);
+                        }
+                      }}
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold",
+                        theme.surfaceMuted,
+                      )}
+                    >
+                      <BellOff className="size-3.5" /> Disable
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={pushBusy}
+                      onClick={async () => {
+                        setPushBusy(true);
+                        try {
+                          const headers = await getBearerHeaders();
+                          const res = await registerDevicePushToken(headers);
+                          setPushStatus(await fetchPushDiagnostics());
+                          if (res.ok) {
+                            toast.success("Push notifications enabled for this device");
+                          } else {
+                            toast.info(res.reason || "Push registration unavailable here.");
+                          }
+                        } finally {
+                          setPushBusy(false);
+                        }
+                      }}
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold",
+                        theme.accentBg,
+                      )}
+                    >
+                      <Bell className="size-3.5" /> {pushBusy ? "Enabling…" : "Enable Push"}
+                    </button>
+                  )}
+                </div>
+
+                {pushStatus?.limitationNote && (
+                  <p
+                    className={cn(
+                      "rounded-xl px-3 py-2 text-xs",
+                      theme.surfaceMuted,
+                      theme.mutedText,
+                    )}
+                  >
+                    {pushStatus.limitationNote}
+                  </p>
+                )}
+
+                <div className="space-y-2 text-xs">
+                  {(
+                    [
+                      { key: "pushEnabled", label: "Allow push alerts for new messages" },
+                      { key: "messagePreview", label: "Show sender name & message preview" },
+                      { key: "callAlerts", label: "Notify on incoming audio/video calls" },
+                      { key: "quietHoursEnabled", label: "Quiet hours (silence push alerts)" },
+                    ] as const
+                  ).map(({ key, label }) => (
+                    <label
+                      key={key}
+                      className="flex cursor-pointer items-center justify-between gap-2 py-1"
+                    >
+                      <span className="font-semibold">{label}</span>
+                      <input
+                        type="checkbox"
+                        checked={notifPrefs[key]}
+                        onChange={async (e) => {
+                          const patch = { [key]: e.target.checked };
+                          setNotifPrefs((prev) => ({ ...prev, ...patch }));
+                          const headers = await getBearerHeaders();
+                          const updated = await updateNotificationPreferences(patch, headers);
+                          if (updated) {
+                            setNotifPrefs(updated);
+                          } else {
+                            toast.error("Could not update notification preferences.");
+                          }
+                        }}
+                        className="size-4 accent-sky-500"
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
             </div>
 
             {/* Personal Link + QR & Linked Accounts visible inside Settings */}

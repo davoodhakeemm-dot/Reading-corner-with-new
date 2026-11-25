@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 
 import {
   LocalCallPreview,
@@ -51,6 +52,11 @@ export function GlobalCallAndAlertLayer() {
   const [seconds, setSeconds] = useState(0);
   const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
   const [switchingCamera, setSwitchingCamera] = useState(false);
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
 
   const isOnChatSurface = pathname.startsWith("/messages") || pathname.startsWith("/chat");
   const theme = getSecretTheme(me?.theme);
@@ -126,8 +132,9 @@ export function GlobalCallAndAlertLayer() {
       tag: `${payload.tag}-${incomingCall.callId}`,
       requireInteraction: true,
       onClick: () => {
+        void openThread(incomingCall.from.id);
         if (!isOnChatSurface) {
-          void navigate({ to: "/messages" });
+          void navigate({ to: "/messages", search: { peer: incomingCall.from.id } });
         }
       },
     });
@@ -199,7 +206,7 @@ export function GlobalCallAndAlertLayer() {
     !incomingCall,
   );
 
-  return (
+  const overlayContent = (
     <>
       {/* Incoming Message Notification Banner with Receive Action */}
       <AnimatePresence>
@@ -287,7 +294,7 @@ export function GlobalCallAndAlertLayer() {
             role="dialog"
             aria-modal="true"
             aria-label={incomingCall ? "Incoming call" : "Active call"}
-            className="fixed inset-0 z-[80] flex flex-col justify-between overflow-hidden bg-zinc-950 p-5 text-white md:p-10"
+            className="fixed inset-0 z-[120] flex h-[100dvh] w-[100dvw] flex-col justify-between overflow-hidden overscroll-none bg-zinc-950 p-5 text-white touch-manipulation md:p-10"
           >
             {/* Dedicated Remote Audio Element for BOTH audio & video calls */}
             {outgoingCall && (
@@ -533,4 +540,10 @@ export function GlobalCallAndAlertLayer() {
       </AnimatePresence>
     </>
   );
+
+  if (!mounted || typeof document === "undefined") {
+    return null;
+  }
+
+  return createPortal(overlayContent, document.body);
 }

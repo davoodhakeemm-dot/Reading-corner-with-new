@@ -267,3 +267,72 @@ test("dedupe helpers remove duplicate IDs and excluded IDs while preserving orde
     [{ k: "a" }, { k: "b" }],
   );
 });
+
+test("formatChatDateLabel and groupMessagesWithDateSeparators group messages per day", async () => {
+  const { formatChatDateLabel, groupMessagesWithDateSeparators } = await import("./social-logic");
+  const now = new Date(2026, 10, 25, 14, 0, 0);
+  const todayIso = new Date(2026, 10, 25, 9, 30, 0).toISOString();
+  const yesterdayIso = new Date(2026, 10, 24, 18, 15, 0).toISOString();
+  const olderIso = new Date(2026, 10, 20, 12, 0, 0).toISOString();
+  const prevYearIso = new Date(2025, 5, 10, 12, 0, 0).toISOString();
+
+  assert.equal(formatChatDateLabel(todayIso, now), "Today");
+  assert.equal(formatChatDateLabel(yesterdayIso, now), "Yesterday");
+  assert.ok(formatChatDateLabel(olderIso, now).includes("Nov"));
+  assert.ok(formatChatDateLabel(prevYearIso, now).includes("2025"));
+
+  const timeline = groupMessagesWithDateSeparators(
+    [
+      { id: "m1", createdAt: yesterdayIso },
+      { id: "m2", createdAt: todayIso },
+      { id: "m3", createdAt: todayIso },
+    ],
+    now,
+  );
+  assert.deepEqual(
+    timeline.map((e) => (e.type === "date" ? e.label : e.message.id)),
+    ["Yesterday", "m1", "Today", "m2", "m3"],
+  );
+});
+
+test("mergePaginatedMessages deduplicates and sorts chronologically ascending", async () => {
+  const { mergePaginatedMessages } = await import("./social-logic");
+  const merged = mergePaginatedMessages(
+    [
+      { id: "m1", createdAt: "2026-11-25T10:00:00.000Z" },
+      { id: "m2", createdAt: "2026-11-25T10:01:00.000Z" },
+    ],
+    [
+      { id: "m2", createdAt: "2026-11-25T10:01:00.000Z" },
+      { id: "m3", createdAt: "2026-11-25T10:02:00.000Z" },
+    ],
+  );
+  assert.deepEqual(
+    merged.map((m) => m.id),
+    ["m1", "m2", "m3"],
+  );
+});
+
+test("parseGalleryScope, validateMediaFile, and buildNotificationChatPath enforce safe defaults", async () => {
+  const { parseGalleryScope, validateMediaFile, buildNotificationChatPath } =
+    await import("./social-logic");
+
+  assert.equal(parseGalleryScope("secret"), "secret");
+  assert.equal(parseGalleryScope("normal"), "normal");
+  assert.equal(parseGalleryScope("unexpected"), "normal");
+
+  assert.deepEqual(validateMediaFile({ size: 1024, type: "image/jpeg" }), {
+    ok: true,
+    kind: "image",
+  });
+  assert.deepEqual(validateMediaFile({ size: 1024, type: "video/mp4" }), {
+    ok: true,
+    kind: "video",
+  });
+  assert.equal(validateMediaFile({ size: 30 * 1024 * 1024, type: "video/mp4" }).ok, false);
+  assert.equal(validateMediaFile({ size: 100, type: "application/pdf" }).ok, false);
+
+  assert.equal(buildNotificationChatPath("u_abc 1"), "/messages?peer=u_abc%201");
+  assert.equal(buildNotificationChatPath(""), "/messages");
+  assert.equal(buildNotificationChatPath(null), "/messages");
+});

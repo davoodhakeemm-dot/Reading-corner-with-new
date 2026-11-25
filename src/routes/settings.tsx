@@ -1,7 +1,16 @@
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
 import { InstallApp } from "@/components/InstallApp";
-import { AlertTriangle, Eye, EyeOff, KeyRound, RotateCcw, ShieldCheck } from "lucide-react";
-import { useState } from "react";
+import {
+  AlertTriangle,
+  Bell,
+  BellOff,
+  Eye,
+  EyeOff,
+  KeyRound,
+  RotateCcw,
+  ShieldCheck,
+} from "lucide-react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { AppShell, PageHeader } from "@/components/AppShell";
@@ -11,12 +20,22 @@ import { DevicePermissionsCard } from "@/components/StartupPermissionsPrompt";
 import {
   changePassword,
   deleteAccount,
+  getBearerHeaders,
   getFreshGoogleReauthToken,
   logout,
   sendPasswordReset,
   useChat,
 } from "@/lib/chat-store";
 import { useLibrary } from "@/lib/library-store";
+import {
+  fetchPushDiagnostics,
+  getNotificationPreferences,
+  registerDevicePushToken,
+  unregisterDevicePushToken,
+  updateNotificationPreferences,
+  type NotificationPreferences,
+  type PushRegistrationStatus,
+} from "@/lib/push-notifications";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/settings")({
@@ -55,6 +74,73 @@ function SettingsPage() {
   const [newPw, setNewPw] = useState("");
   const [pwGoogleToken, setPwGoogleToken] = useState<string | null>(null);
   const [pwBusy, setPwBusy] = useState(false);
+
+  const [pushStatus, setPushStatus] = useState<PushRegistrationStatus | null>(null);
+  const [notifPrefs, setNotifPrefs] = useState<NotificationPreferences>({
+    pushEnabled: true,
+    messagePreview: true,
+    callAlerts: true,
+    quietHoursEnabled: false,
+  });
+  const [pushBusy, setPushBusy] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void fetchPushDiagnostics().then((status) => {
+      if (active) setPushStatus(status);
+    });
+    if (me) {
+      void getBearerHeaders().then((headers) =>
+        getNotificationPreferences(headers).then((prefs) => {
+          if (active) setNotifPrefs(prefs);
+        }),
+      );
+    }
+    return () => {
+      active = false;
+    };
+  }, [me]);
+
+  async function handleEnableDevicePush() {
+    setPushBusy(true);
+    try {
+      const headers = await getBearerHeaders();
+      const res = await registerDevicePushToken(headers);
+      const next = await fetchPushDiagnostics();
+      setPushStatus(next);
+      if (res.ok) {
+        toast.success("Push notifications enabled for this device");
+      } else {
+        toast.info(res.reason || "Could not enable background push on this device.");
+      }
+    } finally {
+      setPushBusy(false);
+    }
+  }
+
+  async function handleDisableDevicePush() {
+    setPushBusy(true);
+    try {
+      const headers = await getBearerHeaders();
+      await unregisterDevicePushToken(headers);
+      setPushStatus(await fetchPushDiagnostics());
+      toast.success("Device push registration removed");
+    } finally {
+      setPushBusy(false);
+    }
+  }
+
+  async function handleUpdateNotifPref(patch: Partial<NotificationPreferences>) {
+    const optimistic = { ...notifPrefs, ...patch };
+    setNotifPrefs(optimistic);
+    const headers = await getBearerHeaders();
+    const saved = await updateNotificationPreferences(patch, headers);
+    if (saved) {
+      setNotifPrefs(saved);
+    } else {
+      toast.error("Could not update notification preferences.");
+    }
+  }
 
   function closeDeleteModal() {
     setShowDeleteModal(false);
@@ -250,6 +336,67 @@ function SettingsPage() {
         </Card>
 
         <Card title="Notifications">
+          {me && (
+            <div className="space-y-3 border-b border-border/50 pb-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold">Chat &amp; Call Push Notifications</p>
+                  <p className="text-xs text-muted-foreground">
+                    {pushStatus?.activeToken
+                      ? `Registered on this device (${pushStatus.registeredDevices} device(s) total).`
+                      : "Receive alerts for new messages and incoming calls."}
+                  </p>
+                </div>
+                {pushStatus?.activeToken ? (
+                  <button
+                    type="button"
+                    disabled={pushBusy}
+                    onClick={() => void handleDisableDevicePush()}
+                    className="press inline-flex items-center gap-1.5 rounded-full bg-secondary px-3.5 py-1.5 text-xs font-bold text-secondary-foreground disabled:opacity-50"
+                  >
+                    <BellOff className="size-3.5" /> Disable Push
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={pushBusy}
+                    onClick={() => void handleEnableDevicePush()}
+                    className="press inline-flex items-center gap-1.5 rounded-full bg-brand px-3.5 py-1.5 text-xs font-bold text-primary-foreground disabled:opacity-50"
+                  >
+                    <Bell className="size-3.5" /> {pushBusy ? "Enabling…" : "Enable Push"}
+                  </button>
+                )}
+              </div>
+
+              {pushStatus?.limitationNote && (
+                <p className="rounded-xl bg-secondary/70 px-3 py-2 text-xs text-muted-foreground">
+                  {pushStatus.limitationNote}
+                </p>
+              )}
+
+              <Toggle
+                label="Allow push notifications for messages"
+                checked={notifPrefs.pushEnabled}
+                onChange={(v) => void handleUpdateNotifPref({ pushEnabled: v })}
+              />
+              <Toggle
+                label="Show sender and message preview"
+                checked={notifPrefs.messagePreview}
+                onChange={(v) => void handleUpdateNotifPref({ messagePreview: v })}
+              />
+              <Toggle
+                label="Incoming call notifications"
+                checked={notifPrefs.callAlerts}
+                onChange={(v) => void handleUpdateNotifPref({ callAlerts: v })}
+              />
+              <Toggle
+                label="Quiet hours (silence push banners)"
+                checked={notifPrefs.quietHoursEnabled}
+                onChange={(v) => void handleUpdateNotifPref({ quietHoursEnabled: v })}
+              />
+            </div>
+          )}
+
           <Toggle
             label="Daily reading reminder"
             checked={state.notifications.reminders}

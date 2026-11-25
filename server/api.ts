@@ -1,9 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
-import { getApp, getApps, initializeApp } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
 import multer from "multer";
 
 import {
@@ -42,7 +38,12 @@ import {
   type DbUser,
   type SecretTheme,
 } from "./db";
-import { broadcastEvent, isUserConnected, sendToUser } from "./ws";
+import {
+  getFirebaseAdminAuth,
+  getFirebaseAdminMessaging,
+  isFcmServerPushConfigured,
+} from "./firebase-admin";
+import { broadcastEvent, isUserConnected, isUserViewingThread, sendToUser } from "./ws";
 
 type AuthedRequest = Request & { authUser?: DbUser; authToken?: string; firebaseUid?: string };
 
@@ -71,19 +72,6 @@ function getClientIp(req: Request): string {
   return req.ip || req.socket?.remoteAddress || "unknown";
 }
 
-let cachedProjectId: string | null = null;
-function getFirebaseAdminAuth() {
-  if (!cachedProjectId) {
-    const cfgPath = path.resolve(process.cwd(), "firebase-applet-config.json");
-    const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")) as { projectId?: string };
-    cachedProjectId = cfg.projectId || process.env["GOOGLE_CLOUD_PROJECT"] || "";
-  }
-  const app = getApps().length
-    ? getApp()
-    : initializeApp(cachedProjectId ? { projectId: cachedProjectId } : undefined);
-  return getAuth(app);
-}
-
 function extractCookieValue(req: Request, name: string): string | null {
   const cookieHeader = req.headers.cookie;
   if (!cookieHeader) return null;
@@ -97,14 +85,28 @@ function extractCookieValue(req: Request, name: string): string | null {
   return null;
 }
 
-async function resolveFirebaseUid(req: Request): Promise<string | null> {
+async function verifyFirebaseRequest(req: Request): Promise<{
+  uid: string;
+  email: string | null;
+  emailVerified: boolean;
+  name: string | null;
+  picture: string | null;
+} | null> {
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ")) {
     const token = auth.slice(7).trim();
     if (token && !token.startsWith("rc_sess_")) {
       try {
         const decoded = await getFirebaseAdminAuth().verifyIdToken(token);
-        if (decoded?.uid) return decoded.uid;
+        if (decoded?.uid) {
+          return {
+            uid: decoded.uid,
+            email: decoded.email ? normalizeEmail(decoded.email) : null,
+            emailVerified: Boolean(decoded.email_verified),
+            name: typeof decoded["name"] === "string" ? decoded["name"] : null,
+            picture: typeof decoded.picture === "string" ? decoded.picture : null,
+          };
+        }
       } catch {
         /* invalid Firebase ID token */
       }
@@ -113,9 +115,22 @@ async function resolveFirebaseUid(req: Request): Promise<string | null> {
   const fbCookie = extractCookieValue(req, "rc_fb_session");
   if (fbCookie) {
     const verified = verifyCookieToken(fbCookie);
-    if (verified?.uid) return verified.uid;
+    if (verified?.uid) {
+      return {
+        uid: verified.uid,
+        email: null,
+        emailVerified: false,
+        name: null,
+        picture: null,
+      };
+    }
   }
   return null;
+}
+
+async function resolveFirebaseUid(req: Request): Promise<string | null> {
+  const verified = await verifyFirebaseRequest(req);
+  return verified?.uid ?? null;
 }
 
 type DbMessageRow = {
@@ -225,35 +240,90 @@ function extractToken(req: Request): string | null {
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ")) {
     const val = auth.slice(7).trim();
-    if (val) return val;
+    if (val && val.startsWith("rc_sess_")) return val;
   }
-  const cookieHeader = req.headers.cookie;
-  if (cookieHeader) {
-    for (const part of cookieHeader.split(";")) {
-      const [k, ...rest] = part.trim().split("=");
-      if (k === "rc_session") {
-        const val = decodeURIComponent(rest.join("=")).trim();
-        if (val) return val;
-      }
-    }
-  }
+  const cookieToken = extractCookieValue(req, "rc_session");
+  if (cookieToken) return cookieToken;
   return null;
+}
+
+async function ensureUserForVerifiedFirebase(fb: {
+  uid: string;
+  email: string | null;
+  emailVerified: boolean;
+  name: string | null;
+  picture: string | null;
+}): Promise<DbUser | null> {
+  const fbUserId = `fb_${fb.uid}`;
+  let user = (await db
+    .prepare("SELECT * FROM users WHERE id = ? OR id = ? LIMIT 1")
+    .get(fbUserId, fb.uid)) as DbUser | undefined;
+
+  if (!user && fb.email && fb.emailVerified) {
+    user = (await db
+      .prepare("SELECT * FROM users WHERE email_verified = 1 AND LOWER(email) = LOWER(?) LIMIT 1")
+      .get(fb.email)) as DbUser | undefined;
+  }
+  if (user) return user;
+  if (!fb.email && !fb.name) return null;
+
+  const rawName = String(fb.name || (fb.email ? fb.email.split("@")[0] : "") || "Reader")
+    .trim()
+    .slice(0, 60);
+  const fullName = rawName.length >= 2 ? rawName : `${rawName} Reader`.slice(0, 60);
+  const finalHandle = await makeUniqueHandle(fullName);
+  const now = new Date().toISOString();
+  const role = fb.emailVerified && fb.email && getAdminEmailSet().has(fb.email) ? "admin" : "user";
+  const externalAvatar =
+    fb.picture && fb.picture.startsWith("https://") ? fb.picture.slice(0, 1024) : null;
+
+  await db
+    .prepare(
+      `INSERT INTO users (id, email, email_verified, phone_e164, phone_verified, role, full_name, display_handle, bio, avatar_media_id, avatar_external_url, password_hash, theme, created_at, last_active_at)
+       VALUES (?, ?, ?, NULL, 0, ?, ?, ?, '', NULL, ?, ?, 'instagram', ?, ?)
+       ON CONFLICT DO NOTHING`,
+    )
+    .run(
+      fbUserId,
+      fb.email,
+      fb.emailVerified ? 1 : 0,
+      role,
+      fullName,
+      finalHandle,
+      externalAvatar,
+      hashPassword(crypto.randomBytes(24).toString("hex")),
+      now,
+      now,
+    );
+  await createNfcTokenForUser(fbUserId);
+  user = (await db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(fbUserId)) as
+    DbUser | undefined;
+  return user ?? null;
 }
 
 async function lookupSessionUser(req: Request): Promise<{ user: DbUser; token: string } | null> {
   const token = extractToken(req);
-  if (!token) return null;
-  const now = new Date().toISOString();
-  const row = (await db
-    .prepare(
-      `SELECT u.* FROM sessions s
-       JOIN users u ON u.id = s.user_id
-       WHERE s.token_hash = ? AND s.expires_at > ?
-       LIMIT 1`,
-    )
-    .get(sha256(token), now)) as DbUser | undefined;
-  if (!row) return null;
-  return { user: row, token };
+  if (token) {
+    const now = new Date().toISOString();
+    const row = (await db
+      .prepare(
+        `SELECT u.* FROM sessions s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.token_hash = ? AND s.expires_at > ?
+         LIMIT 1`,
+      )
+      .get(sha256(token), now)) as DbUser | undefined;
+    if (row) return { user: row, token };
+  }
+
+  const fb = await verifyFirebaseRequest(req);
+  if (fb) {
+    const user = await ensureUserForVerifiedFirebase(fb);
+    if (user) {
+      return { user, token: "" };
+    }
+  }
+  return null;
 }
 
 async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
@@ -1539,14 +1609,16 @@ export function createApiRouter() {
   router.get("/auth/session", async (req, res) => {
     const resolved = await lookupSessionUser(req);
     if (!resolved) {
-      res.json({ authenticated: false, user: null });
+      res.json({ authenticated: false, user: null, token: null });
       return;
     }
     const { user } = resolved;
     const now = new Date().toISOString();
     await db.prepare("UPDATE users SET last_active_at = ? WHERE id = ?").run(now, user.id);
+    const activeToken = resolved.token || (await issueSession(user.id, req, res));
     res.json({
       authenticated: true,
+      token: activeToken,
       user: await toSelfUser({ ...user, last_active_at: now }),
     });
   });
@@ -2759,6 +2831,9 @@ export function createApiRouter() {
       .trim()
       .toLowerCase();
     let rows: DbMessageRow[];
+    let hasMore = false;
+    let nextCursor: { before: string; beforeId: string } | null = null;
+
     if (q) {
       rows = (await db
         .prepare(
@@ -2766,9 +2841,49 @@ export function createApiRouter() {
         )
         .all(key, `%${q}%`)) as DbMessageRow[];
     } else {
-      rows = (await db
-        .prepare("SELECT * FROM messages WHERE thread_key = ? ORDER BY created_at ASC LIMIT 300")
-        .all(key)) as DbMessageRow[];
+      const rawLimit = Number(req.query["limit"]);
+      const limit = Number.isFinite(rawLimit)
+        ? Math.min(100, Math.max(1, Math.floor(rawLimit)))
+        : 40;
+      const before = typeof req.query["before"] === "string" ? req.query["before"].trim() : "";
+      const beforeId =
+        typeof req.query["beforeId"] === "string" ? req.query["beforeId"].trim() : "";
+
+      let descRows: DbMessageRow[];
+      if (before && !Number.isNaN(Date.parse(before))) {
+        if (beforeId) {
+          descRows = (await db
+            .prepare(
+              `SELECT * FROM messages
+               WHERE thread_key = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+               ORDER BY created_at DESC, id DESC
+               LIMIT ?`,
+            )
+            .all(key, before, before, beforeId, limit + 1)) as DbMessageRow[];
+        } else {
+          descRows = (await db
+            .prepare(
+              `SELECT * FROM messages
+               WHERE thread_key = ? AND created_at < ?
+               ORDER BY created_at DESC, id DESC
+               LIMIT ?`,
+            )
+            .all(key, before, limit + 1)) as DbMessageRow[];
+        }
+      } else {
+        descRows = (await db
+          .prepare(
+            "SELECT * FROM messages WHERE thread_key = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+          )
+          .all(key, limit + 1)) as DbMessageRow[];
+      }
+
+      hasMore = descRows.length > limit;
+      const pageDesc = hasMore ? descRows.slice(0, limit) : descRows;
+      rows = [...pageDesc].reverse();
+      if (hasMore && rows[0]) {
+        nextCursor = { before: rows[0].created_at, beforeId: rows[0].id };
+      }
     }
 
     const settings = (await db
@@ -2784,6 +2899,8 @@ export function createApiRouter() {
       blockedMe: await didUserBlock(peer.id, me.id),
       pinned: settings?.pinned === 1,
       muted: settings?.muted === 1,
+      hasMore,
+      nextCursor,
       messages: await Promise.all(uniqueMessageRows.map((r) => serializeMessage(r, me.id))),
     });
   });
@@ -2915,6 +3032,78 @@ export function createApiRouter() {
 
     sendToUser(peer.id, "message:new", payloadForPeer);
     sendToUser(me.id, "message:new", payloadForMe);
+
+    // Best-effort Firebase Cloud Messaging dispatch (never blocks message delivery or exposes tokens)
+    void (async () => {
+      try {
+        const messaging = getFirebaseAdminMessaging();
+        if (!messaging) return;
+        if (isUserViewingThread(peer.id, me.id)) return;
+
+        const convSetting = (await db
+          .prepare(
+            "SELECT muted FROM conversation_settings WHERE user_id = ? AND peer_id = ? LIMIT 1",
+          )
+          .get(peer.id, me.id)) as { muted: number } | undefined;
+        if (convSetting?.muted === 1) return;
+
+        const prefs = (await db
+          .prepare(
+            "SELECT push_enabled, message_preview, quiet_hours_enabled FROM notification_preferences WHERE user_id = ? LIMIT 1",
+          )
+          .get(peer.id)) as
+          | { push_enabled: number; message_preview: number; quiet_hours_enabled: number }
+          | undefined;
+        if (prefs && (prefs.push_enabled === 0 || prefs.quiet_hours_enabled === 1)) return;
+
+        const tokenRows = (await db
+          .prepare("SELECT token FROM notification_tokens WHERE user_id = ?")
+          .all(peer.id)) as { token: string }[];
+        const tokens = tokenRows.map((r) => r.token).filter(Boolean);
+        if (tokens.length === 0) return;
+
+        const allowPreview = prefs ? prefs.message_preview === 1 : true;
+        const bodyPreview = allowPreview ? displayText.slice(0, 140) : "New message";
+        const targetPath = `/messages?peer=${encodeURIComponent(me.id)}`;
+        const result = await messaging.sendEachForMulticast({
+          tokens,
+          notification: {
+            title: me.full_name,
+            body: bodyPreview,
+          },
+          data: {
+            peerId: me.id,
+            messageId: saved.id,
+            senderName: me.full_name,
+            preview: bodyPreview,
+            path: targetPath,
+          },
+          webpush: {
+            fcmOptions: {
+              link: targetPath,
+            },
+          },
+        });
+
+        for (let idx = 0; idx < result.responses.length; idx++) {
+          const r = result.responses[idx];
+          const errCode = r?.error?.code;
+          if (
+            errCode === "messaging/registration-token-not-registered" ||
+            errCode === "messaging/invalid-registration-token"
+          ) {
+            const badToken = tokens[idx];
+            if (badToken) {
+              await db
+                .prepare("DELETE FROM notification_tokens WHERE user_id = ? AND token = ?")
+                .run(peer.id, badToken);
+            }
+          }
+        }
+      } catch {
+        /* ignore optional push errors */
+      }
+    })();
 
     res.status(201).json(payloadForMe);
   });
@@ -3084,10 +3273,10 @@ export function createApiRouter() {
     res.json({ ok: true, updated: result.changes, seenAt });
   });
 
-  // Issue a signed storage upload so large media bypasses Vercel's request-body limit.
+  // Issue a signed storage upload so large media bypasses request-body limits.
   router.post("/media/upload-ticket", async (req: AuthedRequest, res) => {
     const fbUid = await resolveFirebaseUid(req);
-    const resolved = fbUid ? null : await lookupSessionUser(req);
+    const resolved = await lookupSessionUser(req);
     if (!fbUid && !resolved) {
       res.status(401).json({ error: "Authentication required." });
       return;
@@ -3096,6 +3285,7 @@ export function createApiRouter() {
     const kind = String(req.body?.kind ?? "");
     const mimeType = String(req.body?.mimeType ?? "");
     const sizeBytes = Number(req.body?.sizeBytes);
+    const galleryScope = req.body?.galleryScope === "secret" ? "secret" : "normal";
     const recipientId =
       typeof req.body?.recipientId === "string" ? req.body.recipientId.trim() : null;
     if (
@@ -3115,8 +3305,9 @@ export function createApiRouter() {
       return;
     }
 
-    const id = `${fbUid ? "fbm" : "med"}_${crypto.randomUUID()}`;
-    const ownerKey = fbUid ? `firebase/${fbUid}` : `users/${resolved!.user.id}`;
+    const useFbPrefix = Boolean(fbUid && !resolved);
+    const id = `${useFbPrefix ? "fbm" : "med"}_${crypto.randomUUID()}`;
+    const ownerKey = useFbPrefix ? `firebase/${fbUid}` : `users/${resolved!.user.id}`;
     const storageKey = `${ownerKey}/${id}`;
     const uploadToken = await createSignedMediaUpload(storageKey);
     res.json({
@@ -3124,6 +3315,7 @@ export function createApiRouter() {
       kind,
       mimeType,
       sizeBytes,
+      galleryScope,
       originalName: String(req.body?.originalName ?? "media")
         .replace(/[\\r\\n]/g, "_")
         .slice(0, 255),
@@ -3147,7 +3339,7 @@ export function createApiRouter() {
   // Persist metadata only after the browser confirms its direct-to-storage upload.
   router.post("/media/complete", async (req: AuthedRequest, res) => {
     const fbUid = await resolveFirebaseUid(req);
-    const resolved = fbUid ? null : await lookupSessionUser(req);
+    const resolved = await lookupSessionUser(req);
     if (!fbUid && !resolved) {
       res.status(401).json({ error: "Authentication required." });
       return;
@@ -3157,13 +3349,14 @@ export function createApiRouter() {
     const kind = String(req.body?.kind ?? "");
     const mimeType = String(req.body?.mimeType ?? "");
     const sizeBytes = Number(req.body?.sizeBytes);
+    const galleryScope = req.body?.galleryScope === "secret" ? "secret" : "normal";
     const originalName = String(req.body?.originalName ?? "media")
       .replace(/[\\r\\n]/g, "_")
       .slice(0, 255);
     const recipientId =
       typeof req.body?.recipientId === "string" ? req.body.recipientId.trim() : null;
     if (
-      !id.startsWith(fbUid ? "fbm_" : "med_") ||
+      (!id.startsWith("med_") && !id.startsWith("fbm_")) ||
       !(["image", "video", "audio"] as const).includes(kind as "image" | "video" | "audio") ||
       !mimeType.startsWith(`${kind}/`) ||
       !Number.isSafeInteger(sizeBytes) ||
@@ -3178,26 +3371,49 @@ export function createApiRouter() {
       return;
     }
 
-    const ownerId = fbUid ?? resolved!.user.id;
-    const storageKey = `${fbUid ? `firebase/${ownerId}` : `users/${ownerId}`}/${id}`;
+    const useFbStorage = id.startsWith("fbm_") && Boolean(fbUid);
+    const ownerId = useFbStorage ? fbUid! : resolved!.user.id;
+    const storageKey = `${useFbStorage ? `firebase/${ownerId}` : `users/${ownerId}`}/${id}`;
     if (!(await mediaStorageObjectExists(storageKey))) {
       res.status(400).json({ error: "The file did not finish uploading. Please try again." });
       return;
     }
 
     const now = new Date().toISOString();
-    if (fbUid) {
+    if (useFbStorage) {
       await db
         .prepare(
-          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, gallery_scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .run(id, fbUid, recipientId, kind, mimeType, originalName, storageKey, sizeBytes, now);
+        .run(
+          id,
+          fbUid,
+          recipientId,
+          kind,
+          mimeType,
+          originalName,
+          storageKey,
+          sizeBytes,
+          galleryScope,
+          now,
+        );
     } else {
       await db
         .prepare(
-          "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+          "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, gallery_scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
         )
-        .run(id, ownerId, recipientId, kind, mimeType, originalName, storageKey, sizeBytes, now);
+        .run(
+          id,
+          ownerId,
+          recipientId,
+          kind,
+          mimeType,
+          originalName,
+          storageKey,
+          sizeBytes,
+          galleryScope,
+          now,
+        );
     }
 
     res.status(201).json({
@@ -3206,6 +3422,7 @@ export function createApiRouter() {
       mimeType,
       originalName,
       sizeBytes,
+      galleryScope,
       createdAt: now,
       url: `/api/media/${id}`,
       mine: true,
@@ -3230,6 +3447,7 @@ export function createApiRouter() {
 
     const recipientId =
       typeof req.body?.["recipientId"] === "string" ? req.body["recipientId"].trim() : null;
+    const galleryScope = req.body?.["galleryScope"] === "secret" ? "secret" : "normal";
 
     if (resolved && recipientId && (await isBlockedBetween(resolved.user.id, recipientId))) {
       res.status(403).json({ error: "Cannot share media with a blocked user." });
@@ -3273,7 +3491,7 @@ export function createApiRouter() {
     if (userInDb) {
       await db
         .prepare(
-          "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+          "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, gallery_scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
         )
         .run(
           mediaId,
@@ -3284,6 +3502,7 @@ export function createApiRouter() {
           originalName,
           storageKey,
           file.size,
+          galleryScope,
           now,
         );
     }
@@ -3291,7 +3510,7 @@ export function createApiRouter() {
     if (fbUid || ownerId.startsWith("fb_")) {
       await db
         .prepare(
-          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, gallery_scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
         )
         .run(
           mediaId,
@@ -3302,6 +3521,7 @@ export function createApiRouter() {
           originalName,
           storageKey,
           file.size,
+          galleryScope,
           now,
         );
     }
@@ -3312,6 +3532,7 @@ export function createApiRouter() {
       mimeType: file.mimetype,
       originalName,
       sizeBytes: file.size,
+      galleryScope,
       createdAt: now,
       url: `/api/media/${mediaId}`,
       mine: true,
@@ -3356,7 +3577,7 @@ export function createApiRouter() {
   // Save media shared with the current user as a private copy in their gallery.
   router.post("/media/:id/save", async (req: AuthedRequest, res) => {
     const fbUid = await resolveFirebaseUid(req);
-    const resolved = fbUid ? null : await lookupSessionUser(req);
+    const resolved = await lookupSessionUser(req);
     if (!fbUid && !resolved) {
       res.status(401).json({ error: "Authentication required." });
       return;
@@ -3367,8 +3588,12 @@ export function createApiRouter() {
       res.status(400).json({ error: "Media ID is required." });
       return;
     }
+    const galleryScope =
+      (req.body as { galleryScope?: string } | undefined)?.galleryScope === "secret"
+        ? "secret"
+        : "normal";
 
-    if (fbUid) {
+    if (fbUid && !resolved) {
       const item = (await db
         .prepare("SELECT * FROM firebase_media WHERE id = ? LIMIT 1")
         .get(mediaId)) as
@@ -3388,7 +3613,7 @@ export function createApiRouter() {
         return;
       }
       if (item.owner_uid === fbUid) {
-        res.json({ ok: true, alreadySaved: true, id: item.id });
+        res.json({ ok: true, alreadySaved: true, id: item.id, galleryScope });
         return;
       }
       const recipients = (item.recipient_uid ?? "").split(",").map((value) => value.trim());
@@ -3408,7 +3633,7 @@ export function createApiRouter() {
       await uploadMediaStorage(storageKey, bytes, item.mime_type);
       await db
         .prepare(
-          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO firebase_media (id, owner_uid, recipient_uid, kind, mime_type, original_name, file_path, size_bytes, gallery_scope, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
         )
         .run(
           savedId,
@@ -3418,9 +3643,10 @@ export function createApiRouter() {
           item.original_name,
           storageKey,
           item.size_bytes,
+          galleryScope,
           createdAt,
         );
-      res.status(201).json({ ok: true, alreadySaved: false, id: savedId });
+      res.status(201).json({ ok: true, alreadySaved: false, id: savedId, galleryScope });
       return;
     }
 
@@ -3445,7 +3671,7 @@ export function createApiRouter() {
       return;
     }
     if (item.owner_id === me.id) {
-      res.json({ ok: true, alreadySaved: true, id: item.id });
+      res.json({ ok: true, alreadySaved: true, id: item.id, galleryScope });
       return;
     }
     const sharedInMessage = Boolean(
@@ -3472,7 +3698,7 @@ export function createApiRouter() {
     await uploadMediaStorage(storageKey, bytes, item.mime_type);
     await db
       .prepare(
-        "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?)",
+        "INSERT INTO media_objects (id, owner_id, recipient_id, kind, mime_type, original_name, file_path, size_bytes, is_public_avatar, gallery_scope, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?)",
       )
       .run(
         savedId,
@@ -3482,9 +3708,10 @@ export function createApiRouter() {
         item.original_name,
         storageKey,
         item.size_bytes,
+        galleryScope,
         createdAt,
       );
-    res.status(201).json({ ok: true, alreadySaved: false, id: savedId });
+    res.status(201).json({ ok: true, alreadySaved: false, id: savedId, galleryScope });
   });
 
   // Delete an owned media file from the gallery & disk storage
@@ -3761,6 +3988,10 @@ export function createApiRouter() {
       if (u) callerIds.add(u.id);
     }
     const callerIdList = Array.from(callerIds);
+    const requestedScope =
+      req.query["scope"] === "secret" || req.query["scope"] === "normal"
+        ? (req.query["scope"] as "normal" | "secret")
+        : null;
 
     const itemsMap = new Map<
       string,
@@ -3770,6 +4001,7 @@ export function createApiRouter() {
         mimeType: string;
         originalName: string;
         sizeBytes: number;
+        galleryScope: "normal" | "secret";
         createdAt: string;
         url: string;
         mine: boolean;
@@ -3781,7 +4013,7 @@ export function createApiRouter() {
       const placeholders = callerIdList.map(() => "?").join(",");
       const rows = (await db
         .prepare(
-          `SELECT id, owner_id, recipient_id, kind, mime_type, original_name, size_bytes, created_at
+          `SELECT id, owner_id, recipient_id, kind, mime_type, original_name, size_bytes, gallery_scope, created_at
            FROM media_objects
            WHERE is_public_avatar = 0
              AND kind IN ('image', 'video')
@@ -3797,17 +4029,21 @@ export function createApiRouter() {
         mime_type: string;
         original_name: string;
         size_bytes: number;
+        gallery_scope: string | null;
         created_at: string;
       }[];
 
       for (const r of rows) {
         const isMine = callerIds.has(r.owner_id);
+        const scope = r.gallery_scope === "secret" ? "secret" : "normal";
+        if (requestedScope && scope !== requestedScope) continue;
         itemsMap.set(r.id, {
           id: r.id,
           kind: r.kind as "image" | "video",
           mimeType: r.mime_type,
           originalName: r.original_name,
           sizeBytes: r.size_bytes,
+          galleryScope: scope,
           createdAt: r.created_at,
           url: `/api/media/${r.id}`,
           mine: isMine,
@@ -3818,7 +4054,7 @@ export function createApiRouter() {
     // 2. Query firebase_media
     const fbRows = (await db
       .prepare(
-        `SELECT id, owner_uid, recipient_uid, kind, mime_type, original_name, size_bytes, created_at
+        `SELECT id, owner_uid, recipient_uid, kind, mime_type, original_name, size_bytes, gallery_scope, created_at
          FROM firebase_media
          WHERE kind IN ('image', 'video')
          ORDER BY created_at DESC
@@ -3832,6 +4068,7 @@ export function createApiRouter() {
       mime_type: string;
       original_name: string;
       size_bytes: number;
+      gallery_scope: string | null;
       created_at: string;
     }[];
 
@@ -3848,6 +4085,8 @@ export function createApiRouter() {
           callerIds.has(`fb_${rec}`) ||
           (rec.startsWith("fb_") && callerIds.has(rec.slice(3))),
       );
+      const scope = r.gallery_scope === "secret" ? "secret" : "normal";
+      if (requestedScope && scope !== requestedScope) continue;
       if (isMine || isRecipient) {
         itemsMap.set(r.id, {
           id: r.id,
@@ -3855,6 +4094,7 @@ export function createApiRouter() {
           mimeType: r.mime_type,
           originalName: r.original_name,
           sizeBytes: r.size_bytes,
+          galleryScope: scope,
           createdAt: r.created_at,
           url: `/api/media/${r.id}`,
           mine: isMine,
@@ -4075,6 +4315,152 @@ export function createApiRouter() {
       .run(me.id, serialized, now);
 
     res.json({ ok: true, updatedAt: now });
+  });
+
+  // Notification token registration & per-user preferences (strictly scoped to caller)
+  router.get("/notifications/status", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const countRow = (await db
+      .prepare("SELECT COUNT(*) AS cnt FROM notification_tokens WHERE user_id = ?")
+      .get(me.id)) as { cnt: number };
+    res.json({
+      fcmServerConfigured: isFcmServerPushConfigured(),
+      registeredDevices: Number(countRow?.cnt ?? 0),
+    });
+  });
+
+  router.get("/notifications/preferences", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const row = (await db
+      .prepare(
+        "SELECT push_enabled, message_preview, call_alerts, quiet_hours_enabled, updated_at FROM notification_preferences WHERE user_id = ? LIMIT 1",
+      )
+      .get(me.id)) as
+      | {
+          push_enabled: number;
+          message_preview: number;
+          call_alerts: number;
+          quiet_hours_enabled: number;
+          updated_at: string;
+        }
+      | undefined;
+
+    res.json({
+      pushEnabled: row ? row.push_enabled === 1 : true,
+      messagePreview: row ? row.message_preview === 1 : true,
+      callAlerts: row ? row.call_alerts === 1 : true,
+      quietHoursEnabled: row ? row.quiet_hours_enabled === 1 : false,
+      updatedAt: row?.updated_at ?? null,
+    });
+  });
+
+  router.patch("/notifications/preferences", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const existing = (await db
+      .prepare(
+        "SELECT push_enabled, message_preview, call_alerts, quiet_hours_enabled FROM notification_preferences WHERE user_id = ? LIMIT 1",
+      )
+      .get(me.id)) as
+      | {
+          push_enabled: number;
+          message_preview: number;
+          call_alerts: number;
+          quiet_hours_enabled: number;
+        }
+      | undefined;
+
+    const body = (req.body ?? {}) as {
+      pushEnabled?: boolean;
+      messagePreview?: boolean;
+      callAlerts?: boolean;
+      quietHoursEnabled?: boolean;
+    };
+    const pushEnabled =
+      typeof body.pushEnabled === "boolean"
+        ? body.pushEnabled
+          ? 1
+          : 0
+        : (existing?.push_enabled ?? 1);
+    const messagePreview =
+      typeof body.messagePreview === "boolean"
+        ? body.messagePreview
+          ? 1
+          : 0
+        : (existing?.message_preview ?? 1);
+    const callAlerts =
+      typeof body.callAlerts === "boolean"
+        ? body.callAlerts
+          ? 1
+          : 0
+        : (existing?.call_alerts ?? 1);
+    const quietHoursEnabled =
+      typeof body.quietHoursEnabled === "boolean"
+        ? body.quietHoursEnabled
+          ? 1
+          : 0
+        : (existing?.quiet_hours_enabled ?? 0);
+
+    const now = new Date().toISOString();
+    await db
+      .prepare(
+        `INSERT INTO notification_preferences (user_id, push_enabled, message_preview, call_alerts, quiet_hours_enabled, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+           push_enabled = excluded.push_enabled,
+           message_preview = excluded.message_preview,
+           call_alerts = excluded.call_alerts,
+           quiet_hours_enabled = excluded.quiet_hours_enabled,
+           updated_at = excluded.updated_at`,
+      )
+      .run(me.id, pushEnabled, messagePreview, callAlerts, quietHoursEnabled, now);
+
+    res.json({
+      pushEnabled: pushEnabled === 1,
+      messagePreview: messagePreview === 1,
+      callAlerts: callAlerts === 1,
+      quietHoursEnabled: quietHoursEnabled === 1,
+      updatedAt: now,
+    });
+  });
+
+  router.post("/notifications/token", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const body = (req.body ?? {}) as { token?: string; platform?: string };
+    const token = typeof body.token === "string" ? body.token.trim().slice(0, 512) : "";
+    if (token.length < 16) {
+      res.status(400).json({ error: "Valid notification device token is required." });
+      return;
+    }
+    const platform =
+      body.platform === "android" || body.platform === "ios" || body.platform === "desktop"
+        ? body.platform
+        : "web";
+    const ua = String(req.headers["user-agent"] ?? "").slice(0, 200);
+    const now = new Date().toISOString();
+
+    await db
+      .prepare(
+        `INSERT INTO notification_tokens (id, user_id, token, platform, user_agent, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_id, token) DO UPDATE SET platform = excluded.platform, user_agent = excluded.user_agent, updated_at = excluded.updated_at`,
+      )
+      .run(`ntok_${crypto.randomUUID()}`, me.id, token, platform, ua, now, now);
+
+    res.status(201).json({ ok: true, platform, updatedAt: now });
+  });
+
+  router.delete("/notifications/token", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const body = (req.body ?? {}) as { token?: string };
+    const token = typeof body.token === "string" ? body.token.trim() : "";
+    if (token) {
+      await db
+        .prepare("DELETE FROM notification_tokens WHERE user_id = ? AND token = ?")
+        .run(me.id, token);
+    } else {
+      await db.prepare("DELETE FROM notification_tokens WHERE user_id = ?").run(me.id);
+    }
+    res.json({ ok: true });
   });
 
   return router;

@@ -1,4 +1,4 @@
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { Compass, MessageCircle, ShieldCheck, User } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useMemo, useState } from "react";
@@ -43,14 +43,33 @@ export function InstagramShell({
     }
   }, [ready, me, navigate]);
 
+  const routerSearchStr = useRouterState({
+    select: (s) => s.location.searchStr ?? "",
+  });
+
   useEffect(() => {
     if (!ready || !me || typeof window === "undefined") return;
-    const params = new URLSearchParams(window.location.search);
+    const params = new URLSearchParams(routerSearchStr || window.location.search);
     const peer = params.get("peer");
     if (peer) {
       setTab("chat");
       void openThread(peer);
     }
+  }, [ready, me, routerSearchStr]);
+
+  useEffect(() => {
+    if (!ready || !me || typeof navigator === "undefined" || !("serviceWorker" in navigator)) {
+      return;
+    }
+    const onSwMessage = (event: MessageEvent) => {
+      const payload = event.data as { type?: string; peerId?: string } | null;
+      if (payload?.type === "OPEN_CHAT_THREAD" && payload.peerId) {
+        setTab("chat");
+        void openThread(payload.peerId);
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", onSwMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onSwMessage);
   }, [ready, me]);
 
   const totalUnread = useMemo(

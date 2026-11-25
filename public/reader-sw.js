@@ -6,8 +6,9 @@ self.addEventListener("fetch", (event) => {
     request.method !== "GET" ||
     url.origin !== self.location.origin ||
     url.pathname.startsWith("/api/")
-  )
+  ) {
     return;
+  }
   event.respondWith(
     fetch(request).catch(
       () =>
@@ -19,5 +20,79 @@ self.addEventListener("fetch", (event) => {
           },
         ),
     ),
+  );
+});
+
+function buildChatTargetUrl(data) {
+  const peerId = data && typeof data.peerId === "string" ? data.peerId.trim() : "";
+  if (peerId) {
+    return `/messages?peer=${encodeURIComponent(peerId)}`;
+  }
+  const rawPath = data && typeof data.path === "string" ? data.path.trim() : "";
+  if (rawPath.startsWith("/messages")) {
+    return rawPath;
+  }
+  return "/messages";
+}
+
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    payload = {};
+  }
+
+  const notification = payload.notification || {};
+  const data = payload.data || {};
+  const title = notification.title || data.senderName || "New message";
+  const body = notification.body || data.preview || "Open chat to view message";
+  const peerId = typeof data.peerId === "string" ? data.peerId.trim() : "";
+  const messageId = typeof data.messageId === "string" ? data.messageId.trim() : "";
+  const targetUrl = buildChatTargetUrl(data);
+
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body,
+      tag: messageId ? `rc-msg-${messageId}` : peerId ? `rc-peer-${peerId}` : "rc-message",
+      renotify: true,
+      data: {
+        peerId,
+        targetUrl,
+      },
+    }),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const notifData = event.notification.data || {};
+  const targetUrl = buildChatTargetUrl(notifData);
+  const peerId = typeof notifData.peerId === "string" ? notifData.peerId.trim() : "";
+
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientsList) => {
+      for (const client of clientsList) {
+        try {
+          const clientUrl = new URL(client.url);
+          if (clientUrl.origin === self.location.origin && "focus" in client) {
+            if ("postMessage" in client) {
+              client.postMessage({
+                type: "OPEN_CHAT_THREAD",
+                peerId,
+                targetUrl,
+              });
+            }
+            return client.focus();
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      if (self.clients.openWindow) {
+        return self.clients.openWindow(targetUrl);
+      }
+      return undefined;
+    }),
   );
 });

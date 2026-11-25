@@ -1288,3 +1288,275 @@ test("Media upload ticket falls back cleanly and multipart image/video uploads s
   assert.equal(delRes.status, 200);
   assert.equal(delRes.data.ok, true);
 });
+
+test("Cookie+Bearer auth fallback, newest-first pagination, Secret/Normal gallery, notifications isolation, and WS typing", async () => {
+  // 1. Register User A & User B via raw fetch so we can capture Set-Cookie
+  const rawRegA = await fetch(`${baseUrl}/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      fullName: "Cookie Auth A",
+      username: "cookie_auth_a",
+      email: "cookie.a@example.com",
+      password: "Password123!",
+    }),
+  });
+  assert.equal(rawRegA.status, 201);
+  const regABody = (await rawRegA.json()) as { token: string; user: { id: string } };
+  const setCookies =
+    typeof rawRegA.headers.getSetCookie === "function"
+      ? rawRegA.headers.getSetCookie()
+      : [rawRegA.headers.get("set-cookie") ?? ""];
+  const rawCookieMatch = setCookies.join("; ").match(/rc_session=[^;,\s]+/);
+  const rawCookieA = rawCookieMatch?.[0] ?? "";
+  assert.ok(rawCookieA.startsWith("rc_session="), "expected rc_session cookie");
+
+  const regB = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Pagination Peer B",
+      username: "page_peer_b",
+      email: "page.b@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(regB.status, 201);
+
+  // 2. Sending rc_session cookie alongside an unrelated non-rc_sess_ Bearer token must NOT 401
+  const sessWithCookieAndOtherBearer = await fetch(`${baseUrl}/auth/session`, {
+    headers: {
+      Cookie: rawCookieA,
+      Authorization: "Bearer unrelated_firebase_jwt_placeholder",
+    },
+  });
+  assert.equal(sessWithCookieAndOtherBearer.status, 200);
+  const sessJson = (await sessWithCookieAndOtherBearer.json()) as {
+    authenticated: boolean;
+    token?: string;
+    user?: { id: string };
+  };
+  assert.equal(sessJson.authenticated, true);
+  assert.equal(sessJson.user?.id, regABody.user.id);
+  assert.ok(sessJson.token?.startsWith("rc_sess_"));
+
+  const msgPostWithCookieAndOtherBearer = await fetch(`${baseUrl}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: rawCookieA,
+      Authorization: "Bearer unrelated_firebase_jwt_placeholder",
+    },
+    body: JSON.stringify({ peerId: regB.data.user.id, text: "Msg 1 via cookie" }),
+  });
+  assert.equal(msgPostWithCookieAndOtherBearer.status, 201);
+
+  // 3. Newest-first cursor pagination: send 4 more messages (total 5)
+  for (let i = 2; i <= 5; i += 1) {
+    const r = await api<{ message: { id: string } }>("/messages", {
+      method: "POST",
+      token: regABody.token,
+      body: { peerId: regB.data.user.id, text: `Msg ${i}` },
+    });
+    assert.equal(r.status, 201);
+  }
+
+  const page1 = await api<{
+    messages: { id: string; text: string }[];
+    hasMore: boolean;
+    nextCursor: { before: string; beforeId: string } | null;
+  }>(`/messages/${regB.data.user.id}?limit=2`, { token: regABody.token });
+  assert.equal(page1.status, 200);
+  assert.equal(page1.data.messages.length, 2);
+  assert.equal(page1.data.hasMore, true);
+  assert.deepEqual(
+    page1.data.messages.map((m) => m.text),
+    ["Msg 4", "Msg 5"],
+  );
+  assert.ok(page1.data.nextCursor);
+
+  const page2 = await api<{
+    messages: { id: string; text: string }[];
+    hasMore: boolean;
+    nextCursor: { before: string; beforeId: string } | null;
+  }>(
+    `/messages/${regB.data.user.id}?limit=2&before=${encodeURIComponent(page1.data.nextCursor!.before)}&beforeId=${encodeURIComponent(page1.data.nextCursor!.beforeId)}`,
+    { token: regABody.token },
+  );
+  assert.equal(page2.status, 200);
+  assert.equal(page2.data.hasMore, true);
+  assert.deepEqual(
+    page2.data.messages.map((m) => m.text),
+    ["Msg 2", "Msg 3"],
+  );
+
+  const page3 = await api<{
+    messages: { id: string; text: string }[];
+    hasMore: boolean;
+  }>(
+    `/messages/${regB.data.user.id}?limit=2&before=${encodeURIComponent(page2.data.nextCursor!.before)}&beforeId=${encodeURIComponent(page2.data.nextCursor!.beforeId)}`,
+    { token: regABody.token },
+  );
+  assert.equal(page3.status, 200);
+  assert.equal(page3.data.hasMore, false);
+  assert.deepEqual(
+    page3.data.messages.map((m) => m.text),
+    ["Msg 1 via cookie"],
+  );
+
+  // 4. Secret vs Normal gallery upload and scope filtering
+  const secretForm = new FormData();
+  secretForm.append(
+    "file",
+    new Blob([Buffer.from("secret-img")], { type: "image/png" }),
+    "secret.png",
+  );
+  secretForm.append("recipientId", regB.data.user.id);
+  secretForm.append("galleryScope", "secret");
+  const upSecret = await fetch(`${baseUrl}/media`, {
+    method: "POST",
+    headers: { Cookie: rawCookieA },
+    body: secretForm,
+  });
+  assert.equal(upSecret.status, 201);
+  const secretMedia = (await upSecret.json()) as { id: string; galleryScope: string };
+  assert.equal(secretMedia.galleryScope, "secret");
+
+  const normalForm = new FormData();
+  normalForm.append(
+    "file",
+    new Blob([Buffer.from("normal-img")], { type: "image/png" }),
+    "normal.png",
+  );
+  normalForm.append("galleryScope", "normal");
+  const upNormal = await fetch(`${baseUrl}/media`, {
+    method: "POST",
+    headers: { Cookie: rawCookieA },
+    body: normalForm,
+  });
+  assert.equal(upNormal.status, 201);
+
+  const secretOnly = await api<{ items: { id: string; galleryScope: string }[] }>(
+    "/gallery?scope=secret",
+    { token: regABody.token },
+  );
+  assert.equal(secretOnly.status, 200);
+  assert.equal(secretOnly.data.items.length, 1);
+  assert.equal(secretOnly.data.items[0]?.id, secretMedia.id);
+
+  // Recipient B saves secretMedia to their Normal gallery
+  const saveOnB = await api<{ ok: boolean; galleryScope: string }>(
+    `/media/${secretMedia.id}/save`,
+    { method: "POST", token: regB.data.token, body: { galleryScope: "normal" } },
+  );
+  assert.equal(saveOnB.status, 201);
+  assert.equal(saveOnB.data.galleryScope, "normal");
+
+  // 5. Notification tokens & preferences isolation
+  const regTok = await api<{ ok: boolean; platform: string }>("/notifications/token", {
+    method: "POST",
+    token: regABody.token,
+    body: { token: "fcm_token_user_a_sample_1234567890", platform: "android" },
+  });
+  assert.equal(regTok.status, 201);
+  assert.equal(regTok.data.ok, true);
+  assert.equal(regTok.data.platform, "android");
+
+  const statusA = await api<{ registeredDevices: number }>("/notifications/status", {
+    token: regABody.token,
+  });
+  assert.equal(statusA.status, 200);
+  assert.equal(statusA.data.registeredDevices, 1);
+
+  const prefUpdate = await api<{
+    pushEnabled: boolean;
+    messagePreview: boolean;
+    quietHoursEnabled: boolean;
+  }>("/notifications/preferences", {
+    method: "PATCH",
+    token: regABody.token,
+    body: { messagePreview: false, quietHoursEnabled: true },
+  });
+  assert.equal(prefUpdate.status, 200);
+  assert.equal(prefUpdate.data.messagePreview, false);
+  assert.equal(prefUpdate.data.quietHoursEnabled, true);
+
+  // User B should see only their own default preferences and zero tokens
+  const statusB = await api<{ registeredDevices: number }>("/notifications/status", {
+    token: regB.data.token,
+  });
+  assert.equal(statusB.status, 200);
+  assert.equal(statusB.data.registeredDevices, 0);
+
+  // /api/users must never expose notification tokens
+  const usersList = await api<{ users: Record<string, unknown>[] }>("/users", {
+    token: regB.data.token,
+  });
+  assert.equal(usersList.status, 200);
+  for (const u of usersList.data.users) {
+    assert.equal(u["notificationTokens"], undefined);
+  }
+
+  // 6. WebSocket connects with rc_session cookie header and delivers typing event
+  const wsCookieA = await new Promise<{
+    ws: WebSocket;
+    waitForEvent: (name: string) => Promise<Record<string, unknown>>;
+  }>((resolve, reject) => {
+    const ws = new WebSocket(wsBaseUrl, { headers: { Cookie: rawCookieA } });
+    const waiters: { event: string; done: (p: Record<string, unknown>) => void }[] = [];
+    const queue: { event: string; payload: Record<string, unknown> }[] = [];
+    ws.on("message", (raw) => {
+      const parsed = JSON.parse(raw.toString()) as {
+        event?: string;
+        payload?: Record<string, unknown>;
+      };
+      if (!parsed.event) return;
+      const idx = waiters.findIndex((w) => w.event === parsed.event);
+      if (idx >= 0) {
+        waiters.splice(idx, 1)[0]?.done(parsed.payload ?? {});
+      } else {
+        queue.push({ event: parsed.event, payload: parsed.payload ?? {} });
+      }
+    });
+    const waitForEvent = (name: string) => {
+      const idx = queue.findIndex((q) => q.event === name);
+      if (idx >= 0) return Promise.resolve(queue.splice(idx, 1)[0]!.payload);
+      return new Promise<Record<string, unknown>>((res, rej) => {
+        const t = setTimeout(() => rej(new Error(`Timeout waiting for ${name}`)), 3000);
+        waiters.push({
+          event: name,
+          done: (p) => {
+            clearTimeout(t);
+            res(p);
+          },
+        });
+      });
+    };
+    ws.on("open", () => resolve({ ws, waitForEvent }));
+    ws.on("error", reject);
+  });
+
+  const wsB = await connectWs(regB.data.token);
+  await Promise.all([wsCookieA.waitForEvent("connected"), wsB.waitForEvent("connected")]);
+
+  try {
+    const typingOnB = wsB.waitForEvent("typing");
+    wsCookieA.ws.send(
+      JSON.stringify({ event: "typing", payload: { peerId: regB.data.user.id, active: true } }),
+    );
+    const typingEvt = await typingOnB;
+    assert.equal(typingEvt["fromUserId"], regABody.user.id);
+    assert.equal(typingEvt["active"], true);
+
+    const seenOnA = wsCookieA.waitForEvent("messages:seen");
+    const markSeen = await api<{ ok: boolean }>(`/messages/${regABody.user.id}/seen`, {
+      method: "POST",
+      token: regB.data.token,
+    });
+    assert.equal(markSeen.status, 200);
+    const seenEvt = await seenOnA;
+    assert.equal(seenEvt["byUserId"], regB.data.user.id);
+  } finally {
+    wsCookieA.ws.close();
+    wsB.ws.close();
+  }
+});

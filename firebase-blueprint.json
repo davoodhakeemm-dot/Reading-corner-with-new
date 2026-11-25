@@ -5,9 +5,19 @@
       "description": "Public, PII-free reader directory profile visible to signed-in readers for discovery and chat.",
       "type": "object",
       "properties": {
-        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "fullName": { "type": "string", "minLength": 2, "maxLength": 60 },
-        "displayHandle": { "type": "string", "minLength": 3, "maxLength": 32, "pattern": "^@[a-z0-9._-]+$" },
+        "displayHandle": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 32,
+          "pattern": "^@[a-z0-9._-]+$"
+        },
         "bio": { "type": "string", "minLength": 0, "maxLength": 200 },
         "avatarUrl": { "type": "string", "maxLength": 300000 },
         "theme": { "type": "string", "enum": ["instagram", "emerald", "dark"] },
@@ -18,14 +28,31 @@
         "updatedAt": { "type": "string", "format": "date-time" },
         "lastActiveAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["uid", "fullName", "displayHandle", "bio", "theme", "online", "followerCount", "followingCount", "createdAt", "updatedAt", "lastActiveAt"]
+      "required": [
+        "uid",
+        "fullName",
+        "displayHandle",
+        "bio",
+        "theme",
+        "online",
+        "followerCount",
+        "followingCount",
+        "createdAt",
+        "updatedAt",
+        "lastActiveAt"
+      ]
     },
     "PrivateUserAccount": {
       "title": "PrivateUserAccount",
       "description": "Owner-only private PII and personal preferences isolated from public reads.",
       "type": "object",
       "properties": {
-        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "email": { "type": "string", "maxLength": 254 },
         "soundEnabled": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" },
@@ -38,8 +65,18 @@
       "description": "Unique lowercase username reservation mapping handleKey to owner uid.",
       "type": "object",
       "properties": {
-        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "handle": { "type": "string", "minLength": 3, "maxLength": 32, "pattern": "^@[a-z0-9._-]+$" },
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "handle": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 32,
+          "pattern": "^@[a-z0-9._-]+$"
+        },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["uid", "handle", "createdAt"]
@@ -49,7 +86,12 @@
       "description": "Owner-only reading shelf, onboarding preferences, bookmarks, favorites, and progress.",
       "type": "object",
       "properties": {
-        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "onboarded": { "type": "boolean" },
         "languages": { "type": "array" },
         "categories": { "type": "array" },
@@ -65,15 +107,41 @@
         "streak": { "type": "integer" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["uid", "onboarded", "languages", "categories", "appTheme", "reader", "notifications", "profile", "progress", "favorites", "bookmarks", "completed", "history", "streak", "updatedAt"]
+      "required": [
+        "uid",
+        "onboarded",
+        "languages",
+        "categories",
+        "appTheme",
+        "reader",
+        "notifications",
+        "profile",
+        "progress",
+        "favorites",
+        "bookmarks",
+        "completed",
+        "history",
+        "streak",
+        "updatedAt"
+      ]
     },
     "FollowEdge": {
       "title": "FollowEdge",
       "description": "Directed follow relationship between followerId and followingId.",
       "type": "object",
       "properties": {
-        "followerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "followingId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "followerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "followingId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["followerId", "followingId", "createdAt"]
@@ -83,8 +151,18 @@
       "description": "Two-participant direct message conversation metadata, pin/mute, typing, and unread counts.",
       "type": "object",
       "properties": {
-        "participantA": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "participantB": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "participantA": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "participantB": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "lastMessageText": { "type": "string", "maxLength": 4000 },
         "lastMessageFrom": { "type": "string", "maxLength": 128 },
         "lastMessageMediaKind": { "type": "string", "enum": ["image", "video", "audio"] },
@@ -102,17 +180,47 @@
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["participantA", "participantB", "lastMessageText", "lastMessageDeleted", "unreadA", "unreadB", "pinnedA", "pinnedB", "mutedA", "mutedB", "typingA", "typingB", "createdAt", "updatedAt"]
+      "required": [
+        "participantA",
+        "participantB",
+        "lastMessageText",
+        "lastMessageDeleted",
+        "unreadA",
+        "unreadB",
+        "pinnedA",
+        "pinnedB",
+        "mutedA",
+        "mutedB",
+        "typingA",
+        "typingB",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "DirectMessage": {
       "title": "DirectMessage",
       "description": "Message inside a two-participant conversation thread.",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "threadKey": { "type": "string", "minLength": 4, "maxLength": 260 },
-        "senderId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "recipientId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "senderId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "recipientId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "text": { "type": "string", "maxLength": 4000 },
         "mediaUrl": { "type": "string", "maxLength": 500 },
         "mediaId": { "type": "string", "maxLength": 128 },
@@ -136,8 +244,18 @@
       "description": "User block record between blockerId and blockedId.",
       "type": "object",
       "properties": {
-        "blockerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "blockedId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "blockerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "blockedId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["blockerId", "blockedId", "createdAt"]
@@ -147,8 +265,18 @@
       "description": "Safety report submitted by a signed-in user.",
       "type": "object",
       "properties": {
-        "reporterId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "reportedUserId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "reporterId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "reportedUserId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "reason": { "type": "string", "minLength": 2, "maxLength": 120 },
         "details": { "type": "string", "maxLength": 500 },
         "createdAt": { "type": "string", "format": "date-time" }
@@ -160,8 +288,18 @@
       "description": "WebRTC audio/video call offer and answer signaling document between caller and callee.",
       "type": "object",
       "properties": {
-        "caller": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "callee": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "caller": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "callee": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "kind": { "type": "string", "enum": ["audio", "video"] },
         "offer": { "type": "string", "maxLength": 100000 },
         "answer": { "type": "string", "maxLength": 100000 },

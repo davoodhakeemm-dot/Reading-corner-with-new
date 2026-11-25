@@ -2,9 +2,23 @@ import crypto from "node:crypto";
 import type { IncomingMessage, Server as HttpServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 
-import { db, isBlockedBetween, sha256, threadKeyFor, toPublicUser, type DbUser } from "./db";
+import {
+  db,
+  isBlockedBetween,
+  normalizeEmail,
+  sha256,
+  threadKeyFor,
+  toPublicUser,
+  verifyCookieToken,
+  type DbUser,
+} from "./db";
+import { getFirebaseAdminAuth } from "./firebase-admin";
 
-type ClientSocket = WebSocket & { userId?: string; isAlive?: boolean };
+type ClientSocket = WebSocket & {
+  userId?: string;
+  isAlive?: boolean;
+  activePeerId?: string | null;
+};
 
 const userSockets = new Map<string, Set<ClientSocket>>();
 const activeCallPeers = new Map<string, { callId: string; peerId: string }>();
@@ -12,6 +26,17 @@ const activeCallPeers = new Map<string, { callId: string; peerId: string }>();
 export function isUserConnected(userId: string): boolean {
   const set = userSockets.get(userId);
   return Boolean(set && set.size > 0);
+}
+
+export function isUserViewingThread(userId: string, peerId: string): boolean {
+  const set = userSockets.get(userId);
+  if (!set) return false;
+  for (const ws of set) {
+    if (ws.readyState === WebSocket.OPEN && ws.activePeerId === peerId) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function sendToUser(userId: string, event: string, payload: unknown) {
@@ -37,40 +62,93 @@ export function broadcastEvent(event: string, payload: unknown, excludeUserId?: 
   }
 }
 
-function parseSessionTokenFromRequest(req: IncomingMessage): string | null {
-  const url = new URL(req.url ?? "/", "http://localhost");
-  const queryToken = url.searchParams.get("token")?.trim();
-  if (queryToken) return queryToken;
-
-  const authHeader = req.headers.authorization;
-  if (authHeader?.startsWith("Bearer ")) {
-    return authHeader.slice(7).trim();
-  }
-
+function parseCookieValue(req: IncomingMessage, name: string): string | null {
   const cookieHeader = req.headers.cookie;
-  if (cookieHeader) {
-    for (const part of cookieHeader.split(";")) {
-      const [k, ...rest] = part.trim().split("=");
-      if (k === "rc_session") {
-        return decodeURIComponent(rest.join("="));
-      }
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(";")) {
+    const [k, ...rest] = part.trim().split("=");
+    if (k === name) {
+      const val = decodeURIComponent(rest.join("=")).trim();
+      if (val) return val;
     }
   }
   return null;
 }
 
-async function resolveUserFromToken(token: string | null): Promise<DbUser | null> {
-  if (!token) return null;
+function parseAuthTokensFromRequest(req: IncomingMessage): {
+  sessionToken: string | null;
+  firebaseToken: string | null;
+  fbCookie: string | null;
+} {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  const queryToken = url.searchParams.get("token")?.trim() || null;
+  const authHeader = req.headers.authorization;
+  const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+
+  const sessionToken =
+    (queryToken && queryToken.startsWith("rc_sess_") ? queryToken : null) ||
+    (bearerToken && bearerToken.startsWith("rc_sess_") ? bearerToken : null) ||
+    parseCookieValue(req, "rc_session");
+
+  const firebaseToken =
+    (bearerToken && !bearerToken.startsWith("rc_sess_") ? bearerToken : null) ||
+    (queryToken && !queryToken.startsWith("rc_sess_") ? queryToken : null);
+
+  const fbCookie = parseCookieValue(req, "rc_fb_session");
+  return { sessionToken, firebaseToken, fbCookie };
+}
+
+async function resolveUserFromRequest(req: IncomingMessage): Promise<DbUser | null> {
+  const { sessionToken, firebaseToken, fbCookie } = parseAuthTokensFromRequest(req);
   const now = new Date().toISOString();
-  const row = (await db
-    .prepare(
-      `SELECT u.* FROM sessions s
-       JOIN users u ON u.id = s.user_id
-       WHERE s.token_hash = ? AND s.expires_at > ?
-       LIMIT 1`,
-    )
-    .get(sha256(token), now)) as DbUser | undefined;
-  return row ?? null;
+
+  if (sessionToken) {
+    const row = (await db
+      .prepare(
+        `SELECT u.* FROM sessions s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.token_hash = ? AND s.expires_at > ?
+         LIMIT 1`,
+      )
+      .get(sha256(sessionToken), now)) as DbUser | undefined;
+    if (row) return row;
+  }
+
+  if (fbCookie) {
+    const verified = verifyCookieToken(fbCookie);
+    if (verified?.uid) {
+      const fbRow = (await db
+        .prepare("SELECT * FROM users WHERE id = ? OR id = ? LIMIT 1")
+        .get(`fb_${verified.uid}`, verified.uid)) as DbUser | undefined;
+      if (fbRow) return fbRow;
+    }
+  }
+
+  if (firebaseToken) {
+    try {
+      const decoded = await getFirebaseAdminAuth().verifyIdToken(firebaseToken);
+      if (decoded?.uid) {
+        const fbRow = (await db
+          .prepare("SELECT * FROM users WHERE id = ? OR id = ? LIMIT 1")
+          .get(`fb_${decoded.uid}`, decoded.uid)) as DbUser | undefined;
+        if (fbRow) return fbRow;
+
+        const cleanEmail = decoded.email ? normalizeEmail(decoded.email) : null;
+        if (decoded.email_verified && cleanEmail) {
+          const emailRow = (await db
+            .prepare(
+              "SELECT * FROM users WHERE email_verified = 1 AND LOWER(email) = LOWER(?) LIMIT 1",
+            )
+            .get(cleanEmail)) as DbUser | undefined;
+          if (emailRow) return emailRow;
+        }
+      }
+    } catch {
+      /* invalid firebase token */
+    }
+  }
+
+  return null;
 }
 
 export async function broadcastPresence(userId: string, online: boolean) {
@@ -120,8 +198,7 @@ export function attachWebSocketServer(httpServer: HttpServer) {
       return;
     }
 
-    const token = parseSessionTokenFromRequest(req);
-    const user = await resolveUserFromToken(token);
+    const user = await resolveUserFromRequest(req);
     if (!user) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
@@ -172,6 +249,12 @@ export function attachWebSocketServer(httpServer: HttpServer) {
             .prepare("UPDATE users SET last_active_at = ? WHERE id = ?")
             .run(new Date().toISOString(), userId);
           ws.send(JSON.stringify({ event: "pong", payload: { ts: Date.now() } }));
+          return;
+        }
+
+        if (event === "thread:active") {
+          const peerId = typeof payload["peerId"] === "string" ? payload["peerId"].trim() : "";
+          ws.activePeerId = peerId || null;
           return;
         }
 
