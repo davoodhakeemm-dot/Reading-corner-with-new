@@ -64,6 +64,7 @@ import {
   formatTime,
   initialsOf,
   initiateCall,
+  loadConversations,
   loadOlderMessages,
   openThread,
   reactToMessage,
@@ -400,6 +401,36 @@ export function InstagramChatView({
   useEffect(() => {
     onThreadOpenChange?.(Boolean(activePeerId));
   }, [activePeerId, onThreadOpenChange]);
+
+  useEffect(() => {
+    const syncActiveThread = () => {
+      if (document.visibilityState === "visible" && activePeerId) {
+        void openThread(activePeerId, { markSeen: false }).catch(() => {});
+      }
+    };
+
+    const intervalId = window.setInterval(syncActiveThread, 4000);
+    document.addEventListener("visibilitychange", syncActiveThread);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", syncActiveThread);
+    };
+  }, [activePeerId]);
+
+  useEffect(() => {
+    const syncConversations = () => {
+      if (document.visibilityState === "visible") {
+        void loadConversations().catch(() => {});
+      }
+    };
+
+    const intervalId = window.setInterval(syncConversations, 10000);
+    document.addEventListener("visibilitychange", syncConversations);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", syncConversations);
+    };
+  }, []);
 
   useEffect(() => {
     setReplyingTo(null);
