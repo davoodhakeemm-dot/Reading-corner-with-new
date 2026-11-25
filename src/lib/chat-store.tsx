@@ -1926,7 +1926,7 @@ export function dismissIncomingMessageAlert() {
   }
 }
 
-export async function openThread(peerId: string | null) {
+export async function openThread(peerId: string | null, options: { markSeen?: boolean } = {}) {
   sendWs("thread:active", { peerId: peerId ?? "" });
   setState({
     activePeerId: peerId,
@@ -1998,7 +1998,9 @@ export async function openThread(peerId: string | null) {
     ...(state.activePeerId === peerId ? { hasOlderMessages: Boolean(data.hasMore) } : {}),
   });
 
-  await markThreadSeen(peerId);
+  if (options.markSeen !== false) {
+    await markThreadSeen(peerId);
+  }
 }
 
 export async function loadOlderMessages(peerId: string): Promise<void> {
