@@ -60,15 +60,7 @@ export function InstallApp() {
         className="press inline-flex min-h-11 items-center gap-2 rounded-full px-4 text-sm font-bold text-primary"
         aria-expanded={!prompt ? help : undefined}
         aria-controls={help ? id : undefined}
-        onClick={async () => {
-          if (prompt) {
-            try {
-              await prompt();
-            } catch {
-              setHelp(true);
-            }
-          } else setHelp(!help);
-        }}
+        onClick={() => setHelp(!help)}
       >
         <Download aria-hidden="true" className="size-4" />
         Install app
@@ -78,19 +70,23 @@ export function InstallApp() {
           id={id}
           className="max-w-sm rounded-2xl bg-card p-4 text-left text-sm text-foreground shadow-soft"
         >
-          <p className="font-bold">Add Reading Corner to your device</p>
-          <ul className="mt-2 flex list-disc flex-col gap-2 pl-5">
+          <p className="font-bold">No download needed</p>
+          <p className="mt-1 text-muted-foreground">
+            Reading Corner installs from this website. You do not need to download an APK or another
+            file.
+          </p>
+          <ul className="mt-3 flex list-disc flex-col gap-2 pl-5">
             <li>
-              <strong>iPhone or iPad:</strong> Open in Safari, tap Share, then Add to Home Screen
-              and Add.
+              <strong>iPhone or iPad:</strong> Open this page in Safari, tap Share, then Add to Home
+              Screen.
             </li>
             <li>
-              <strong>Android:</strong> Open in Chrome and choose Install app or Add to Home screen
-              from the menu.
+              <strong>Android:</strong> Open this page in Chrome, tap the menu, then Install app or
+              Add to Home screen.
             </li>
             <li>
-              <strong>Computer:</strong> Open in Chrome or Edge and select the install icon in the
-              address bar when available.
+              <strong>Computer:</strong> In Chrome or Edge, select the install icon in the address
+              bar, if shown.
             </li>
           </ul>
         </div>
